@@ -1,0 +1,1492 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+from domain.project_modes import list_project_modes
+
+from .contracts import UiAdvancedSettingsViewModel, UiQuickLaunchSettingsViewModel
+from .controller import DesktopGuiController, handle_ui_error
+from .presentation import (
+    THEME_LABELS,
+    STRICTNESS_LABELS,
+    get_ui_theme,
+    label_for_theme,
+    label_for_strictness,
+    normalize_ui_theme,
+    translate_asset_role,
+    translate_provider,
+    translate_run_stage,
+    translate_run_status,
+    translate_session_health,
+    translate_paragraph_status,
+    translate_severity,
+    yes_no,
+)
+
+
+class DesktopQtApp(QtWidgets.QMainWindow):
+    def __init__(self, controller: DesktopGuiController):
+        super().__init__()
+        self.controller = controller
+        self._mode_definitions = list_project_modes()
+        self._mode_labels = {
+            item.mode_id: item.label for item in self._mode_definitions
+        }
+        self._mode_ids_by_label = {
+            item.label: item.mode_id for item in self._mode_definitions
+        }
+        self._strictness_ids_by_label = {
+            label_for_strictness(value): value for value in STRICTNESS_LABELS
+        }
+        self._theme_ids_by_label = {
+            label_for_theme(value): value for value in THEME_LABELS
+        }
+        self.active_project_id: str | None = None
+        self.active_run_id: str | None = None
+        self._project_ids_by_row: list[str] = []
+        self._history_ids_by_row: list[tuple[str, str]] = []
+        self._paragraph_numbers_by_row: list[int] = []
+        self._selected_asset_ids_by_row: list[str] = []
+        self._candidate_asset_ids_by_row: list[str] = []
+        self._session_buttons: list[QtWidgets.QPushButton] = []
+        self._last_paragraph_signature: tuple[tuple[int, str, str, bool], ...] = ()
+        self._last_journal_signature: tuple[int, str, str] = (0, "", "")
+        self._theme_id = self.controller.get_ui_theme()
+
+        self.setWindowTitle("Vid Img Downloader")
+        self.resize(1480, 920)
+        self._build_ui()
+        self._apply_theme(self._theme_id)
+        self.refresh()
+
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(750)
+        self._timer.timeout.connect(self._poll_refresh)
+        self._timer.start()
+
+    def _build_ui(self) -> None:
+        toolbar = self.addToolBar("Главное")
+        toolbar.setMovable(False)
+        for text, handler in (
+            ("Открыть сценарий", self.on_open_script),
+            ("Старт", self.on_start_run),
+            ("Продолжить", self.on_resume_run),
+            ("Пауза", self.on_pause_run),
+            ("Остановить", self.on_abort_run),
+            ("Повторить ошибки", self.on_retry_failed),
+            ("Проверить сессию", self.on_check_session),
+        ):
+            action = toolbar.addAction(text)
+            action.triggered.connect(handler)
+
+        central = QtWidgets.QWidget(self)
+        self.setCentralWidget(central)
+        root = QtWidgets.QVBoxLayout(central)
+
+        header = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Медиа-станция по абзацам")
+        title.setObjectName("WindowTitle")
+        subtitle = QtWidgets.QLabel(
+            "Темная тема, русский интерфейс и только нужные действия"
+        )
+        subtitle.setObjectName("WindowSubtitle")
+        title_block = QtWidgets.QVBoxLayout()
+        title_block.addWidget(title)
+        title_block.addWidget(subtitle)
+        self.theme_combo = QtWidgets.QComboBox()
+        self.theme_combo.addItems([label_for_theme(item) for item in THEME_LABELS])
+        self.theme_combo.setCurrentText(label_for_theme(self._theme_id))
+        self.theme_combo.currentTextChanged.connect(self.on_theme_changed)
+        self.status_label = QtWidgets.QLabel("Готово")
+        header.addLayout(title_block)
+        header.addStretch(1)
+        header.addWidget(QtWidgets.QLabel("Тема"))
+        header.addWidget(self.theme_combo)
+        header.addWidget(self.status_label)
+        root.addLayout(header)
+
+        self.main_tabs = QtWidgets.QTabWidget()
+        root.addWidget(self.main_tabs, 1)
+
+        self._build_main_tab(self.main_tabs)
+        self._build_api_keys_tab(self.main_tabs)
+        self._build_session_tab(self.main_tabs)
+        self._build_advanced_tab(self.main_tabs)
+        self._build_history_tab(self.main_tabs)
+
+    def _build_main_tab(self, tabs: QtWidgets.QTabWidget) -> None:
+        tab = QtWidgets.QWidget()
+        tabs.addTab(tab, "Главная")
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        self.project_name_edit = QtWidgets.QLineEdit()
+        self.script_path_edit = QtWidgets.QLineEdit()
+        self.output_dir_edit = QtWidgets.QLineEdit()
+        self.mode_combo = QtWidgets.QComboBox()
+        self.script_path_edit.setMinimumWidth(620)
+        self.output_dir_edit.setMinimumWidth(620)
+        self.mode_combo.setMinimumWidth(420)
+        self.mode_combo.addItems([item.label for item in self._mode_definitions])
+        self.mode_combo.currentTextChanged.connect(
+            lambda _value: self.refresh_preview()
+        )
+        self.mode_combo.setMinimumContentsLength(28)
+        self.project_name_edit.setPlaceholderText("Необязательно")
+
+        launch_box = QtWidgets.QGroupBox("Что запускать")
+        launch_layout = QtWidgets.QGridLayout(launch_box)
+        launch_layout.setColumnStretch(1, 1)
+        row_index = 0
+        launch_layout.addWidget(QtWidgets.QLabel("Название проекта"), row_index, 0)
+        launch_layout.addWidget(self.project_name_edit, row_index, 1)
+        row_index += 1
+        script_row = QtWidgets.QHBoxLayout()
+        script_row.addWidget(self.script_path_edit, 1)
+        browse_script = QtWidgets.QPushButton("Обзор")
+        browse_script.clicked.connect(self.on_browse_script)
+        script_row.addWidget(browse_script)
+        launch_layout.addWidget(QtWidgets.QLabel("Файл сценария"), row_index, 0)
+        launch_layout.addWidget(_wrap_layout(script_row), row_index, 1)
+        row_index += 1
+        output_row = QtWidgets.QHBoxLayout()
+        output_row.addWidget(self.output_dir_edit, 1)
+        browse_output = QtWidgets.QPushButton("Обзор")
+        browse_output.clicked.connect(self.on_browse_output_dir)
+        output_row.addWidget(browse_output)
+        launch_layout.addWidget(QtWidgets.QLabel("Папка вывода"), row_index, 0)
+        launch_layout.addWidget(_wrap_layout(output_row), row_index, 1)
+        row_index += 1
+        launch_layout.addWidget(QtWidgets.QLabel("Режим проекта"), row_index, 0)
+        launch_layout.addWidget(self.mode_combo, row_index, 1)
+        row_index += 1
+        self.paragraph_selection_edit = QtWidgets.QLineEdit()
+        self.paragraph_selection_edit.setPlaceholderText("Например: 5..end, 8-12")
+        self.paragraph_selection_edit.textChanged.connect(
+            lambda _value: self.refresh_preview()
+        )
+        launch_layout.addWidget(QtWidgets.QLabel("Абзацы"), row_index, 0)
+        launch_layout.addWidget(self.paragraph_selection_edit, row_index, 1)
+        row_index += 1
+        count_row = QtWidgets.QHBoxLayout()
+        self.supporting_image_spin = _spin_box(0, 12, 1)
+        self.supporting_image_spin.valueChanged.connect(
+            lambda _value: self.refresh_preview()
+        )
+        self.fallback_image_spin = _spin_box(0, 12, 1)
+        self.fallback_image_spin.valueChanged.connect(
+            lambda _value: self.refresh_preview()
+        )
+        count_row.addWidget(QtWidgets.QLabel("Основные изображения"))
+        count_row.addWidget(self.supporting_image_spin)
+        count_row.addSpacing(16)
+        count_row.addWidget(QtWidgets.QLabel("Резервные изображения"))
+        count_row.addWidget(self.fallback_image_spin)
+        count_row.addStretch(1)
+        launch_layout.addWidget(QtWidgets.QLabel("Media counts"), row_index, 0)
+        launch_layout.addWidget(_wrap_layout(count_row), row_index, 1)
+        layout.addWidget(launch_box)
+
+        ai_box = QtWidgets.QGroupBox("Gemini control")
+        ai_layout = QtWidgets.QVBoxLayout(ai_box)
+        self.manual_prompt_edit = QtWidgets.QPlainTextEdit()
+        self.manual_prompt_edit.setPlaceholderText(
+            "Дополнительный prompt для Gemini. Необязательно."
+        )
+        self.manual_prompt_edit.setMaximumHeight(96)
+        ai_layout.addWidget(self.manual_prompt_edit)
+        self.attach_full_script_context_checkbox = QtWidgets.QCheckBox(
+            "Прикреплять весь сценарий как контекст"
+        )
+        self.attach_full_script_context_checkbox.toggled.connect(
+            lambda _checked: self.refresh_preview()
+        )
+        ai_layout.addWidget(self.attach_full_script_context_checkbox)
+        enrich_button = QtWidgets.QPushButton("Обновить intent через Gemini")
+        enrich_button.clicked.connect(self.on_enrich_project_intents)
+        ai_layout.addWidget(enrich_button)
+        layout.addWidget(ai_box)
+
+        ready_box = QtWidgets.QGroupBox("Перед запуском")
+        ready_layout = QtWidgets.QVBoxLayout(ready_box)
+        self.preview_text = QtWidgets.QPlainTextEdit()
+        self.preview_text.setReadOnly(True)
+        self.preview_text.setMaximumHeight(140)
+        ready_layout.addWidget(self.preview_text)
+        layout.addWidget(ready_box)
+
+        self._build_workspace(layout)
+
+    def _build_api_keys_tab(self, tabs: QtWidgets.QTabWidget) -> None:
+        tab = QtWidgets.QWidget()
+        tabs.addTab(tab, "Ключи API")
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        gemini_box = QtWidgets.QGroupBox("Gemini")
+        gemini_layout = QtWidgets.QVBoxLayout(gemini_box)
+        self.gemini_key_edit = QtWidgets.QLineEdit()
+        self.gemini_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.gemini_key_edit.setPlaceholderText("Введите Gemini API key")
+        gemini_layout.addWidget(self.gemini_key_edit)
+        gemini_buttons = QtWidgets.QHBoxLayout()
+        store_button = QtWidgets.QPushButton("Сохранить")
+        store_button.clicked.connect(self.on_store_gemini_key)
+        clear_button = QtWidgets.QPushButton("Удалить")
+        clear_button.clicked.connect(self.on_clear_gemini_key)
+        gemini_buttons.addWidget(store_button)
+        gemini_buttons.addWidget(clear_button)
+        gemini_layout.addLayout(gemini_buttons)
+        layout.addWidget(gemini_box)
+
+        stock_box = QtWidgets.QGroupBox("Ключи стоков")
+        stock_layout = QtWidgets.QFormLayout(stock_box)
+        self.stock_key_edits: dict[str, QtWidgets.QLineEdit] = {}
+        for provider_id, label in (
+            ("pexels", "Pexels API key"),
+            ("pixabay", "Pixabay API key"),
+        ):
+            row = QtWidgets.QHBoxLayout()
+            edit = QtWidgets.QLineEdit()
+            edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+            edit.setPlaceholderText(f"Введите ключ для {label}")
+            save_button = QtWidgets.QPushButton("Сохранить")
+            save_button.clicked.connect(
+                lambda _checked=False,
+                provider_id=provider_id: self.on_store_provider_key(provider_id)
+            )
+            clear_button = QtWidgets.QPushButton("Удалить")
+            clear_button.clicked.connect(
+                lambda _checked=False,
+                provider_id=provider_id: self.on_clear_provider_key(provider_id)
+            )
+            row.addWidget(edit, 1)
+            row.addWidget(save_button)
+            row.addWidget(clear_button)
+            self.stock_key_edits[provider_id] = edit
+            stock_layout.addRow(label, _wrap_layout(row))
+        layout.addWidget(stock_box)
+        layout.addStretch(1)
+
+    def _build_advanced_tab(self, tabs: QtWidgets.QTabWidget) -> None:
+        tab = QtWidgets.QWidget()
+        tabs.addTab(tab, "Эксперт")
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        self.paragraph_workers_spin = _spin_box(1, 64, 1)
+        self.provider_workers_spin = _spin_box(1, 64, 4)
+        self.download_workers_spin = _spin_box(1, 64, 4)
+        self.relevance_workers_spin = _spin_box(1, 64, 2)
+        self.queue_size_spin = _spin_box(1, 128, 8)
+        self.launch_timeout_spin = _spin_box(1000, 300000, 45000)
+        self.navigation_timeout_spin = _spin_box(1000, 300000, 30000)
+        self.download_timeout_spin = QtWidgets.QDoubleSpinBox()
+        self.download_timeout_spin.setRange(1.0, 3600.0)
+        self.download_timeout_spin.setValue(120.0)
+        self.no_match_budget_spin = QtWidgets.QDoubleSpinBox()
+        self.no_match_budget_spin.setRange(0.0, 3600.0)
+        self.no_match_budget_spin.setValue(20.0)
+        self.top_k_spin = _spin_box(1, 256, 24)
+        self.retry_budget_spin = _spin_box(0, 32, 2)
+        self.full_script_context_budget_spin = _spin_box(1000, 50000, 12000)
+        self.cache_root_edit = QtWidgets.QLineEdit()
+        self.browser_profile_edit = QtWidgets.QLineEdit()
+        self.allow_generic_checkbox = QtWidgets.QCheckBox(
+            "Разрешить обычный веб-поиск изображений"
+        )
+        self.allow_generic_checkbox.toggled.connect(
+            lambda _checked: self.refresh_preview()
+        )
+        self.strictness_combo = QtWidgets.QComboBox()
+        self.strictness_combo.addItems(
+            [label_for_strictness(item) for item in STRICTNESS_LABELS]
+        )
+        self.strictness_combo.currentTextChanged.connect(
+            lambda _value: self.refresh_preview()
+        )
+        self.slow_mode_checkbox = QtWidgets.QCheckBox("Медленный режим браузера")
+        self.slow_mode_checkbox.toggled.connect(lambda _checked: self.refresh_preview())
+        self.free_provider_checks: dict[str, QtWidgets.QCheckBox] = {}
+
+        behavior_box = QtWidgets.QGroupBox("Поведение запуска")
+        behavior_form = QtWidgets.QFormLayout(behavior_box)
+        behavior_form.addRow("Строгость", self.strictness_combo)
+        behavior_form.addRow(self.slow_mode_checkbox)
+        behavior_form.addRow(self.allow_generic_checkbox)
+        layout.addWidget(behavior_box)
+
+        provider_box = QtWidgets.QGroupBox("Источники бесплатных изображений")
+        provider_layout = QtWidgets.QVBoxLayout(provider_box)
+        provider_layout.addWidget(
+            QtWidgets.QLabel(
+                "Используются только в режимах с бесплатными изображениями."
+            )
+        )
+        for provider_id, label in (
+            ("pexels", "Pexels"),
+            ("pixabay", "Pixabay"),
+            ("openverse", "Openverse"),
+            ("wikimedia", "Wikimedia Commons"),
+            ("bing", "Bing (обычные веб-изображения)"),
+        ):
+            checkbox = QtWidgets.QCheckBox(label)
+            checkbox.toggled.connect(lambda _checked, self=self: self.refresh_preview())
+            self.free_provider_checks[provider_id] = checkbox
+            provider_layout.addWidget(checkbox)
+        layout.addWidget(provider_box)
+
+        presets_box = QtWidgets.QGroupBox("Пресеты")
+        presets_layout = QtWidgets.QVBoxLayout(presets_box)
+        presets_layout.addWidget(
+            QtWidgets.QLabel("Сохраняйте наборы настроек для повторного использования.")
+        )
+        self.preset_name_edit = QtWidgets.QLineEdit()
+        self.preset_name_edit.setPlaceholderText("Например: Только видео Storyblocks")
+        presets_layout.addWidget(self.preset_name_edit)
+        preset_buttons = QtWidgets.QHBoxLayout()
+        for text, handler in (
+            ("Сохранить", self.on_save_preset),
+            ("Загрузить", self.on_load_preset),
+            ("Экспорт", self.on_export_preset),
+            ("Импорт", self.on_import_preset),
+        ):
+            button = QtWidgets.QPushButton(text)
+            button.clicked.connect(handler)
+            preset_buttons.addWidget(button)
+        presets_layout.addLayout(preset_buttons)
+        layout.addWidget(presets_box)
+
+        technical_box = QtWidgets.QGroupBox("Технические параметры")
+        technical_form = QtWidgets.QFormLayout(technical_box)
+        technical_form.addRow("Потоки абзацев", self.paragraph_workers_spin)
+        technical_form.addRow("Потоки провайдеров", self.provider_workers_spin)
+        technical_form.addRow("Потоки скачивания", self.download_workers_spin)
+        technical_form.addRow("Потоки релевантности", self.relevance_workers_spin)
+        technical_form.addRow("Размер очереди", self.queue_size_spin)
+        technical_form.addRow("Таймаут запуска, мс", self.launch_timeout_spin)
+        technical_form.addRow("Таймаут навигации, мс", self.navigation_timeout_spin)
+        technical_form.addRow("Таймаут скачивания, с", self.download_timeout_spin)
+        technical_form.addRow("Лимит no-match, с", self.no_match_budget_spin)
+        technical_form.addRow("Top-K релевантности", self.top_k_spin)
+        technical_form.addRow("Лимит повторов", self.retry_budget_spin)
+        technical_form.addRow(
+            "Бюджет full-script context",
+            self.full_script_context_budget_spin,
+        )
+        technical_form.addRow("Папка кэша", self.cache_root_edit)
+        technical_form.addRow("Путь к профилю браузера", self.browser_profile_edit)
+        layout.addWidget(technical_box)
+        layout.addStretch(1)
+
+    def _build_session_tab(self, tabs: QtWidgets.QTabWidget) -> None:
+        tab = QtWidgets.QWidget()
+        tabs.addTab(tab, "Сессия")
+        layout = QtWidgets.QVBoxLayout(tab)
+        self.session_text = QtWidgets.QPlainTextEdit()
+        self.session_text.setReadOnly(True)
+        layout.addWidget(self.session_text, 1)
+        buttons = QtWidgets.QGridLayout()
+        actions = (
+            ("Войти в браузере", self.on_prepare_login),
+            ("Проверить сессию", self.on_check_session),
+            ("Открыть браузер Storyblocks", self.on_open_browser),
+            ("Выйти", self.on_logout),
+            ("Сменить аккаунт", self.on_switch_account),
+            ("Сбросить сессию", self.on_reset_session),
+        )
+        for index, (text, handler) in enumerate(actions):
+            button = QtWidgets.QPushButton(text)
+            button.clicked.connect(handler)
+            self._session_buttons.append(button)
+            buttons.addWidget(button, index // 2, index % 2)
+        layout.addLayout(buttons)
+
+    def _build_history_tab(self, tabs: QtWidgets.QTabWidget) -> None:
+        tab = QtWidgets.QWidget()
+        tabs.addTab(tab, "История")
+        layout = QtWidgets.QVBoxLayout(tab)
+        self.history_list = QtWidgets.QListWidget()
+        self.history_list.itemSelectionChanged.connect(self.on_history_selected)
+        layout.addWidget(self.history_list)
+
+    def _build_workspace(self, parent_layout: QtWidgets.QVBoxLayout) -> None:
+        progress_box = QtWidgets.QGroupBox("Что сейчас происходит")
+        progress_layout = QtWidgets.QVBoxLayout(progress_box)
+        self.run_summary_label = QtWidgets.QLabel("Нет активного запуска")
+        self.run_summary_label.setObjectName("RunSummary")
+        self.run_detail_label = QtWidgets.QLabel("Откройте сценарий и нажмите Старт")
+        self.run_eta_label = QtWidgets.QLabel("")
+        self.run_checkpoint_label = QtWidgets.QLabel("")
+        self.run_progress = QtWidgets.QProgressBar()
+        self.run_progress.setRange(0, 100)
+        self.run_progress.setFormat("%p%")
+        progress_layout.addWidget(self.run_summary_label)
+        progress_layout.addWidget(self.run_detail_label)
+        progress_layout.addWidget(self.run_eta_label)
+        progress_layout.addWidget(self.run_checkpoint_label)
+        progress_layout.addWidget(self.run_progress)
+        parent_layout.addWidget(progress_box)
+
+        journal_box = QtWidgets.QGroupBox("Журнал событий")
+        journal_layout = QtWidgets.QVBoxLayout(journal_box)
+        journal_header = QtWidgets.QHBoxLayout()
+        journal_header.addWidget(
+            QtWidgets.QLabel(
+                "Здесь отображается ход обработки, найденные результаты и возможные ошибки."
+            )
+        )
+        journal_header.addStretch(1)
+        self.export_logs_button = QtWidgets.QPushButton("Скачать логи")
+        self.export_logs_button.clicked.connect(self.on_export_logs)
+        journal_header.addWidget(self.export_logs_button)
+        journal_layout.addLayout(journal_header)
+        self.journal_text = QtWidgets.QPlainTextEdit()
+        self.journal_text.setReadOnly(True)
+        self.journal_text.setMinimumHeight(420)
+        journal_layout.addWidget(self.journal_text, 1)
+        parent_layout.addWidget(journal_box, 1)
+
+        self.project_list = QtWidgets.QListWidget()
+        self.paragraph_list = QtWidgets.QListWidget()
+        self.paragraph_text = QtWidgets.QPlainTextEdit()
+        self.video_queries_text = QtWidgets.QPlainTextEdit()
+        self.image_queries_text = QtWidgets.QPlainTextEdit()
+        self.selected_assets_list = QtWidgets.QListWidget()
+        self.candidate_assets_list = QtWidgets.QListWidget()
+
+    def _quick_form(self) -> UiQuickLaunchSettingsViewModel:
+        selected_mode = self._mode_ids_by_label.get(
+            self.mode_combo.currentText(), "sb_video_only"
+        )
+        provider_ids = [
+            provider_id
+            for provider_id, checkbox in self.free_provider_checks.items()
+            if checkbox.isChecked()
+        ]
+        return UiQuickLaunchSettingsViewModel(
+            project_name=self.project_name_edit.text().strip(),
+            script_path=self.script_path_edit.text().strip(),
+            output_dir=self.output_dir_edit.text().strip(),
+            paragraph_selection_text=self.paragraph_selection_edit.text().strip(),
+            selected_paragraphs=[],
+            mode_id=selected_mode,
+            strictness=self._strictness_ids_by_label.get(
+                self.strictness_combo.currentText().strip(), "balanced"
+            ),
+            slow_mode=self.slow_mode_checkbox.isChecked(),
+            provider_ids=provider_ids,
+            supporting_image_limit=self.supporting_image_spin.value(),
+            fallback_image_limit=self.fallback_image_spin.value(),
+            manual_prompt=self.manual_prompt_edit.toPlainText().strip(),
+            attach_full_script_context=self.attach_full_script_context_checkbox.isChecked(),
+        )
+
+    def _advanced_form(self) -> UiAdvancedSettingsViewModel:
+        return UiAdvancedSettingsViewModel(
+            paragraph_workers=self.paragraph_workers_spin.value(),
+            provider_workers=self.provider_workers_spin.value(),
+            download_workers=self.download_workers_spin.value(),
+            relevance_workers=self.relevance_workers_spin.value(),
+            queue_size=self.queue_size_spin.value(),
+            launch_timeout_ms=self.launch_timeout_spin.value(),
+            navigation_timeout_ms=self.navigation_timeout_spin.value(),
+            downloads_timeout_seconds=self.download_timeout_spin.value(),
+            top_k_to_relevance=self.top_k_spin.value(),
+            retry_budget=self.retry_budget_spin.value(),
+            cache_root=self.cache_root_edit.text().strip(),
+            browser_profile_path=self.browser_profile_edit.text().strip(),
+            allow_generic_web_image=self.allow_generic_checkbox.isChecked(),
+            no_match_budget_seconds=self.no_match_budget_spin.value(),
+            full_script_context_char_budget=self.full_script_context_budget_spin.value(),
+        )
+
+    def refresh(self, *, preserve_forms: bool = False) -> None:
+        state = self.controller.build_state(
+            active_project_id=self.active_project_id, active_run_id=self.active_run_id
+        )
+        self._apply_state(state, preserve_forms=preserve_forms)
+
+    def _poll_refresh(self) -> None:
+        if self.active_project_id is None and self.active_run_id is None:
+            return
+        try:
+            live_state = self.controller.build_live_run_state(
+                active_project_id=self.active_project_id,
+                active_run_id=self.active_run_id,
+                selected_paragraph_no=self._current_paragraph_number(),
+            )
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self._apply_live_state(live_state)
+        terminal_statuses = {"completed", "failed", "cancelled"}
+        if (
+            live_state.run_progress is None
+            or live_state.run_progress.status in terminal_statuses
+        ):
+            self.refresh(preserve_forms=True)
+
+    def _apply_live_state(self, state) -> None:
+        self.active_run_id = state.active_run_id
+        self.status_label.setText(state.status_text)
+        self._render_run_progress(state.run_progress)
+        self._set_session_actions_enabled(self.controller.session_actions_enabled())
+        self._fill_journal(state.event_journal)
+        self.export_logs_button.setEnabled(self.active_run_id is not None)
+
+    def refresh_preview(self) -> None:
+        if self.active_project_id is None:
+            self.preview_text.setPlainText(
+                "Сначала откройте сценарий, чтобы увидеть параметры запуска."
+            )
+            return
+        try:
+            preview = self.controller.build_run_preview(
+                self.active_project_id, self._quick_form(), self._advanced_form()
+            )
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self._render_preview(preview)
+
+    def _apply_state(self, state, *, preserve_forms: bool = False) -> None:
+        self.status_label.setText(state.status_text)
+        if not preserve_forms:
+            if not self.output_dir_edit.text().strip():
+                self.output_dir_edit.setText(state.quick_launch.output_dir)
+            self.mode_combo.setCurrentText(
+                self._mode_labels.get(
+                    state.quick_launch.mode_id, self._mode_labels["sb_video_only"]
+                )
+            )
+            self.strictness_combo.setCurrentText(
+                label_for_strictness(state.quick_launch.strictness)
+            )
+            self.slow_mode_checkbox.setChecked(state.quick_launch.slow_mode)
+            self.paragraph_selection_edit.setText(
+                state.quick_launch.paragraph_selection_text
+            )
+            self.supporting_image_spin.setValue(
+                state.quick_launch.supporting_image_limit
+            )
+            self.fallback_image_spin.setValue(state.quick_launch.fallback_image_limit)
+            self.manual_prompt_edit.setPlainText(state.quick_launch.manual_prompt)
+            self.attach_full_script_context_checkbox.setChecked(
+                state.quick_launch.attach_full_script_context
+            )
+            selected_free = set(state.quick_launch.provider_ids)
+            for provider_id, checkbox in self.free_provider_checks.items():
+                checkbox.setChecked(provider_id in selected_free)
+            self.paragraph_workers_spin.setValue(state.advanced.paragraph_workers)
+            self.provider_workers_spin.setValue(state.advanced.provider_workers)
+            self.download_workers_spin.setValue(state.advanced.download_workers)
+            self.relevance_workers_spin.setValue(state.advanced.relevance_workers)
+            self.queue_size_spin.setValue(state.advanced.queue_size)
+            self.launch_timeout_spin.setValue(state.advanced.launch_timeout_ms)
+            self.navigation_timeout_spin.setValue(state.advanced.navigation_timeout_ms)
+            self.download_timeout_spin.setValue(
+                state.advanced.downloads_timeout_seconds
+            )
+            self.top_k_spin.setValue(state.advanced.top_k_to_relevance)
+            self.retry_budget_spin.setValue(state.advanced.retry_budget)
+            self.no_match_budget_spin.setValue(state.advanced.no_match_budget_seconds)
+            self.full_script_context_budget_spin.setValue(
+                state.advanced.full_script_context_char_budget
+            )
+            self.cache_root_edit.setText(state.advanced.cache_root)
+            self.browser_profile_edit.setText(state.advanced.browser_profile_path)
+            self.allow_generic_checkbox.setChecked(
+                state.advanced.allow_generic_web_image
+            )
+            if not self.gemini_key_edit.text().strip():
+                self.gemini_key_edit.setText(self.controller.get_gemini_key() or "")
+            for provider_id, edit in self.stock_key_edits.items():
+                if not edit.text().strip():
+                    edit.setText(
+                        self.controller.get_provider_api_key(provider_id) or ""
+                    )
+
+        self._fill_history_list(state.run_history)
+        self._render_session(state.session)
+        self._render_preview(state.run_preview)
+        self._render_run_progress(state.run_progress)
+        self._set_session_actions_enabled(self.controller.session_actions_enabled())
+        self._fill_journal(state.event_journal)
+        self.export_logs_button.setEnabled(self.active_run_id is not None)
+
+    def _set_session_actions_enabled(self, enabled: bool) -> None:
+        for button in self._session_buttons:
+            button.setEnabled(enabled)
+
+    def _fill_project_list(self, projects) -> None:
+        self.project_list.blockSignals(True)
+        self.project_list.clear()
+        self._project_ids_by_row = []
+        for project in projects:
+            summary = f"{project.name} ({project.paragraphs_total})"
+            if project.numbering_issues:
+                summary += " - есть проблемы с нумерацией"
+            self.project_list.addItem(summary)
+            self._project_ids_by_row.append(project.project_id)
+        if self.active_project_id in self._project_ids_by_row:
+            self.project_list.setCurrentRow(
+                self._project_ids_by_row.index(self.active_project_id)
+            )
+        self.project_list.blockSignals(False)
+
+    def _fill_history_list(self, runs) -> None:
+        self.history_list.blockSignals(True)
+        self.history_list.clear()
+        self._history_ids_by_row = []
+        for run in runs:
+            self.history_list.addItem(
+                f"{run.run_id} | {translate_run_status(run.status)} | {run.created_at}"
+            )
+            self._history_ids_by_row.append((run.run_id, run.project_id))
+        if self.active_run_id is not None:
+            for index, (run_id, _project_id) in enumerate(self._history_ids_by_row):
+                if run_id == self.active_run_id:
+                    self.history_list.setCurrentRow(index)
+                    break
+        self.history_list.blockSignals(False)
+
+    def _fill_paragraph_list(self, paragraph_items) -> None:
+        signature = self._paragraph_signature(paragraph_items)
+        selected_paragraph_no = self._current_paragraph_number()
+        if signature == self._last_paragraph_signature:
+            return
+        self.paragraph_list.blockSignals(True)
+        self.paragraph_list.clear()
+        self._paragraph_numbers_by_row = []
+        for item in paragraph_items:
+            label = f"P{item.paragraph_no} | {translate_paragraph_status(item.status)}"
+            if not item.numbering_valid:
+                label += " | проблема нумерации"
+            self.paragraph_list.addItem(label)
+            self._paragraph_numbers_by_row.append(item.paragraph_no)
+        if selected_paragraph_no in self._paragraph_numbers_by_row:
+            self.paragraph_list.setCurrentRow(
+                self._paragraph_numbers_by_row.index(selected_paragraph_no)
+            )
+        elif self._paragraph_numbers_by_row:
+            self.paragraph_list.setCurrentRow(0)
+        self.paragraph_list.blockSignals(False)
+        self._last_paragraph_signature = signature
+
+    def _render_preview(self, preview) -> None:
+        if preview is None:
+            self.preview_text.setPlainText("")
+            return
+        lines = [
+            f"Проект: {preview.project_name}",
+            f"Режим: {preview.mode_label}",
+            f"Вывод: {preview.output_dir}",
+            f"Абзацы: {preview.selected_paragraphs}/{preview.paragraphs_total}",
+            f"Провайдеры: {', '.join(translate_provider(item) for item in preview.providers) if preview.providers else 'нет'}",
+            "",
+            *preview.summary_lines,
+        ]
+        if preview.warnings:
+            lines.extend(
+                [
+                    "",
+                    "Предупреждения:",
+                    *[f"- {warning}" for warning in preview.warnings],
+                ]
+            )
+        self.preview_text.setPlainText("\n".join(lines))
+
+    def _render_run_progress(self, progress) -> None:
+        if progress is None:
+            self.run_summary_label.setText("Нет активного запуска")
+            self.run_detail_label.setText("Откройте сценарий и нажмите Старт")
+            self.run_eta_label.setText("")
+            self.run_checkpoint_label.setText("")
+            self.run_progress.setValue(0)
+            return
+        self.run_summary_label.setText(
+            f"Обработано {progress.project_progress_completed} из {progress.project_progress_total} абзацев"
+        )
+        stage = translate_run_stage(progress.current_stage)
+        current = (
+            f"абзац {progress.current_paragraph_no}"
+            if progress.current_paragraph_no is not None
+            else "ожидание"
+        )
+        self.run_detail_label.setText(
+            f"{translate_run_status(progress.status)} - {stage} - {current}"
+        )
+        self.run_eta_label.setText(progress.eta_text)
+        self.run_checkpoint_label.setText(
+            f"Найдено: {progress.paragraphs_matched} · Без результата: {progress.paragraphs_no_match} · Ошибки: {progress.paragraphs_failed}"
+        )
+        self.run_progress.setValue(int(progress.percent_complete))
+
+    def _fill_journal(self, items) -> None:
+        signature = self._journal_signature(items)
+        if signature == self._last_journal_signature:
+            return
+        lines: list[str] = []
+        for item in items:
+            context = []
+            if item.paragraph_no is not None:
+                context.append(f"P{item.paragraph_no}")
+            if item.provider_name:
+                context.append(translate_provider(item.provider_name))
+            if item.query:
+                context.append(item.query)
+            if item.current_asset_id:
+                context.append(item.current_asset_id)
+            suffix = f" [{' | '.join(context)}]" if context else ""
+            lines.append(
+                f"{item.created_at[-8:]} | {translate_severity(item.severity)} | {translate_run_stage(item.stage)} | {item.message}{suffix}"
+            )
+        self.journal_text.setPlainText("\n".join(lines))
+        self._last_journal_signature = signature
+
+    def _paragraph_signature(
+        self, paragraph_items
+    ) -> tuple[tuple[int, str, str, bool], ...]:
+        return tuple(
+            (
+                item.paragraph_no,
+                item.status,
+                item.user_decision_status,
+                item.numbering_valid,
+            )
+            for item in paragraph_items
+        )
+
+    def _journal_signature(self, items) -> tuple[int, str, str]:
+        if not items:
+            return (0, "", "")
+        latest = items[0]
+        return (len(items), latest.created_at, latest.message)
+
+    def _render_current_paragraph_detail(self, paragraph_items) -> None:
+        if not paragraph_items:
+            return
+        selected_paragraph_no = self._current_paragraph_number()
+        if selected_paragraph_no is not None:
+            for item in paragraph_items:
+                if item.paragraph_no == selected_paragraph_no:
+                    self._render_paragraph_detail(item)
+                    return
+        self._render_paragraph_detail(paragraph_items[0])
+
+    def _render_session(self, session) -> None:
+        lines = [
+            f"Профиль: {session.profile_name or session.profile_id or 'не выбран'}",
+            f"Состояние: {translate_session_health(session.health)}",
+            f"Аккаунт: {session.account or 'вход не выполнен'}",
+            f"Браузер готов: {yes_no(session.browser_ready)}",
+            f"Окно входа открыто: {yes_no(session.native_login_running)}",
+            f"Текущий URL: {session.current_url or '-'}",
+        ]
+        if session.native_debug_port is not None:
+            lines.append(f"Debug port: {session.native_debug_port}")
+        if session.imported_source:
+            lines.append(f"Импортировано из: {session.imported_source}")
+        if session.imported_profile_name:
+            lines.append(f"Импортированный профиль: {session.imported_profile_name}")
+        if session.imported_at:
+            lines.append(f"Дата импорта: {session.imported_at}")
+        if session.reason_code:
+            lines.append(f"Reason code: {session.reason_code}")
+        if session.manual_ready_override:
+            lines.append(
+                f"Ручное подтверждение: да ({session.manual_ready_override_note or 'подтверждено оператором'})"
+            )
+        if session.diagnostic_lines:
+            lines.extend(["", "Диагностика:", *session.diagnostic_lines])
+        if session.manual_prompt:
+            lines.extend(["", session.manual_prompt])
+        if session.last_error:
+            lines.extend(["", f"Последняя ошибка: {session.last_error}"])
+        self.session_text.setPlainText("\n".join(lines))
+
+    def _render_paragraph_detail(self, item) -> None:
+        detail_lines = [
+            f"Абзац #{item.paragraph_no}",
+            f"Статус: {translate_paragraph_status(item.status)}",
+        ]
+        if item.validation_issues:
+            detail_lines.extend(
+                [
+                    "Проблемы валидации:",
+                    *[f"- {issue}" for issue in item.validation_issues],
+                ]
+            )
+        detail_lines.extend(["", item.text])
+        self.paragraph_text.setPlainText("\n".join(detail_lines))
+        self.video_queries_text.setPlainText("\n".join(item.video_queries))
+        self.image_queries_text.setPlainText("\n".join(item.image_queries))
+        self.selected_assets_list.clear()
+        self._selected_asset_ids_by_row = []
+        for asset in item.selected_assets:
+            self.selected_assets_list.addItem(
+                f"{translate_provider(asset.provider_name)} | {translate_asset_role(asset.role)} | {asset.title}"
+                + (f" | {asset.local_path}" if asset.local_path else "")
+            )
+            self._selected_asset_ids_by_row.append(asset.asset_id)
+        self.candidate_assets_list.clear()
+        self._candidate_asset_ids_by_row = []
+
+    def on_browse_script(self) -> None:
+        path, _selected = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Открыть сценарий",
+            str(Path.cwd()),
+            "Документы Word (*.docx);;Все файлы (*)",
+        )
+        if not path:
+            return
+        self.script_path_edit.setText(path)
+        if not self.project_name_edit.text().strip():
+            self.project_name_edit.setText(Path(path).stem.replace("_", " "))
+
+    def on_browse_output_dir(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Выберите папку вывода",
+            self.output_dir_edit.text() or str(Path.cwd()),
+        )
+        if path:
+            self.output_dir_edit.setText(path)
+
+    def on_open_script(self) -> None:
+        try:
+            summary = self.controller.open_script(
+                self.script_path_edit.text(),
+                project_name=self.project_name_edit.text().strip() or None,
+            )
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.active_project_id = summary.project_id
+        self.refresh(preserve_forms=True)
+
+    def on_start_run(self) -> None:
+        if self.active_project_id is None:
+            self.on_open_script()
+            if self.active_project_id is None:
+                return
+        try:
+            run_id = self.controller.start_run_async(
+                self.active_project_id, self._quick_form(), self._advanced_form()
+            )
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.active_run_id = run_id
+        self.refresh(preserve_forms=True)
+
+    def on_resume_run(self) -> None:
+        if self.active_run_id is None:
+            return
+        try:
+            self.controller.resume_run_async(self.active_run_id, self._advanced_form())
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.refresh(preserve_forms=True)
+
+    def on_pause_run(self) -> None:
+        if self.active_run_id is None:
+            return
+        try:
+            self.controller.pause_run(self.active_run_id)
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.refresh(preserve_forms=True)
+
+    def on_stop_after_current(self) -> None:
+        if self.active_run_id is None:
+            return
+        try:
+            self.controller.stop_after_current(self.active_run_id)
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.refresh(preserve_forms=True)
+
+    def on_abort_run(self) -> None:
+        if self.active_run_id is None:
+            return
+        try:
+            self.controller.cancel_run(self.active_run_id)
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.refresh(preserve_forms=True)
+
+    def on_retry_failed(self) -> None:
+        if self.active_run_id is None:
+            return
+        try:
+            self.active_run_id = self.controller.retry_failed_run_async(
+                self.active_run_id, self._advanced_form()
+            )
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.refresh(preserve_forms=True)
+
+    def on_save_preset(self) -> None:
+        name = self.preset_name_edit.text().strip()
+        if not name:
+            self._show_notification(handle_ui_error(ValueError("Укажите имя пресета.")))
+            return
+        try:
+            self.controller.save_preset(name, self._quick_form(), self._advanced_form())
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.refresh()
+
+    def on_load_preset(self) -> None:
+        name = self.preset_name_edit.text().strip()
+        if not name:
+            self._show_notification(handle_ui_error(ValueError("Укажите имя пресета.")))
+            return
+        try:
+            quick, advanced = self.controller.load_preset(name)
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self._apply_quick_form(quick)
+        self._apply_advanced_form(advanced)
+        self.refresh_preview()
+
+    def on_export_preset(self) -> None:
+        name = self.preset_name_edit.text().strip()
+        if not name:
+            self._show_notification(handle_ui_error(ValueError("Укажите имя пресета.")))
+            return
+        path, _selected = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Экспорт пресета", f"{name}.json", "JSON files (*.json)"
+        )
+        if not path:
+            return
+        try:
+            self.controller.export_preset(name, path)
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        QtWidgets.QMessageBox.information(self, "Пресет", "Пресет экспортирован")
+
+    def on_import_preset(self) -> None:
+        path, _selected = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Импорт пресета",
+            str(Path.cwd()),
+            "JSON files (*.json);;Все файлы (*)",
+        )
+        if not path:
+            return
+        try:
+            preset = self.controller.import_preset(path)
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.preset_name_edit.setText(preset.name)
+        self.refresh()
+
+    def on_store_gemini_key(self) -> None:
+        self._show_notification(
+            self.controller.set_gemini_key(self.gemini_key_edit.text())
+        )
+
+    def on_clear_gemini_key(self) -> None:
+        self.controller.delete_gemini_key()
+        self.gemini_key_edit.clear()
+        QtWidgets.QMessageBox.information(self, "Ключ Gemini", "Ключ Gemini удален")
+
+    def on_store_provider_key(self, provider_id: str) -> None:
+        edit = self.stock_key_edits.get(provider_id)
+        if edit is None:
+            return
+        self._show_notification(
+            self.controller.set_provider_api_key(provider_id, edit.text())
+        )
+
+    def on_clear_provider_key(self, provider_id: str) -> None:
+        edit = self.stock_key_edits.get(provider_id)
+        if edit is not None:
+            edit.clear()
+        self._show_notification(self.controller.delete_provider_api_key(provider_id))
+
+    def on_open_browser(self) -> None:
+        self._run_session_action(self.controller.open_storyblocks_browser)
+
+    def on_prepare_login(self) -> None:
+        self._run_session_action(self.controller.prepare_storyblocks_login)
+
+    def on_import_chrome_session(self) -> None:
+        self._import_existing_session("chrome")
+
+    def on_import_edge_session(self) -> None:
+        self._import_existing_session("msedge")
+
+    def on_reimport_session(self) -> None:
+        self._run_session_action(self.controller.reimport_storyblocks_session)
+
+    def on_logout(self) -> None:
+        self._run_session_action(self.controller.logout_storyblocks)
+
+    def on_switch_account(self) -> None:
+        self._run_session_action(self.controller.switch_storyblocks_account)
+
+    def on_check_session(self) -> None:
+        self._run_session_action(self.controller.check_storyblocks_session)
+
+    def on_reset_session(self) -> None:
+        self._run_session_action(self.controller.reset_storyblocks_session)
+
+    def on_mark_session_ready(self) -> None:
+        self._run_session_action(self.controller.mark_storyblocks_session_ready)
+
+    def on_clear_session_override(self) -> None:
+        self._run_session_action(self.controller.clear_storyblocks_session_override)
+
+    def on_clear_profile(self) -> None:
+        self._run_session_action(self.controller.clear_storyblocks_profile)
+
+    def on_enrich_project_intents(self) -> None:
+        if self.active_project_id is None:
+            self.on_open_script()
+            if self.active_project_id is None:
+                return
+        try:
+            self.controller.enrich_project_intents_with_ai(
+                self.active_project_id,
+                self._quick_form(),
+                self._advanced_form(),
+            )
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.refresh(preserve_forms=True)
+
+    def on_project_selected(self) -> None:
+        row = self.project_list.currentRow()
+        if row < 0 or row >= len(self._project_ids_by_row):
+            return
+        self.active_project_id = self._project_ids_by_row[row]
+        self.refresh()
+
+    def on_history_selected(self) -> None:
+        row = self.history_list.currentRow()
+        if row < 0 or row >= len(self._history_ids_by_row):
+            return
+        self.active_run_id, self.active_project_id = self._history_ids_by_row[row]
+        self.main_tabs.setCurrentIndex(0)
+        self.refresh()
+
+    def on_export_logs(self) -> None:
+        if self.active_run_id is None:
+            return
+        default_name = f"run-{self.active_run_id}.log"
+        path, _selected = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Сохранить журнал запуска",
+            default_name,
+            "Log files (*.log);;Text files (*.txt);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            saved = self.controller.export_run_log(self.active_run_id, path)
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        QtWidgets.QMessageBox.information(
+            self,
+            "Журнал событий",
+            f"Лог сохранен: {saved}",
+        )
+
+    def on_paragraph_selected(self) -> None:
+        if self.active_project_id is None:
+            return
+        row = self.paragraph_list.currentRow()
+        if row < 0 or row >= len(self._paragraph_numbers_by_row):
+            return
+        paragraph_no = self._paragraph_numbers_by_row[row]
+        item = self.controller.build_paragraph_detail(
+            self.active_project_id, paragraph_no, self.active_run_id
+        )
+        if item is not None:
+            self._render_paragraph_detail(item)
+
+    def on_save_queries(self) -> None:
+        if self.active_project_id is None:
+            return
+        paragraph_no = self._current_paragraph_number()
+        if paragraph_no is None:
+            return
+        try:
+            self.controller.update_paragraph_queries(
+                self.active_project_id,
+                paragraph_no,
+                video_queries=self.video_queries_text.toPlainText().splitlines(),
+                image_queries=self.image_queries_text.toPlainText().splitlines(),
+            )
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.refresh()
+
+    def on_lock_asset(self) -> None:
+        if self.active_run_id is None:
+            return
+        paragraph_no = self._current_paragraph_number()
+        asset_id = self._current_candidate_asset_id()
+        if paragraph_no is None or asset_id is None:
+            return
+        try:
+            self.controller.lock_asset(self.active_run_id, paragraph_no, asset_id)
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.refresh()
+
+    def on_reject_asset(self) -> None:
+        if self.active_run_id is None:
+            return
+        paragraph_no = self._current_paragraph_number()
+        asset_id = self._current_candidate_asset_id()
+        if paragraph_no is None or asset_id is None:
+            return
+        try:
+            self.controller.reject_asset(self.active_run_id, paragraph_no, asset_id)
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.refresh()
+
+    def on_rerun_current_paragraph(self) -> None:
+        if self.active_project_id is None:
+            return
+        paragraph_no = self._current_paragraph_number()
+        if paragraph_no is None:
+            return
+        try:
+            self.active_run_id = self.controller.rerun_current_paragraph_async(
+                self.active_project_id,
+                paragraph_no,
+                self._quick_form(),
+                self._advanced_form(),
+            )
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.refresh(preserve_forms=True)
+
+    def on_rerun_selected_paragraphs(self) -> None:
+        if self.active_project_id is None:
+            return
+        rows = sorted({index.row() for index in self.paragraph_list.selectedIndexes()})
+        paragraph_numbers = [
+            self._paragraph_numbers_by_row[row]
+            for row in rows
+            if row < len(self._paragraph_numbers_by_row)
+        ]
+        if not paragraph_numbers:
+            return
+        try:
+            self.active_run_id = self.controller.rerun_selected_paragraphs_async(
+                self.active_project_id,
+                paragraph_numbers,
+                self._quick_form(),
+                self._advanced_form(),
+            )
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self.refresh(preserve_forms=True)
+
+    def _current_paragraph_number(self) -> int | None:
+        row = self.paragraph_list.currentRow()
+        if row < 0 or row >= len(self._paragraph_numbers_by_row):
+            return None
+        return self._paragraph_numbers_by_row[row]
+
+    def _current_candidate_asset_id(self) -> str | None:
+        row = self.candidate_assets_list.currentRow()
+        if row < 0 or row >= len(self._candidate_asset_ids_by_row):
+            return None
+        return self._candidate_asset_ids_by_row[row]
+
+    def _apply_quick_form(self, quick: UiQuickLaunchSettingsViewModel) -> None:
+        self.project_name_edit.setText(quick.project_name)
+        self.script_path_edit.setText(quick.script_path)
+        self.output_dir_edit.setText(quick.output_dir)
+        self.paragraph_selection_edit.setText(quick.paragraph_selection_text)
+        self.mode_combo.setCurrentText(
+            self._mode_labels.get(quick.mode_id, self._mode_labels["sb_video_only"])
+        )
+        self.strictness_combo.setCurrentText(label_for_strictness(quick.strictness))
+        self.slow_mode_checkbox.setChecked(quick.slow_mode)
+        self.supporting_image_spin.setValue(quick.supporting_image_limit)
+        self.fallback_image_spin.setValue(quick.fallback_image_limit)
+        self.manual_prompt_edit.setPlainText(quick.manual_prompt)
+        self.attach_full_script_context_checkbox.setChecked(
+            quick.attach_full_script_context
+        )
+        selected_free = set(quick.provider_ids)
+        for provider_id, checkbox in self.free_provider_checks.items():
+            checkbox.setChecked(provider_id in selected_free)
+
+    def _apply_advanced_form(self, advanced: UiAdvancedSettingsViewModel) -> None:
+        self.paragraph_workers_spin.setValue(advanced.paragraph_workers)
+        self.provider_workers_spin.setValue(advanced.provider_workers)
+        self.download_workers_spin.setValue(advanced.download_workers)
+        self.relevance_workers_spin.setValue(advanced.relevance_workers)
+        self.queue_size_spin.setValue(advanced.queue_size)
+        self.launch_timeout_spin.setValue(advanced.launch_timeout_ms)
+        self.navigation_timeout_spin.setValue(advanced.navigation_timeout_ms)
+        self.download_timeout_spin.setValue(advanced.downloads_timeout_seconds)
+        self.no_match_budget_spin.setValue(advanced.no_match_budget_seconds)
+        self.top_k_spin.setValue(advanced.top_k_to_relevance)
+        self.retry_budget_spin.setValue(advanced.retry_budget)
+        self.full_script_context_budget_spin.setValue(
+            advanced.full_script_context_char_budget
+        )
+        self.cache_root_edit.setText(advanced.cache_root)
+        self.browser_profile_edit.setText(advanced.browser_profile_path)
+        self.allow_generic_checkbox.setChecked(advanced.allow_generic_web_image)
+
+    def _run_session_action(self, action) -> None:
+        try:
+            session = action()
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+        self._render_session(session)
+        self.refresh()
+
+    def _import_existing_session(self, browser_name: str) -> None:
+        try:
+            options = self.controller.discover_storyblocks_sessions(browser_name)
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
+            return
+
+        selected_path = ""
+        selected_browser = browser_name
+        if options:
+            labels = [item.display_label for item in options]
+            label, accepted = QtWidgets.QInputDialog.getItem(
+                self,
+                "Импорт существующей сессии",
+                "Выберите найденный профиль браузера для импорта:",
+                labels,
+                0,
+                False,
+            )
+            if not accepted:
+                return
+            selected = next(item for item in options if item.display_label == label)
+            selected_path = selected.profile_dir
+            selected_browser = selected.browser_name
+        else:
+            caption = "Выберите папку профиля Chrome/Edge (Default/Profile X)"
+            selected_path = QtWidgets.QFileDialog.getExistingDirectory(
+                self, caption, str(Path.home())
+            )
+            if not selected_path:
+                return
+        self._run_session_action(
+            lambda selected_path=selected_path,
+            selected_browser=selected_browser: self.controller.import_storyblocks_session_from_path(
+                selected_path,
+                browser_name=selected_browser,
+            )
+        )
+
+    def _show_notification(self, notification) -> None:
+        self.status_label.setText(notification.message)
+        icon = QtWidgets.QMessageBox.Icon.Information
+        if notification.severity == "error":
+            icon = QtWidgets.QMessageBox.Icon.Critical
+        elif notification.severity == "warning":
+            icon = QtWidgets.QMessageBox.Icon.Warning
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle(notification.title)
+        box.setText(notification.message)
+        box.setIcon(icon)
+        box.exec()
+
+    def on_theme_changed(self, label: str) -> None:
+        theme_id = normalize_ui_theme(self._theme_ids_by_label.get(label, "dark"))
+        if theme_id == self._theme_id:
+            return
+        self._theme_id = self.controller.set_ui_theme(theme_id)
+        self._apply_theme(self._theme_id)
+
+    def _apply_theme(self, theme_id: str) -> None:
+        theme = get_ui_theme(theme_id)
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.setStyle("Fusion")
+            palette = QtGui.QPalette()
+            palette.setColor(
+                QtGui.QPalette.ColorRole.Window, QtGui.QColor(theme.window_bg)
+            )
+            palette.setColor(
+                QtGui.QPalette.ColorRole.WindowText, QtGui.QColor(theme.text)
+            )
+            palette.setColor(
+                QtGui.QPalette.ColorRole.Base, QtGui.QColor(theme.input_bg)
+            )
+            palette.setColor(
+                QtGui.QPalette.ColorRole.AlternateBase,
+                QtGui.QColor(theme.surface_alt_bg),
+            )
+            palette.setColor(
+                QtGui.QPalette.ColorRole.ToolTipBase, QtGui.QColor(theme.surface_bg)
+            )
+            palette.setColor(
+                QtGui.QPalette.ColorRole.ToolTipText, QtGui.QColor(theme.text)
+            )
+            palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor(theme.text))
+            palette.setColor(
+                QtGui.QPalette.ColorRole.Button, QtGui.QColor(theme.surface_bg)
+            )
+            palette.setColor(
+                QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor(theme.text)
+            )
+            palette.setColor(
+                QtGui.QPalette.ColorRole.Highlight, QtGui.QColor(theme.selection)
+            )
+            palette.setColor(
+                QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor(theme.text)
+            )
+            app.setPalette(palette)
+        self.setStyleSheet(
+            f"""
+            QMainWindow, QWidget {{
+                background: {theme.window_bg};
+                color: {theme.text};
+                font-family: 'Segoe UI';
+                font-size: 13px;
+            }}
+            QLabel#WindowTitle {{
+                font-size: 24px;
+                font-weight: 700;
+                color: {theme.text};
+            }}
+            QLabel#WindowSubtitle {{
+                color: {theme.muted_text};
+                font-size: 12px;
+            }}
+            QLabel#RunSummary {{
+                font-size: 22px;
+                font-weight: 700;
+                color: {theme.text};
+            }}
+            QToolBar {{
+                background: {theme.surface_bg};
+                border: 1px solid {theme.border};
+                spacing: 6px;
+                padding: 8px;
+            }}
+            QToolButton {{
+                background: {theme.surface_alt_bg};
+                border: 1px solid {theme.border};
+                border-radius: 8px;
+                padding: 8px 12px;
+            }}
+            QToolButton:hover {{
+                background: {theme.selection};
+            }}
+            QLineEdit, QPlainTextEdit, QListWidget, QComboBox, QSpinBox, QDoubleSpinBox {{
+                background: {theme.input_bg};
+                border: 1px solid {theme.border};
+                border-radius: 8px;
+                padding: 6px;
+                color: {theme.text};
+                selection-background-color: {theme.selection};
+            }}
+            QTabWidget::pane, QGroupBox {{
+                background: {theme.surface_bg};
+                border: 1px solid {theme.border};
+                border-radius: 12px;
+                margin-top: 12px;
+                padding-top: 8px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 14px;
+                padding: 0 6px;
+                color: {theme.muted_text};
+            }}
+            QTabBar::tab {{
+                background: {theme.surface_alt_bg};
+                border: 1px solid {theme.border};
+                padding: 8px 14px;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+                margin-right: 4px;
+            }}
+            QTabBar::tab:selected {{
+                background: {theme.accent};
+                color: #ffffff;
+                border-color: {theme.accent};
+            }}
+            QPushButton {{
+                background: {theme.surface_alt_bg};
+                border: 1px solid {theme.border};
+                border-radius: 8px;
+                padding: 8px 12px;
+                color: {theme.text};
+            }}
+            QPushButton:hover {{
+                background: {theme.selection};
+            }}
+            QPushButton:pressed {{
+                background: {theme.accent_pressed};
+                color: #ffffff;
+            }}
+            QPushButton:disabled {{
+                color: {theme.muted_text};
+                background: {theme.surface_bg};
+            }}
+            QProgressBar {{
+                border: 1px solid {theme.border};
+                border-radius: 8px;
+                background: {theme.input_bg};
+                text-align: center;
+            }}
+            QProgressBar::chunk {{
+                background: {theme.accent};
+                border-radius: 7px;
+            }}
+            """
+        )
+
+
+def launch_pyside_app(controller: DesktopGuiController) -> None:
+    app = QtWidgets.QApplication.instance()
+    owns_app = app is None
+    if app is None:
+        app = QtWidgets.QApplication([])
+    window = DesktopQtApp(controller)
+    window.show()
+    if owns_app:
+        app.exec()
+
+
+def _wrap_layout(layout: QtWidgets.QLayout) -> QtWidgets.QWidget:
+    widget = QtWidgets.QWidget()
+    widget.setLayout(layout)
+    return widget
+
+
+def _spin_box(minimum: int, maximum: int, value: int) -> QtWidgets.QSpinBox:
+    widget = QtWidgets.QSpinBox()
+    widget.setRange(minimum, maximum)
+    widget.setValue(value)
+    return widget

@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "app",
+    "browser",
+    "config",
+    "domain",
+    "pipeline",
+    "providers",
+    "services",
+    "storage",
+    "ui",
+]

@@ -1,0 +1,77 @@
+Video:
+1) https://www.storyblocks.com/
+2) Пишу в поисковую строку Old Castle и нажимаю кнопку поиска
+3) Переход на https://www.storyblocks.com/all-video/search/old-castle
+4) Нажимаю на первое видео
+5) Перехожу на https://www.storyblocks.com/video/stock/narrow-corridor-in-the-old-castle-the-play-of-light-and-shadow-347070435
+6) Нажимаю кнопку скачивания 
+7) Видео успешно скачано
+
+Код записи:
+import re
+from playwright.sync_api import Playwright, sync_playwright, expect
+
+
+def run(playwright: Playwright) -> None:
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.goto("https://www.storyblocks.com/")
+    page.get_by_role("combobox", name="Input Search:").click()
+    page.get_by_role("combobox", name="Input Search:").fill("old castle")
+    page.get_by_role("combobox", name="Input Search:").press("Enter")
+    page.get_by_role("button", name="Submit Search").click()
+    page.get_by_test_id("justified-gallery-item-347070435").get_by_role("link", name="Go to video details for").click()
+    with page.expect_download() as download_info:
+        page.get_by_role("button", name="Download", exact=True).click()
+    download = download_info.value
+
+    # ---------------------
+    context.close()
+    browser.close()
+
+
+with sync_playwright() as playwright:
+    run(playwright)
+
+Image:
+1) https://www.storyblocks.com/
+2) Пишу в поисковую строку Old Castle и нажимаю кнопку поиска
+3) Переход на https://www.storyblocks.com/images/search/old-castle
+4) Нажимаю на изображение
+5) Перехожу на https://www.storyblocks.com/images/stock/bran-castle-in-transylvania-draculas-castle-real-time-4k-351393562
+6) Нажимаю кнопку скачивания 
+7) Изображение успешно скачано
+
+Код записи (вначале случайно нажал на Audio вместо Image):
+import re
+from playwright.sync_api import Playwright, sync_playwright, expect
+
+
+def run(playwright: Playwright) -> None:
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.goto("https://www.storyblocks.com/")
+    page.get_by_role("button", name="Audio").click()
+    page.get_by_role("combobox", name="Input Search:").click()
+    page.get_by_role("combobox", name="Input Search:").fill("old castle")
+    page.get_by_role("button", name="Submit Search").click()
+    page.goto("https://www.storyblocks.com/")
+    page.get_by_role("button", name="Images").click()
+    page.get_by_role("combobox", name="Input Search:").click()
+    page.get_by_role("combobox", name="Input Search:").fill("old castle")
+    page.get_by_role("button", name="Submit Search").click()
+    page.get_by_role("link", name="Bran Castle in Transylvania,").click()
+    with page.expect_download() as download_info:
+        page.get_by_role("button", name="Download", exact=True).click()
+    download = download_info.value
+
+    # ---------------------
+    context.close()
+    browser.close()
+
+
+with sync_playwright() as playwright:
+    run(playwright)
+
