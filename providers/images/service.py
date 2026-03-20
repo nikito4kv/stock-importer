@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from services.errors import ProviderSearchError
+from services.retry import is_timeout_exception
 
 from ..registry import ProviderRegistry
 from .caching import MetadataCache, SearchResultCache
@@ -15,6 +19,56 @@ from .clients import (
 )
 from .filtering import ImageLicensePolicy, filter_and_rank_candidates
 from .querying import ImageQueryPlanner
+
+
+def _enrich_provider_search_error(
+    exc: ProviderSearchError,
+    *,
+    provider_id: str,
+    provider_queries: list[str],
+    failed_query: str,
+) -> ProviderSearchError:
+    details = dict(exc.details)
+    details.setdefault("provider_id", provider_id)
+    details.setdefault("provider_queries", list(provider_queries))
+    details.setdefault("failed_query", failed_query)
+    return ProviderSearchError(
+        code=exc.code,
+        message=str(exc),
+        provider_id=provider_id,
+        details=details,
+        retryable=exc.retryable,
+        fatal=exc.fatal,
+    )
+
+
+def _wrap_provider_search_exception(
+    exc: Exception,
+    *,
+    provider_id: str,
+    provider_queries: list[str],
+    failed_query: str,
+) -> ProviderSearchError:
+    if isinstance(exc, ProviderSearchError):
+        return _enrich_provider_search_error(
+            exc,
+            provider_id=provider_id,
+            provider_queries=provider_queries,
+            failed_query=failed_query,
+        )
+
+    retryable = is_timeout_exception(exc)
+    code = "provider_search_timeout" if retryable else "provider_search_failed"
+    return ProviderSearchError(
+        code=code,
+        message=f"{provider_id} search failed for '{failed_query}': {exc}",
+        provider_id=provider_id,
+        retryable=retryable,
+        details={
+            "provider_queries": list(provider_queries),
+            "failed_query": failed_query,
+        },
+    )
 
 
 @dataclass(slots=True)
@@ -34,15 +88,74 @@ class ImageProviderSearchService:
     ):
         cache_dir = default_cache_root(cache_root)
         self._registry = registry
+        self._cache_dir = cache_dir
         self._query_planner = ImageQueryPlanner()
-        self._search_cache = SearchResultCache(cache_dir / "search_results.sqlite")
-        self._metadata_cache = MetadataCache(cache_dir / "metadata.sqlite")
+        self._search_cache_instance: SearchResultCache | None = None
+        self._metadata_cache_instance: MetadataCache | None = None
+        self._closed = False
+
+    @property
+    def _search_cache(self) -> SearchResultCache:
+        cache = self._search_cache_instance
+        if cache is not None:
+            return cache
+        if self._closed:
+            raise RuntimeError("ImageProviderSearchService is closed")
+        cache = SearchResultCache(self._cache_dir / "search_results.sqlite")
+        self._search_cache_instance = cache
+        return cache
+
+    @property
+    def _metadata_cache(self) -> MetadataCache:
+        cache = self._metadata_cache_instance
+        if cache is not None:
+            return cache
+        if self._closed:
+            raise RuntimeError("ImageProviderSearchService is closed")
+        cache = MetadataCache(self._cache_dir / "metadata.sqlite")
+        self._metadata_cache_instance = cache
+        return cache
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("ImageProviderSearchService is closed")
+
+    def _provider_supports_timeout_seconds(
+        self,
+        provider: ImageSearchProvider,
+    ) -> bool:
+        try:
+            parameters = inspect.signature(provider.search).parameters.values()
+        except (TypeError, ValueError):
+            return True
+        return any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            or parameter.name == "timeout_seconds"
+            for parameter in parameters
+        )
+
+    def _search_with_compatible_signature(
+        self,
+        provider: ImageSearchProvider,
+        query: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None,
+    ) -> list[SearchCandidate]:
+        if self._provider_supports_timeout_seconds(provider):
+            return provider.search(
+                query,
+                limit,
+                timeout_seconds=timeout_seconds,
+            )
+        return provider.search(query, limit)
 
     def build_providers(
         self,
         provider_ids: list[str],
         context: ImageProviderBuildContext,
     ) -> list[WrappedImageSearchProvider]:
+        self._require_open()
         return build_image_provider_clients(self._registry, provider_ids, context)
 
     def search_keyword(
@@ -54,6 +167,7 @@ class ImageProviderSearchService:
         max_candidates_per_keyword: int,
         license_policy: ImageLicensePolicy,
     ) -> tuple[list[SearchCandidate], list[str], ImageSearchDiagnostics]:
+        self._require_open()
         all_candidates: list[SearchCandidate] = []
         errors: list[str] = []
         rejected_prefilters: list[str] = []
@@ -67,14 +181,27 @@ class ImageProviderSearchService:
             return [], ["No image providers are configured"], ImageSearchDiagnostics({}, [], 0)
 
         for provider in providers:
-            provider_candidates, provider_errors, provider_diagnostics = self.search_provider(
-                keyword,
-                paragraph_text,
-                provider,
-                max_candidates_per_keyword=max_candidates_per_keyword,
-                license_policy=license_policy,
+            try:
+                provider_candidates, provider_errors, provider_diagnostics = (
+                    self.search_provider(
+                        keyword,
+                        paragraph_text,
+                        provider,
+                        max_candidates_per_keyword=max_candidates_per_keyword,
+                        license_policy=license_policy,
+                    )
+                )
+            except ProviderSearchError as exc:
+                provider_queries[provider.provider_id] = list(
+                    exc.details.get("provider_queries", [])
+                )
+                provider_cache_hits[provider.provider_id] = 0
+                provider_rejected[provider.provider_id] = []
+                errors.append(str(exc))
+                continue
+            provider_queries[provider.provider_id] = list(
+                provider_diagnostics.provider_queries.get(provider.provider_id, [])
             )
-            provider_queries[provider.provider_id] = list(provider_diagnostics.provider_queries.get(provider.provider_id, []))
             errors.extend(provider_errors)
             rejected_prefilters.extend(provider_diagnostics.rejected_prefilters)
             cache_hits += provider_diagnostics.cache_hits
@@ -111,7 +238,9 @@ class ImageProviderSearchService:
         *,
         max_candidates_per_keyword: int,
         license_policy: ImageLicensePolicy,
+        timeout_seconds: float | None = None,
     ) -> tuple[list[SearchCandidate], list[str], ImageSearchDiagnostics]:
+        self._require_open()
         descriptor = provider.descriptor
         provider_limit = max(8, min(80, max_candidates_per_keyword or 8))
         query_plan = self._query_planner.rewrite_for_provider(descriptor, keyword, paragraph_text)
@@ -127,10 +256,19 @@ class ImageProviderSearchService:
                 cache_hits += 1
             else:
                 try:
-                    found = provider.search(query, provider_limit)
+                    found = self._search_with_compatible_signature(
+                        provider,
+                        query,
+                        provider_limit,
+                        timeout_seconds=timeout_seconds,
+                    )
                 except Exception as exc:
-                    errors.append(f"{provider.provider_id} search failed for '{query}': {exc}")
-                    continue
+                    raise _wrap_provider_search_exception(
+                        exc,
+                        provider_id=provider.provider_id,
+                        provider_queries=list(query_plan.queries),
+                        failed_query=query,
+                    ) from exc
                 self._search_cache.set(provider.provider_id, query, provider_limit, found)
 
             filtered, rejected = filter_and_rank_candidates(
@@ -160,8 +298,13 @@ class ImageProviderSearchService:
         )
 
     def close(self) -> None:
-        self._search_cache.close()
-        self._metadata_cache.close()
+        if self._closed:
+            return
+        self._closed = True
+        if self._search_cache_instance is not None:
+            self._search_cache_instance.close()
+        if self._metadata_cache_instance is not None:
+            self._metadata_cache_instance.close()
 
 
 __all__ = ["ImageProviderSearchService", "ImageSearchDiagnostics"]

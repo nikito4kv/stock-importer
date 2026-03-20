@@ -10,7 +10,7 @@ from services.errors import AppError
 
 from .contracts import UiAdvancedSettingsViewModel, UiQuickLaunchSettingsViewModel
 from .controller import DesktopGuiController, handle_ui_error
-from .polling import plan_poll_refresh
+from .polling import TERMINAL_RUN_STATUSES, plan_poll_refresh
 from .presentation import (
     STRICTNESS_LABELS,
     THEME_LABELS,
@@ -1385,24 +1385,37 @@ class DesktopTkApp:
             if self.active_project_id is None and self.active_run_id is None:
                 self._terminal_refresh_signature = None
                 return
-            live_state = self.controller.build_live_run_state(
+            live_snapshot = self.controller.build_live_snapshot(
                 active_project_id=self.active_project_id,
                 active_run_id=self.active_run_id,
-                selected_paragraph_no=self._selected_paragraph_number(),
             )
-            self._apply_live_state(live_state)
             run_status = (
-                live_state.run_progress.status
-                if live_state.run_progress is not None
+                live_snapshot.run_progress.status
+                if live_snapshot.run_progress is not None
                 else None
             )
             poll_plan = plan_poll_refresh(
-                run_id=live_state.active_run_id,
+                run_id=live_snapshot.active_run_id,
                 run_status=run_status,
                 previous_terminal_signature=self._terminal_refresh_signature,
                 active_interval_ms=self._poll_interval_active_ms,
                 idle_interval_ms=self._poll_interval_idle_ms,
             )
+            if (
+                self.active_project_id is not None
+                and live_snapshot.active_run_id is not None
+                and run_status is not None
+                and run_status not in TERMINAL_RUN_STATUSES
+            ):
+                self._apply_live_snapshot(live_snapshot)
+                live_state = self.controller.build_live_run_state(
+                    active_project_id=self.active_project_id,
+                    active_run_id=live_snapshot.active_run_id,
+                    selected_paragraph_no=self._selected_paragraph_number(),
+                    live_snapshot=live_snapshot,
+                )
+                if live_state.paragraph_items:
+                    self._apply_live_paragraph_items(live_state.paragraph_items)
             if poll_plan.should_heavy_refresh:
                 self.refresh(preserve_forms=True)
             self._terminal_refresh_signature = poll_plan.terminal_signature
@@ -1413,13 +1426,19 @@ class DesktopTkApp:
             self.root.after(next_interval, self._poll_refresh)
 
     def _apply_live_state(self, state) -> None:
+        self._apply_live_snapshot(state)
+        self._apply_live_paragraph_items(state.paragraph_items)
+
+    def _apply_live_snapshot(self, state) -> None:
         self.active_run_id = state.active_run_id
         self.status_var.set(state.status_text)
         self._render_run_progress(state.run_progress)
-        self._fill_paragraph_tree(state.paragraph_items)
-        self._render_current_paragraph_detail(state.paragraph_items)
         self._set_session_actions_enabled(self.controller.session_actions_enabled())
         self._fill_event_journal(state.event_journal)
+
+    def _apply_live_paragraph_items(self, paragraph_items) -> None:
+        self._fill_paragraph_tree(paragraph_items)
+        self._render_current_paragraph_detail(paragraph_items)
 
     def _apply_quick_form(self, quick: UiQuickLaunchSettingsViewModel) -> None:
         self.project_name_var.set(quick.project_name)

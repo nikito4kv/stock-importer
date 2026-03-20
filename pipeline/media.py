@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import inspect
 import io
 import mimetypes
 import os
 import re
+import urllib.error
 from concurrent.futures import FIRST_COMPLETED, Future, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha1
 from pathlib import Path
-from threading import Event, Thread
+from threading import Lock, RLock
 from time import perf_counter
 from typing import Any, Callable, Protocol, Sequence, cast
 from urllib.parse import urlparse
@@ -18,6 +20,9 @@ from domain.enums import AssetKind, EventLevel, ProviderCapability, RunStage, Ru
 from domain.models import (
     AssetCandidate,
     AssetSelection,
+    LiveAssetSnapshot,
+    LiveParagraphStateSnapshot,
+    LiveRunStateSnapshot,
     MediaSlot,
     ParagraphDiagnostics,
     ParagraphManifestEntry,
@@ -28,7 +33,12 @@ from domain.models import (
     RunManifest,
     utc_now,
 )
-from legacy_core.network import open_with_safe_redirects, read_limited
+from legacy_core.network import (
+    HttpClientConfig,
+    SafeHttpClient,
+    open_with_safe_redirects,
+    read_limited,
+)
 from providers.base import ProviderDescriptor
 from providers.images import (
     ImageLicensePolicy,
@@ -43,8 +53,19 @@ from providers.registry import (
     ExecutionConcurrencyMode,
     ProviderRegistry,
 )
-from services.errors import ConfigError, DownloadError, ProviderError, SessionError
+from services.errors import (
+    ConfigError,
+    DownloadError,
+    ProviderError,
+    SessionError,
+)
 from services.events import AppEvent, EventBus
+from services.retry import (
+    build_retry_profile,
+    classify_retryable_exception,
+    is_timeout_exception,
+    sleep_for_retry_attempt,
+)
 from storage.repositories import ManifestRepository, ProjectRepository, RunRepository
 
 try:
@@ -64,6 +85,21 @@ from .perf import (
 
 def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _supports_keyword_argument(
+    fn: Callable[..., Any],
+    parameter_name: str,
+) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or parameter.name == parameter_name
+        for parameter in parameters
+    )
 
 
 def _content_type_starts_with_image(content_type: str) -> bool:
@@ -189,7 +225,12 @@ class CallbackCandidateSearchBackend:
     search_fn: Callable[[ParagraphUnit, str, int], list[AssetCandidate]]
 
     def search(
-        self, paragraph: ParagraphUnit, query: str, limit: int
+        self,
+        paragraph: ParagraphUnit,
+        query: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None = None,
     ) -> ProviderResult:
         candidates = list(self.search_fn(paragraph, query, limit))
         for index, candidate in enumerate(candidates, start=1):
@@ -229,17 +270,49 @@ class FreeImageCandidateSearchBackend:
     timeout_seconds: float = 15.0
     user_agent: str = "ParagraphMediaPipeline/1.0"
     max_download_bytes: int = 25 * 1024 * 1024
+    _http_client: SafeHttpClient | None = field(default=None, init=False, repr=False)
+    _owns_http_client: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        shared_client = self.provider.http_client
+        if shared_client is not None:
+            self._http_client = shared_client
+            self._owns_http_client = False
+            return
+        self._http_client = SafeHttpClient(HttpClientConfig(user_agent=self.user_agent))
+        self._owns_http_client = True
 
     def search(
-        self, paragraph: ParagraphUnit, query: str, limit: int
+        self,
+        paragraph: ParagraphUnit,
+        query: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None = None,
     ) -> ProviderResult:
-        candidates, errors, diagnostics = self.image_search_service.search_provider(
-            query,
-            paragraph.text,
-            self.provider,
-            max_candidates_per_keyword=limit,
-            license_policy=self.license_policy,
+        effective_timeout_seconds = (
+            self.timeout_seconds
+            if timeout_seconds is None or timeout_seconds <= 0
+            else float(timeout_seconds)
         )
+        search_provider = cast(Any, self.image_search_service).search_provider
+        if _supports_keyword_argument(search_provider, "timeout_seconds"):
+            candidates, errors, diagnostics = search_provider(
+                query,
+                paragraph.text,
+                self.provider,
+                max_candidates_per_keyword=limit,
+                license_policy=self.license_policy,
+                timeout_seconds=effective_timeout_seconds,
+            )
+        else:
+            candidates, errors, diagnostics = search_provider(
+                query,
+                paragraph.text,
+                self.provider,
+                max_candidates_per_keyword=limit,
+                license_policy=self.license_policy,
+            )
         return ProviderResult(
             provider_name=self.provider_id,
             capability=self.capability,
@@ -254,6 +327,16 @@ class FreeImageCandidateSearchBackend:
                 "cache_hits": diagnostics.cache_hits,
             },
         )
+
+    @property
+    def http_client(self) -> SafeHttpClient:
+        assert self._http_client is not None
+        return self._http_client
+
+    def close(self) -> None:
+        self.provider.close()
+        if self._owns_http_client and self._http_client is not None:
+            self._http_client.close()
 
     def _to_asset_candidate(self, candidate: SearchCandidate) -> AssetCandidate:
         digest = sha1(candidate.url.encode("utf-8")).hexdigest()[:16]
@@ -284,6 +367,7 @@ class FreeImageCandidateSearchBackend:
         *,
         destination_dir: Path,
         filename: str,
+        timeout_seconds: float | None = None,
     ) -> AssetCandidate:
         source_url = str(asset.source_url or "").strip()
         if not source_url:
@@ -295,13 +379,19 @@ class FreeImageCandidateSearchBackend:
 
         destination_dir.mkdir(parents=True, exist_ok=True)
         destination = destination_dir / filename
+        effective_timeout_seconds = (
+            self.timeout_seconds
+            if timeout_seconds is None or timeout_seconds <= 0
+            else float(timeout_seconds)
+        )
         try:
             response, final_url = open_with_safe_redirects(
                 source_url,
-                timeout_seconds=self.timeout_seconds,
+                timeout_seconds=effective_timeout_seconds,
                 max_redirects=4,
                 accept_header="image/*,*/*;q=0.8",
                 user_agent=self.user_agent,
+                http_client=self.http_client,
             )
             with response:
                 content_type = (
@@ -317,11 +407,7 @@ class FreeImageCandidateSearchBackend:
                 )
             validation = _validate_image_payload(payload, content_type=content_type)
         except Exception as exc:
-            raise DownloadError(
-                code="direct_image_download_failed",
-                message=f"Image download failed for asset '{asset.asset_id}': {exc}",
-                details={"asset_id": asset.asset_id, "provider_id": self.provider_id},
-            ) from exc
+            raise self._coerce_download_error(exc, asset_id=asset.asset_id) from exc
 
         destination.write_bytes(payload)
         downloaded = AssetCandidate.from_dict(asset.to_dict())
@@ -330,6 +416,46 @@ class FreeImageCandidateSearchBackend:
         downloaded.metadata["final_url"] = final_url
         downloaded.metadata.update(validation)
         return downloaded
+
+    def _coerce_download_error(
+        self,
+        exc: Exception,
+        *,
+        asset_id: str,
+    ) -> DownloadError:
+        if isinstance(exc, DownloadError):
+            return exc
+
+        retryable = False
+        failure_kind = "unexpected"
+        http_status: int | None = None
+
+        if is_timeout_exception(exc):
+            retryable = True
+            failure_kind = "timeout"
+        elif isinstance(exc, urllib.error.HTTPError):
+            http_status = int(getattr(exc, "code", 0) or 0)
+            retryable = http_status == 429 or 500 <= http_status < 600
+            failure_kind = f"http_{http_status or 'unknown'}"
+        elif isinstance(exc, (urllib.error.URLError, OSError)):
+            retryable = True
+            failure_kind = "network"
+        elif isinstance(exc, ValueError):
+            failure_kind = "validation"
+
+        details: dict[str, object] = {
+            "asset_id": asset_id,
+            "provider_id": self.provider_id,
+            "failure_kind": failure_kind,
+        }
+        if http_status is not None:
+            details["http_status"] = http_status
+        return DownloadError(
+            code="direct_image_download_failed",
+            message=f"Image download failed for asset '{asset_id}': {exc}",
+            details=details,
+            retryable=retryable,
+        )
 
 
 @dataclass(slots=True)
@@ -340,36 +466,47 @@ class AssetDeduper:
     perceptual_hashes: set[str] = field(default_factory=set)
     semantic_signatures: set[str] = field(default_factory=set)
     rejection_counts: dict[str, int] = field(default_factory=dict)
+    _guard: RLock | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.parent is not None and self.parent._guard is not None:
+            self._guard = self.parent._guard
+        else:
+            self._guard = RLock()
 
     def child(self) -> "AssetDeduper":
         return AssetDeduper(parent=self)
 
     def register(self, asset: AssetCandidate) -> None:
-        source_id = self._source_id(asset)
-        if source_id:
-            self.source_ids.add(source_id)
-        raw_hash = self._raw_hash(asset)
-        if raw_hash:
-            self.raw_hashes.add(raw_hash)
-        perceptual_hash = self._perceptual_hash(asset)
-        if perceptual_hash:
-            self.perceptual_hashes.add(perceptual_hash)
-        semantic = self._semantic_signature(asset)
-        if semantic:
-            self.semantic_signatures.add(semantic)
+        with self._ensure_guard():
+            source_id = self._source_id(asset)
+            if source_id:
+                self.source_ids.add(source_id)
+            raw_hash = self._raw_hash(asset)
+            if raw_hash:
+                self.raw_hashes.add(raw_hash)
+            perceptual_hash = self._perceptual_hash(asset)
+            if perceptual_hash:
+                self.perceptual_hashes.add(perceptual_hash)
+            semantic = self._semantic_signature(asset)
+            if semantic:
+                self.semantic_signatures.add(semantic)
 
     def filter_candidates(
         self, candidates: list[AssetCandidate]
     ) -> list[AssetCandidate]:
-        accepted: list[AssetCandidate] = []
-        for candidate in candidates:
-            reason = self._duplicate_reason(candidate)
-            if reason is not None:
-                self.rejection_counts[reason] = self.rejection_counts.get(reason, 0) + 1
-                continue
-            self.register(candidate)
-            accepted.append(candidate)
-        return accepted
+        with self._ensure_guard():
+            accepted: list[AssetCandidate] = []
+            for candidate in candidates:
+                reason = self._duplicate_reason(candidate)
+                if reason is not None:
+                    self.rejection_counts[reason] = (
+                        self.rejection_counts.get(reason, 0) + 1
+                    )
+                    continue
+                self.register(candidate)
+                accepted.append(candidate)
+            return accepted
 
     def _duplicate_reason(self, asset: AssetCandidate) -> str | None:
         source_id = self._source_id(asset)
@@ -395,6 +532,13 @@ class AssetDeduper:
                 return True
             parent = parent.parent
         return False
+
+    def _ensure_guard(self) -> RLock:
+        guard = self._guard
+        if guard is None:
+            guard = RLock()
+            self._guard = guard
+        return guard
 
     def _source_id(self, asset: AssetCandidate) -> str:
         return f"{asset.provider_name}:{asset.asset_id}"
@@ -460,6 +604,9 @@ class ParagraphMediaPipeline:
         self._video_backends: dict[str, CandidateSearchBackend] = {}
         self._image_backends: dict[str, CandidateSearchBackend] = {}
         self._download_backends: dict[str, AssetDownloadBackend] = {}
+        self._run_state_guard = Lock()
+        self._run_locks: dict[str, RLock] = {}
+        self._live_manifests: dict[str, RunManifest] = {}
         self._manifest_entry_indexes: dict[str, dict[int, ParagraphManifestEntry]] = {}
         self._manifest_index_owners: dict[str, int] = {}
         self._run_dedupers: dict[str, AssetDeduper] = {}
@@ -550,8 +697,26 @@ class ParagraphMediaPipeline:
             if item.provider_group != "storyblocks_images"
         }
         for provider_id in removable_ids:
-            self._image_backends.pop(provider_id, None)
+            backend = self._image_backends.pop(provider_id, None)
             self._download_backends.pop(provider_id, None)
+            close = getattr(backend, "close", None)
+            if callable(close):
+                close()
+
+    def close(self) -> None:
+        closed_ids: set[int] = set()
+        for backend in [
+            *self._video_backends.values(),
+            *self._image_backends.values(),
+            *self._download_backends.values(),
+        ]:
+            backend_id = id(backend)
+            if backend_id in closed_ids:
+                continue
+            closed_ids.add(backend_id)
+            close = getattr(backend, "close", None)
+            if callable(close):
+                close()
 
     def create_manifest(
         self,
@@ -588,43 +753,84 @@ class ParagraphMediaPipeline:
         self._sync_manifest_entry_index(manifest)
         return self.flush_manifest(manifest)
 
-    def load_manifest(self, run_id: str) -> RunManifest | None:
-        manifest = self._manifest_repository.load(run_id)
-        if manifest is not None:
+    def register_live_manifest(self, manifest: RunManifest) -> None:
+        run_lock = self._run_lock(manifest.run_id)
+        with run_lock:
+            self._live_manifests[manifest.run_id] = manifest
             self._sync_manifest_entry_index(manifest)
-        return manifest
+
+    def snapshot_live_run_state(
+        self, run_id: str, *, detailed_paragraph_no: int | None = None
+    ) -> LiveRunStateSnapshot | None:
+        run_lock = self._run_lock(run_id)
+        with run_lock:
+            manifest = self._live_manifests.get(run_id)
+            if manifest is None:
+                return None
+            return self._build_live_run_state_snapshot(
+                manifest, detailed_paragraph_no=detailed_paragraph_no
+            )
+
+    def snapshot_manifest(self, run_id: str) -> RunManifest | None:
+        run_lock = self._run_lock(run_id)
+        with run_lock:
+            manifest = self._live_manifests.get(run_id)
+            if manifest is not None:
+                return RunManifest.from_dict(manifest.to_dict())
+        return self.load_manifest(run_id)
+
+    def load_manifest(self, run_id: str) -> RunManifest | None:
+        run_lock = self._run_lock(run_id)
+        with run_lock:
+            manifest = self._manifest_repository.load(run_id)
+            if manifest is not None:
+                self._sync_manifest_entry_index(manifest)
+            return manifest
 
     def save_manifest(self, manifest: RunManifest) -> RunManifest:
-        manifest.updated_at = utc_now()
-        self._sync_manifest_entry_index(manifest)
-        return self._manifest_repository.save(manifest)
+        run_lock = self._run_lock(manifest.run_id)
+        with run_lock:
+            manifest.updated_at = utc_now()
+            self._sync_manifest_entry_index(manifest)
+            if manifest.run_id in self._live_manifests:
+                self._live_manifests[manifest.run_id] = manifest
+            return self._manifest_repository.save(manifest)
 
     def flush_manifest(self, manifest: RunManifest) -> RunManifest:
-        return self.save_manifest(self.update_summary(manifest))
+        run_lock = self._run_lock(manifest.run_id)
+        with run_lock:
+            return self.save_manifest(self.update_summary(manifest))
 
     def lock_selection(
         self, run_id: str, paragraph_no: int, selection: AssetSelection
     ) -> RunManifest:
-        manifest = self.load_manifest(run_id)
-        if manifest is None:
-            raise KeyError(run_id)
-        entry = self._entry_for(manifest, paragraph_no)
-        selection.user_locked = True
-        selection.user_decision_status = "locked"
-        entry.selection = selection
-        entry.user_decision_status = "locked"
-        entry.status = "locked"
-        entry.slots = self._slots_with_selection(
-            entry.slots or self._build_slots(MediaSelectionConfig()), selection
-        )
-        entry.fallback_options = list(selection.fallback_assets)
-        self._register_selected_assets(manifest, selection)
-        return self.flush_manifest(manifest)
+        run_lock = self._run_lock(run_id)
+        with run_lock:
+            manifest = self._live_manifests.get(run_id)
+            if manifest is None:
+                manifest = self._manifest_repository.load(run_id)
+            if manifest is None:
+                raise KeyError(run_id)
+            entry = self._entry_for(manifest, paragraph_no)
+            selection.user_locked = True
+            selection.user_decision_status = "locked"
+            entry.selection = selection
+            entry.user_decision_status = "locked"
+            entry.status = "locked"
+            entry.slots = self._slots_with_selection(
+                entry.slots or self._build_slots(MediaSelectionConfig()), selection
+            )
+            entry.fallback_options = list(selection.fallback_assets)
+            self._register_selected_assets(manifest, selection)
+            return self.flush_manifest(manifest)
 
     def release_run_state(self, run_id: str) -> None:
-        self._run_dedupers.pop(run_id, None)
-        self._manifest_entry_indexes.pop(run_id, None)
-        self._manifest_index_owners.pop(run_id, None)
+        with self._run_state_guard:
+            self._live_manifests.pop(run_id, None)
+            self._run_dedupers.pop(run_id, None)
+            self._manifest_entry_indexes.pop(run_id, None)
+            self._manifest_index_owners.pop(run_id, None)
+            self._run_locks.pop(run_id, None)
 
     def process_paragraph(
         self,
@@ -653,11 +859,24 @@ class ParagraphMediaPipeline:
                 **concurrency_limits.to_payload(),
             },
         )
-        entry = self._entry_for(manifest, paragraph.paragraph_no)
-        if entry.selection is not None and entry.selection.user_locked:
-            entry.status = "locked"
-            entry.user_decision_status = "locked"
-            entry.selection.status = "locked"
+        run_lock = self._run_lock(manifest.run_id)
+        with run_lock:
+            entry = self._entry_for(manifest, paragraph.paragraph_no)
+            existing_decision = entry.user_decision_status
+            locked_selection = (
+                entry.selection
+                if entry.selection is not None and entry.selection.user_locked
+                else None
+            )
+        if locked_selection is not None:
+            with run_lock:
+                entry = self._entry_for(manifest, paragraph.paragraph_no)
+                entry.status = "locked"
+                entry.user_decision_status = "locked"
+                assert entry.selection is not None
+                entry.selection.status = "locked"
+                self._register_selected_assets(manifest, entry.selection)
+                self.flush_manifest(manifest)
             self._emit(
                 manifest,
                 "paragraph.locked",
@@ -667,9 +886,7 @@ class ParagraphMediaPipeline:
                 stage=RunStage.PERSIST,
                 payload={"user_locked": True},
             )
-            self._register_selected_assets(manifest, entry.selection)
-            self.flush_manifest(manifest)
-            return entry.selection
+            return locked_selection
 
         diagnostics = ParagraphDiagnostics(
             paragraph_no=paragraph.paragraph_no,
@@ -695,8 +912,6 @@ class ParagraphMediaPipeline:
         deduper = run_deduper.child()
         search_started_at = perf_counter()
         provider_stage_started_at = perf_counter()
-        entry.intent = paragraph.intent
-        entry.query_bundle = paragraph.query_bundle
 
         video_results, early_video_stop = self._collect_results(
             manifest,
@@ -843,12 +1058,14 @@ class ParagraphMediaPipeline:
             for result in diagnostics.provider_results
             if result.query
         }
+        diagnostics.dedupe_rejections = dict(deduper.rejection_counts)
+        with run_lock:
+            self._reserve_selection_assets(manifest, selection, diagnostics)
         selection.rejection_reasons = self._unique_reason_strings(
             selection.rejection_reasons
         )
         diagnostics.rejected_reasons = list(selection.rejection_reasons)
         diagnostics.early_stop_triggered = early_video_stop or early_image_stop
-        diagnostics.dedupe_rejections = dict(deduper.rejection_counts)
         selection.provider_results = list(diagnostics.provider_results)
         selection.diagnostics = {
             "provider_queries": diagnostics.provider_queries,
@@ -857,18 +1074,10 @@ class ParagraphMediaPipeline:
             "early_stop_triggered": diagnostics.early_stop_triggered,
         }
         selection.rejection_reasons = list(diagnostics.rejected_reasons)
-        selection.user_decision_status = entry.user_decision_status or "auto_selected"
+        selection.user_decision_status = existing_decision or "auto_selected"
         selection.media_slots = self._slots_with_selection(
             selection.media_slots, selection
         )
-
-        entry.selection = selection
-        entry.diagnostics = diagnostics
-        entry.fallback_options = list(selection.fallback_assets)
-        entry.rejection_reasons = list(selection.rejection_reasons)
-        entry.user_decision_status = selection.user_decision_status
-        entry.status = selection.status
-        entry.slots = list(selection.media_slots)
 
         if selection.status == "no_match":
             self._emit(
@@ -920,8 +1129,18 @@ class ParagraphMediaPipeline:
         downloaded_assets = self._count_downloaded_assets(selection)
         rejected_candidates = len(selection.rejection_reasons)
         persist_started_at = perf_counter()
-        self._register_selected_assets(manifest, selection)
-        self.flush_manifest(manifest)
+        with run_lock:
+            entry = self._entry_for(manifest, paragraph.paragraph_no)
+            entry.intent = paragraph.intent
+            entry.query_bundle = paragraph.query_bundle
+            entry.selection = selection
+            entry.diagnostics = diagnostics
+            entry.fallback_options = list(selection.fallback_assets)
+            entry.rejection_reasons = list(selection.rejection_reasons)
+            entry.user_decision_status = selection.user_decision_status
+            entry.status = selection.status
+            entry.slots = list(selection.media_slots)
+            self.flush_manifest(manifest)
         persist_ms = int(round((perf_counter() - persist_started_at) * 1000.0))
         paragraph_total_ms = int(round((perf_counter() - paragraph_started_at) * 1000.0))
         self._emit(
@@ -1007,15 +1226,7 @@ class ParagraphMediaPipeline:
         perf_context: PerformanceContext | None = None,
         paragraph_total_ms: int = 0,
     ) -> RunManifest:
-        entry = self._entry_for(manifest, paragraph.paragraph_no)
-        entry.intent = paragraph.intent
-        entry.query_bundle = paragraph.query_bundle
-        entry.selection = None
-        entry.diagnostics = None
-        entry.fallback_options = []
-        entry.rejection_reasons = [str(exc)]
-        entry.user_decision_status = "needs_review"
-        entry.status = "failed"
+        run_lock = self._run_lock(manifest.run_id)
         if perf_context is not None:
             perf_context.increment("paragraph_failures_total", 1)
             perf_context.increment(
@@ -1040,7 +1251,17 @@ class ParagraphMediaPipeline:
                 else "",
             },
         )
-        return self.flush_manifest(manifest)
+        with run_lock:
+            entry = self._entry_for(manifest, paragraph.paragraph_no)
+            entry.intent = paragraph.intent
+            entry.query_bundle = paragraph.query_bundle
+            entry.selection = None
+            entry.diagnostics = None
+            entry.fallback_options = []
+            entry.rejection_reasons = [str(exc)]
+            entry.user_decision_status = "needs_review"
+            entry.status = "failed"
+            return self.flush_manifest(manifest)
 
     def _download_primary_video(
         self,
@@ -1068,41 +1289,62 @@ class ParagraphMediaPipeline:
             stage=RunStage.DOWNLOAD,
             payload={"current_asset_id": asset.asset_id, "filename": filename},
         )
-        attempts = self._retry_attempts(config)
+        retry_profile = self._download_retry_profile(
+            config,
+            provider_id=asset.provider_name,
+        )
+        attempts = retry_profile.max_attempts
         downloaded: AssetCandidate | None = None
         for attempt in range(1, attempts + 1):
+            started_at = perf_counter()
+            elapsed_ms = 0
             try:
-                completed, payload, error, elapsed_ms = self._call_with_timeout(
-                    lambda: backend.download_asset(
-                        asset,
-                        destination_dir=destination_dir,
-                        filename=filename,
-                    ),
-                    timeout_seconds=config.download_timeout_seconds,
+                downloaded = self._download_asset_with_policy(
+                    backend,
+                    asset,
+                    destination_dir=destination_dir,
+                    filename=filename,
+                    config=config,
                 )
-                if not completed:
-                    raise TimeoutError(
-                        f"download timeout exceeded ({elapsed_ms}ms > "
-                        f"{int(config.download_timeout_seconds * 1000.0)}ms)"
-                    )
-                if error is not None:
-                    raise error
-                downloaded = cast(AssetCandidate, payload)
+                elapsed_ms = self._elapsed_ms(started_at)
+                downloaded.metadata["download_attempts"] = attempt
             except Exception as exc:
+                elapsed_ms = self._elapsed_ms(started_at)
+                if is_timeout_exception(exc):
+                    self._cleanup_provider_timeout(
+                        manifest,
+                        paragraph=paragraph,
+                        provider_name=asset.provider_name,
+                        query=str(asset.metadata.get("search_query", "")),
+                        stage=RunStage.DOWNLOAD,
+                        backend=backend,
+                        elapsed_ms=elapsed_ms,
+                    )
+                decision = classify_retryable_exception(
+                    exc,
+                    timeout_error_code="download_timeout",
+                    default_error_code="download_failed",
+                )
                 fatal_storyblocks_error = (
-                    isinstance(exc, DownloadError)
-                    and config.fail_fast_storyblocks_errors
-                    and self._is_fatal_storyblocks_error(
-                        asset.provider_name,
-                        ProviderError(
-                            code=exc.code,
-                            message=exc.message,
-                            details=dict(exc.details),
-                        ),
-                        config=config,
+                    decision.fatal
+                    or (
+                        isinstance(exc, DownloadError)
+                        and config.fail_fast_storyblocks_errors
+                        and self._is_fatal_storyblocks_error(
+                            asset.provider_name,
+                            ProviderError(
+                                code=exc.code,
+                                message=exc.message,
+                                details=dict(exc.details),
+                                retryable=exc.retryable,
+                                fatal=exc.fatal,
+                            ),
+                            config=config,
+                        )
                     )
                 )
-                if attempt < attempts and not fatal_storyblocks_error:
+                if attempt < attempts and decision.retryable and not fatal_storyblocks_error:
+                    backoff_seconds = sleep_for_retry_attempt(retry_profile, attempt)
                     self._emit(
                         manifest,
                         "asset.download.retry",
@@ -1115,17 +1357,18 @@ class ParagraphMediaPipeline:
                         provider_name=asset.provider_name,
                         query=str(asset.metadata.get("search_query", "")),
                         stage=RunStage.DOWNLOAD,
-                        payload={
-                            "current_asset_id": asset.asset_id,
-                            "attempt": attempt,
-                            "download_elapsed_ms": elapsed_ms,
-                        },
+                        payload=self._retry_payload(
+                            decision=decision,
+                            attempt_count=attempt,
+                            attempts_total=attempts,
+                            elapsed_ms=elapsed_ms,
+                            final_status="retrying",
+                            elapsed_key="download_elapsed_ms",
+                            backoff_seconds=backoff_seconds,
+                            extra={"current_asset_id": asset.asset_id},
+                        ),
                     )
                     continue
-                error_code = (
-                    exc.code if isinstance(exc, DownloadError) else "download_failed"
-                )
-                details = dict(exc.details) if isinstance(exc, DownloadError) else {}
                 self._emit(
                     manifest,
                     "asset.download.failed",
@@ -1135,13 +1378,15 @@ class ParagraphMediaPipeline:
                     provider_name=asset.provider_name,
                     query=str(asset.metadata.get("search_query", "")),
                     stage=RunStage.DOWNLOAD,
-                    payload={
-                        "current_asset_id": asset.asset_id,
-                        "error_code": error_code,
-                        "attempt": attempt,
-                        "download_elapsed_ms": elapsed_ms,
-                        **details,
-                    },
+                    payload=self._retry_payload(
+                        decision=decision,
+                        attempt_count=attempt,
+                        attempts_total=attempts,
+                        elapsed_ms=elapsed_ms,
+                        final_status="failed",
+                        elapsed_key="download_elapsed_ms",
+                        extra={"current_asset_id": asset.asset_id},
+                    ),
                 )
                 raise
             break
@@ -1311,44 +1556,64 @@ class ParagraphMediaPipeline:
             stage=RunStage.DOWNLOAD,
             payload={"current_asset_id": asset.asset_id, "filename": filename},
         )
-        attempts = self._retry_attempts(config)
+        retry_profile = self._download_retry_profile(
+            config,
+            provider_id=asset.provider_name,
+        )
+        attempts = retry_profile.max_attempts
         downloaded: AssetCandidate | None = None
         last_error = ""
         for attempt in range(1, attempts + 1):
+            started_at = perf_counter()
+            elapsed_ms = 0
             try:
-                completed, payload, error, elapsed_ms = self._call_with_timeout(
-                    lambda: backend.download_asset(
-                        asset,
-                        destination_dir=destination_dir,
-                        filename=filename,
-                    ),
-                    timeout_seconds=config.download_timeout_seconds,
+                downloaded = self._download_asset_with_policy(
+                    backend,
+                    asset,
+                    destination_dir=destination_dir,
+                    filename=filename,
+                    config=config,
                 )
-                if not completed:
-                    raise TimeoutError(
-                        f"download timeout exceeded ({elapsed_ms}ms > "
-                        f"{int(config.download_timeout_seconds * 1000.0)}ms)"
-                    )
-                if error is not None:
-                    raise error
-                downloaded = cast(AssetCandidate, payload)
+                elapsed_ms = self._elapsed_ms(started_at)
                 downloaded.metadata["download_attempts"] = attempt
             except Exception as exc:
+                elapsed_ms = self._elapsed_ms(started_at)
                 last_error = str(exc)
+                if is_timeout_exception(exc):
+                    self._cleanup_provider_timeout(
+                        manifest,
+                        paragraph=paragraph,
+                        provider_name=asset.provider_name,
+                        query=str(asset.metadata.get("search_query", "")),
+                        stage=RunStage.DOWNLOAD,
+                        backend=backend,
+                        elapsed_ms=elapsed_ms,
+                    )
+                decision = classify_retryable_exception(
+                    exc,
+                    timeout_error_code="download_timeout",
+                    default_error_code="download_failed",
+                )
                 fatal_storyblocks_error = (
-                    isinstance(exc, DownloadError)
-                    and config.fail_fast_storyblocks_errors
-                    and self._is_fatal_storyblocks_error(
-                        asset.provider_name,
-                        ProviderError(
-                            code=exc.code,
-                            message=exc.message,
-                            details=dict(exc.details),
-                        ),
-                        config=config,
+                    decision.fatal
+                    or (
+                        isinstance(exc, DownloadError)
+                        and config.fail_fast_storyblocks_errors
+                        and self._is_fatal_storyblocks_error(
+                            asset.provider_name,
+                            ProviderError(
+                                code=exc.code,
+                                message=exc.message,
+                                details=dict(exc.details),
+                                retryable=exc.retryable,
+                                fatal=exc.fatal,
+                            ),
+                            config=config,
+                        )
                     )
                 )
-                if attempt < attempts and not fatal_storyblocks_error:
+                if attempt < attempts and decision.retryable and not fatal_storyblocks_error:
+                    backoff_seconds = sleep_for_retry_attempt(retry_profile, attempt)
                     self._emit(
                         manifest,
                         "asset.download.retry",
@@ -1361,11 +1626,16 @@ class ParagraphMediaPipeline:
                         provider_name=asset.provider_name,
                         query=str(asset.metadata.get("search_query", "")),
                         stage=RunStage.DOWNLOAD,
-                        payload={
-                            "current_asset_id": asset.asset_id,
-                            "attempt": attempt,
-                            "download_elapsed_ms": elapsed_ms,
-                        },
+                        payload=self._retry_payload(
+                            decision=decision,
+                            attempt_count=attempt,
+                            attempts_total=attempts,
+                            elapsed_ms=elapsed_ms,
+                            final_status="retrying",
+                            elapsed_key="download_elapsed_ms",
+                            backoff_seconds=backoff_seconds,
+                            extra={"current_asset_id": asset.asset_id},
+                        ),
                     )
                     continue
                 self._emit(
@@ -1377,14 +1647,21 @@ class ParagraphMediaPipeline:
                     provider_name=asset.provider_name,
                     query=str(asset.metadata.get("search_query", "")),
                     stage=RunStage.DOWNLOAD,
-                    payload={
-                        "current_asset_id": asset.asset_id,
-                        "attempt": attempt,
-                        "download_elapsed_ms": elapsed_ms,
-                    },
+                    payload=self._retry_payload(
+                        decision=decision,
+                        attempt_count=attempt,
+                        attempts_total=attempts,
+                        elapsed_ms=elapsed_ms,
+                        final_status="failed",
+                        elapsed_key="download_elapsed_ms",
+                        extra={"current_asset_id": asset.asset_id},
+                    ),
                 )
                 asset.metadata["download_status"] = "failed"
                 asset.metadata["download_error"] = last_error
+                asset.metadata["download_error_code"] = decision.error_code
+                asset.metadata["download_attempts"] = attempt
+                asset.metadata["download_retryable"] = bool(decision.retryable)
                 return asset
             break
         if downloaded is None:
@@ -1392,6 +1669,7 @@ class ParagraphMediaPipeline:
             asset.metadata["download_error"] = (
                 last_error or "image download failed"
             )
+            asset.metadata.setdefault("download_attempts", attempts)
             return asset
         self._emit(
             manifest,
@@ -2261,50 +2539,61 @@ class ParagraphMediaPipeline:
             query=query,
             stage=RunStage.PROVIDER_SEARCH,
         )
-        attempts = self._retry_attempts(config)
+        retry_profile = self._search_retry_profile(config)
+        attempts = retry_profile.max_attempts
         for attempt in range(1, attempts + 1):
+            started_at = perf_counter()
             elapsed_ms = 0
             try:
-                completed, payload, error, elapsed_ms = self._call_with_timeout(
-                    lambda: backend.search(paragraph, query, limit),
-                    timeout_seconds=config.search_timeout_seconds,
+                result = self._search_backend_with_timeout(
+                    backend,
+                    paragraph,
+                    query,
+                    limit,
+                    config=config,
                 )
-                if not completed:
-                    raise TimeoutError(
-                        f"search timeout exceeded ({elapsed_ms}ms > "
-                        f"{int(config.search_timeout_seconds * 1000.0)}ms)"
-                    )
-                if error is not None:
-                    raise error
-                result = cast(ProviderResult, payload)
-            except TimeoutError as exc:
-                if attempt < attempts:
-                    self._emit(
+                elapsed_ms = self._elapsed_ms(started_at)
+            except Exception as exc:
+                if not (
+                    is_timeout_exception(exc)
+                    or isinstance(exc, (ConfigError, ProviderError, SessionError))
+                ):
+                    raise
+                elapsed_ms = self._elapsed_ms(started_at)
+                if is_timeout_exception(exc):
+                    self._cleanup_provider_timeout(
                         manifest,
-                        "provider.search.retry",
-                        EventLevel.WARNING,
-                        (
-                            f"Provider {backend.provider_id} timed out for paragraph "
-                            f"{paragraph.paragraph_no}, retrying ({attempt}/{attempts})"
-                        ),
-                        paragraph_no=paragraph.paragraph_no,
+                        paragraph=paragraph,
                         provider_name=backend.provider_id,
                         query=query,
                         stage=RunStage.PROVIDER_SEARCH,
-                        payload={
-                            "search_elapsed_ms": elapsed_ms,
-                            "attempt": attempt,
-                            "retry_budget": attempts - 1,
-                            "error_code": "search_timeout",
-                        },
+                        backend=backend,
+                        elapsed_ms=elapsed_ms,
                     )
-                    continue
+                decision = classify_retryable_exception(
+                    exc,
+                    timeout_error_code="search_timeout",
+                    default_error_code="provider_search_failed",
+                )
+                fatal_storyblocks_error = bool(decision.fatal)
+                if isinstance(exc, (ConfigError, ProviderError, SessionError)):
+                    fatal_storyblocks_error = fatal_storyblocks_error or (
+                        config.fail_fast_storyblocks_errors
+                        and self._is_fatal_storyblocks_error(
+                            backend.provider_id,
+                            exc,
+                            config=config,
+                        )
+                    )
                 if (
-                    config.fail_fast_storyblocks_errors
+                    is_timeout_exception(exc)
+                    and not fatal_storyblocks_error
+                    and config.fail_fast_storyblocks_errors
                     and self._should_fail_fast_storyblocks_provider(
                         backend.provider_id,
                         config,
                     )
+                    and attempt >= attempts
                 ):
                     raise ProviderError(
                         code="search_timeout",
@@ -2312,30 +2601,34 @@ class ParagraphMediaPipeline:
                         details={
                             "provider_id": backend.provider_id,
                             "search_elapsed_ms": elapsed_ms,
-                            "attempts": attempt,
+                            "attempt_count": attempt,
                         },
                     ) from exc
-                return ProviderResult(
-                    provider_name=backend.provider_id,
-                    capability=backend.capability,
-                    query=query,
-                    candidates=[],
-                    errors=[str(exc)],
-                    diagnostics={
-                        "error_code": "search_timeout",
-                        "search_elapsed_ms": elapsed_ms,
-                        "attempts": attempt,
-                    },
-                )
-            except (ConfigError, ProviderError, SessionError) as exc:
-                fatal_storyblocks_error = (
-                    config.fail_fast_storyblocks_errors
-                    and self._is_fatal_storyblocks_error(
-                        backend.provider_id,
-                        exc,
-                        config=config,
+                if attempt < attempts and decision.retryable and not fatal_storyblocks_error:
+                    backoff_seconds = sleep_for_retry_attempt(retry_profile, attempt)
+                    self._emit(
+                        manifest,
+                        "provider.search.retry",
+                        EventLevel.WARNING,
+                        (
+                            f"Provider {backend.provider_id} retrying paragraph "
+                            f"{paragraph.paragraph_no} ({attempt}/{attempts})"
+                        ),
+                        paragraph_no=paragraph.paragraph_no,
+                        provider_name=backend.provider_id,
+                        query=query,
+                        stage=RunStage.PROVIDER_SEARCH,
+                        payload=self._retry_payload(
+                            decision=decision,
+                            attempt_count=attempt,
+                            attempts_total=attempts,
+                            elapsed_ms=elapsed_ms,
+                            final_status="retrying",
+                            elapsed_key="search_elapsed_ms",
+                            backoff_seconds=backoff_seconds,
+                        ),
                     )
-                )
+                    continue
                 self._emit(
                     manifest,
                     "provider.search.failed"
@@ -2347,39 +2640,47 @@ class ParagraphMediaPipeline:
                     provider_name=backend.provider_id,
                     query=query,
                     stage=RunStage.PROVIDER_SEARCH,
-                    payload={
-                        "error_code": exc.code,
-                        "search_elapsed_ms": elapsed_ms,
-                        "attempt": attempt,
-                        **dict(exc.details),
-                    },
+                    payload=self._retry_payload(
+                        decision=decision,
+                        attempt_count=attempt,
+                        attempts_total=attempts,
+                        elapsed_ms=elapsed_ms,
+                        final_status="failed",
+                        elapsed_key="search_elapsed_ms",
+                    ),
                 )
                 if fatal_storyblocks_error:
                     raise
-                if attempt < attempts:
-                    continue
                 return ProviderResult(
                     provider_name=backend.provider_id,
                     capability=backend.capability,
                     query=query,
                     candidates=[],
                     errors=[str(exc)],
-                    diagnostics={
-                        "error_code": exc.code,
-                        "search_elapsed_ms": elapsed_ms,
-                        "attempts": attempt,
-                        **dict(exc.details),
-                    },
+                    diagnostics=self._retry_payload(
+                        decision=decision,
+                        attempt_count=attempt,
+                        attempts_total=attempts,
+                        elapsed_ms=elapsed_ms,
+                        final_status="failed",
+                        elapsed_key="search_elapsed_ms",
+                    ),
                 )
 
             result.diagnostics.setdefault("attempts", attempt)
+            result.diagnostics.setdefault("attempt_count", attempt)
+            result.diagnostics.setdefault("retryable", False)
+            result.diagnostics.setdefault("final_status", "completed")
+            result.diagnostics.setdefault("error_code", "")
             result.diagnostics.setdefault("search_elapsed_ms", elapsed_ms)
+            result.diagnostics.setdefault("elapsed_ms", elapsed_ms)
             break
         else:
             raise RuntimeError("Unreachable provider search retry loop")
 
         elapsed_ms = int(result.diagnostics.get("search_elapsed_ms", 0))
         result.diagnostics.setdefault("search_elapsed_ms", elapsed_ms)
+        result.diagnostics.setdefault("elapsed_ms", elapsed_ms)
         if result.errors:
             self._emit(
                 manifest,
@@ -2390,7 +2691,13 @@ class ParagraphMediaPipeline:
                 provider_name=backend.provider_id,
                 query=query,
                 stage=RunStage.PROVIDER_SEARCH,
-                payload={"search_elapsed_ms": elapsed_ms},
+                payload={
+                    "search_elapsed_ms": elapsed_ms,
+                    "elapsed_ms": elapsed_ms,
+                    "attempt_count": int(result.diagnostics.get("attempt_count", 1)),
+                    "error_code": str(result.diagnostics.get("error_code", "")),
+                    "final_status": str(result.diagnostics.get("final_status", "")),
+                },
             )
         if not result.candidates:
             self._emit(
@@ -2402,7 +2709,13 @@ class ParagraphMediaPipeline:
                 provider_name=backend.provider_id,
                 query=query,
                 stage=RunStage.PROVIDER_SEARCH,
-                payload={"search_elapsed_ms": elapsed_ms},
+                payload={
+                    "search_elapsed_ms": elapsed_ms,
+                    "elapsed_ms": elapsed_ms,
+                    "attempt_count": int(result.diagnostics.get("attempt_count", 1)),
+                    "error_code": str(result.diagnostics.get("error_code", "")),
+                    "final_status": str(result.diagnostics.get("final_status", "")),
+                },
             )
         self._emit(
             manifest,
@@ -2416,6 +2729,10 @@ class ParagraphMediaPipeline:
             payload={
                 "candidates_found": len(result.candidates),
                 "search_elapsed_ms": elapsed_ms,
+                "elapsed_ms": elapsed_ms,
+                "attempt_count": int(result.diagnostics.get("attempt_count", 1)),
+                "final_status": str(result.diagnostics.get("final_status", "completed")),
+                "error_code": str(result.diagnostics.get("error_code", "")),
                 "current_asset_id": result.candidates[0].asset_id
                 if result.candidates
                 else "",
@@ -2425,6 +2742,57 @@ class ParagraphMediaPipeline:
 
     def _retry_attempts(self, config: MediaSelectionConfig) -> int:
         return max(1, int(config.retry_budget) + 1)
+
+    def _search_retry_profile(self, config: MediaSelectionConfig):
+        return build_retry_profile(
+            config.retry_budget,
+            base_delay_seconds=0.05,
+            max_delay_seconds=0.5,
+            jitter_seconds=0.02,
+        )
+
+    def _download_retry_profile(
+        self,
+        config: MediaSelectionConfig,
+        *,
+        provider_id: str,
+    ):
+        retry_budget = 0 if self._is_storyblocks_provider(provider_id) else config.retry_budget
+        return build_retry_profile(
+            retry_budget,
+            base_delay_seconds=0.1,
+            max_delay_seconds=1.0,
+            jitter_seconds=0.05,
+        )
+
+    def _retry_payload(
+        self,
+        *,
+        decision,
+        attempt_count: int,
+        attempts_total: int,
+        elapsed_ms: int,
+        final_status: str,
+        elapsed_key: str,
+        backoff_seconds: float = 0.0,
+        extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "attempt": int(attempt_count),
+            "attempt_count": int(attempt_count),
+            "retry_budget": max(0, int(attempts_total) - 1),
+            "retryable": bool(decision.retryable),
+            "final_status": final_status,
+            "error_code": str(decision.error_code),
+            "elapsed_ms": int(elapsed_ms),
+            elapsed_key: int(elapsed_ms),
+        }
+        if backoff_seconds > 0:
+            payload["backoff_ms"] = int(round(backoff_seconds * 1000.0))
+        payload.update(dict(decision.details))
+        if extra:
+            payload.update(extra)
+        return payload
 
     def _is_storyblocks_provider(self, provider_id: str) -> bool:
         return provider_id in {"storyblocks_video", "storyblocks_image"}
@@ -2465,41 +2833,164 @@ class ParagraphMediaPipeline:
         }
         return str(exc.code).strip().casefold() in fatal_codes
 
-    def _call_with_timeout(
+    def _download_asset_with_policy(
         self,
-        fn: Callable[[], Any],
+        backend: AssetDownloadBackend,
+        asset: AssetCandidate,
         *,
-        timeout_seconds: float,
-    ) -> tuple[bool, Any | None, Exception | None, int]:
-        started_at = perf_counter()
-        if timeout_seconds <= 0:
+        destination_dir: Path,
+        filename: str,
+        config: MediaSelectionConfig,
+    ) -> AssetCandidate:
+        storyblocks_policy = self._storyblocks_operation_policy_for_backend(
+            backend, asset.provider_name, config
+        )
+        if storyblocks_policy is not None and self._supports_keyword_argument(
+            cast(Any, backend).download_asset,
+            "operation_policy",
+        ):
+            return cast(Any, backend).download_asset(
+                asset,
+                destination_dir=destination_dir,
+                filename=filename,
+                operation_policy=storyblocks_policy,
+            )
+        if self._supports_keyword_argument(
+            cast(Any, backend).download_asset,
+            "timeout_seconds",
+        ):
+            return cast(Any, backend).download_asset(
+                asset,
+                destination_dir=destination_dir,
+                filename=filename,
+                timeout_seconds=config.download_timeout_seconds,
+            )
+        return backend.download_asset(
+            asset,
+            destination_dir=destination_dir,
+            filename=filename,
+        )
+
+    def _search_backend_with_timeout(
+        self,
+        backend: CandidateSearchBackend,
+        paragraph: ParagraphUnit,
+        query: str,
+        limit: int,
+        *,
+        config: MediaSelectionConfig,
+    ) -> ProviderResult:
+        search = cast(Any, backend).search
+        if self._supports_keyword_argument(search, "timeout_seconds"):
+            return cast(
+                ProviderResult,
+                search(
+                    paragraph,
+                    query,
+                    limit,
+                    timeout_seconds=config.search_timeout_seconds,
+                ),
+            )
+        return backend.search(paragraph, query, limit)
+
+    def _cleanup_provider_timeout(
+        self,
+        manifest: RunManifest,
+        *,
+        paragraph: ParagraphUnit,
+        provider_name: str,
+        query: str,
+        stage: RunStage,
+        backend: object,
+        elapsed_ms: int,
+    ) -> None:
+        if not self._is_storyblocks_provider(provider_name):
+            return
+        session_manager = getattr(backend, "session_manager", None)
+        reset_session_state = getattr(session_manager, "reset_session_state", None)
+        if not callable(reset_session_state):
+            return
+        cleanup_status = "completed"
+        cleanup_error = ""
+        level = EventLevel.WARNING
+        try:
+            reset_session_state()
+        except Exception as exc:
+            cleanup_status = "failed"
+            cleanup_error = str(exc)
+            level = EventLevel.ERROR
+        self._emit(
+            manifest,
+            "provider.timeout.cleaned_up",
+            level,
+            (
+                f"Storyblocks timeout cleanup {cleanup_status} for provider "
+                f"{provider_name}"
+            ),
+            paragraph_no=paragraph.paragraph_no,
+            provider_name=provider_name,
+            query=query,
+            stage=stage,
+            payload={
+                "timeout_stage": stage.value,
+                "cleanup_action": "reset_session_state",
+                "cleanup_status": cleanup_status,
+                "elapsed_ms": elapsed_ms,
+                "cleanup_error": cleanup_error,
+            },
+        )
+
+    def _supports_keyword_argument(
+        self,
+        fn: Callable[..., Any],
+        parameter_name: str,
+    ) -> bool:
+        return _supports_keyword_argument(fn, parameter_name)
+
+    def _storyblocks_operation_policy_kwargs(
+        self,
+        config: MediaSelectionConfig,
+    ) -> dict[str, object]:
+        return {
+            "search_timeout_seconds": max(0.0, float(config.search_timeout_seconds)),
+            "download_retries": 0,
+            "download_timeout_seconds": max(
+                1.0, float(config.download_timeout_seconds)
+            ),
+        }
+
+    def _instantiate_storyblocks_operation_policy(
+        self,
+        policy_type: type[object],
+        *,
+        config: MediaSelectionConfig,
+    ) -> object | None:
+        kwargs = self._storyblocks_operation_policy_kwargs(config)
+        try:
+            return policy_type(**kwargs)
+        except TypeError:
+            legacy_kwargs = dict(kwargs)
+            legacy_kwargs.pop("search_timeout_seconds", None)
             try:
-                return True, fn(), None, self._elapsed_ms(started_at)
-            except Exception as exc:
-                return True, None, exc, self._elapsed_ms(started_at)
+                return policy_type(**legacy_kwargs)
+            except TypeError:
+                return None
 
-        outcome: dict[str, Any] = {}
-        completed = Event()
-
-        def run() -> None:
-            try:
-                outcome["value"] = fn()
-            except Exception as exc:
-                outcome["error"] = exc
-            finally:
-                completed.set()
-
-        thread = Thread(target=run, daemon=True)
-        thread.start()
-        finished = completed.wait(max(0.0, float(timeout_seconds)))
-        elapsed_ms = self._elapsed_ms(started_at)
-        if not finished:
-            return False, None, None, elapsed_ms
-        return (
-            True,
-            outcome.get("value"),
-            cast(Exception | None, outcome.get("error")),
-            elapsed_ms,
+    def _storyblocks_operation_policy_for_backend(
+        self,
+        backend: AssetDownloadBackend,
+        provider_id: str,
+        config: MediaSelectionConfig,
+    ) -> object | None:
+        if not self._is_storyblocks_provider(provider_id):
+            return None
+        current_policy = getattr(backend, "operation_policy", None)
+        if current_policy is None:
+            return None
+        policy_type = type(current_policy)
+        return self._instantiate_storyblocks_operation_policy(
+            policy_type,
+            config=config,
         )
 
     def _remaining_timeout_seconds(
@@ -2791,6 +3282,116 @@ class ParagraphMediaPipeline:
                 downloaded += 1
         return downloaded
 
+    def _reserve_selection_assets(
+        self,
+        manifest: RunManifest,
+        selection: AssetSelection,
+        diagnostics: ParagraphDiagnostics,
+    ) -> None:
+        run_deduper = self._run_deduper(manifest)
+        paragraph_deduper = run_deduper.child()
+        reserved_primary: AssetCandidate | None = None
+        reserved_supporting: list[AssetCandidate] = []
+        reserved_fallback: list[AssetCandidate] = []
+        reservation_rejections: dict[str, int] = {}
+
+        for role, asset in self._selection_assets_with_roles(selection):
+            counts_before = dict(paragraph_deduper.rejection_counts)
+            accepted = paragraph_deduper.filter_candidates([asset])
+            if accepted:
+                accepted_asset = accepted[0]
+                if role == "primary":
+                    reserved_primary = accepted_asset
+                elif role == "supporting":
+                    reserved_supporting.append(accepted_asset)
+                else:
+                    reserved_fallback.append(accepted_asset)
+                continue
+            deltas = self._dedupe_count_delta(
+                counts_before, paragraph_deduper.rejection_counts
+            )
+            self._merge_rejection_counts(reservation_rejections, deltas)
+            selection.rejection_reasons.extend(
+                self._asset_dedupe_rejection_reasons(asset, deltas)
+            )
+
+        selection.primary_asset = reserved_primary
+        selection.supporting_assets = reserved_supporting
+        selection.fallback_assets = reserved_fallback
+        self._merge_rejection_counts(
+            diagnostics.dedupe_rejections, reservation_rejections
+        )
+        self._register_selected_assets(manifest, selection)
+        self._refresh_selection_outcome(
+            selection,
+            reserved_by_other_paragraph=bool(
+                reservation_rejections and not self._selection_assets(selection)
+            ),
+        )
+
+    def _selection_assets_with_roles(
+        self, selection: AssetSelection
+    ) -> list[tuple[str, AssetCandidate]]:
+        assets: list[tuple[str, AssetCandidate]] = []
+        if selection.primary_asset is not None:
+            assets.append(("primary", selection.primary_asset))
+        assets.extend(("supporting", asset) for asset in selection.supporting_assets)
+        assets.extend(("fallback", asset) for asset in selection.fallback_assets)
+        return assets
+
+    def _dedupe_count_delta(
+        self, before: dict[str, int], after: dict[str, int]
+    ) -> dict[str, int]:
+        deltas: dict[str, int] = {}
+        for reason, count in after.items():
+            delta = int(count) - int(before.get(reason, 0))
+            if delta > 0:
+                deltas[reason] = delta
+        return deltas
+
+    def _merge_rejection_counts(
+        self, target: dict[str, int], additions: dict[str, int]
+    ) -> None:
+        for reason, count in additions.items():
+            target[reason] = int(target.get(reason, 0)) + int(count)
+
+    def _asset_dedupe_rejection_reasons(
+        self, asset: AssetCandidate, counts: dict[str, int]
+    ) -> list[str]:
+        reasons: list[str] = []
+        for reason, count in counts.items():
+            if int(count) <= 0:
+                continue
+            reasons.append(f"{asset.provider_name}:{asset.asset_id}:dedupe:{reason}")
+        return reasons
+
+    def _refresh_selection_outcome(
+        self,
+        selection: AssetSelection,
+        *,
+        reserved_by_other_paragraph: bool = False,
+    ) -> None:
+        if self._selection_assets(selection):
+            selection.status = "selected"
+            if selection.primary_asset is not None:
+                if not selection.supporting_assets and selection.fallback_assets:
+                    selection.reason = (
+                        selection.reason or "Primary video selected with fallback images"
+                    )
+            elif selection.supporting_assets:
+                selection.reason = "Image-only fallback satisfied the paragraph"
+            elif selection.fallback_assets:
+                selection.reason = "Fallback images satisfied the paragraph"
+            elif reserved_by_other_paragraph:
+                selection.reason = ""
+            return
+        selection.status = "no_match"
+        if reserved_by_other_paragraph:
+            selection.reason = "Selected assets were already reserved by another paragraph"
+            return
+        if not _normalize_text(selection.reason):
+            selection.reason = "No acceptable media candidates found"
+
     def _no_match_reason_key(self, reasons: list[str]) -> str:
         normalized_reasons = [
             _normalize_text(reason).casefold()
@@ -2856,21 +3457,25 @@ class ParagraphMediaPipeline:
         return deduper
 
     def _run_deduper(self, manifest: RunManifest) -> AssetDeduper:
-        deduper = self._run_dedupers.get(manifest.run_id)
-        if deduper is not None:
-            return deduper
-        seeded = self._seed_run_deduper(manifest)
-        self._run_dedupers[manifest.run_id] = seeded
-        return seeded
+        run_lock = self._run_lock(manifest.run_id)
+        with run_lock:
+            deduper = self._run_dedupers.get(manifest.run_id)
+            if deduper is not None:
+                return deduper
+            seeded = self._seed_run_deduper(manifest)
+            self._run_dedupers[manifest.run_id] = seeded
+            return seeded
 
     def _register_selected_assets(
         self, manifest: RunManifest, selection: AssetSelection | None
     ) -> None:
         if selection is None:
             return
-        deduper = self._run_deduper(manifest)
-        for asset in self._selection_assets(selection):
-            deduper.register(asset)
+        run_lock = self._run_lock(manifest.run_id)
+        with run_lock:
+            deduper = self._run_deduper(manifest)
+            for asset in self._selection_assets(selection):
+                deduper.register(asset)
 
     def _selection_assets(self, selection: AssetSelection) -> list[AssetCandidate]:
         assets = [
@@ -2880,31 +3485,118 @@ class ParagraphMediaPipeline:
         ]
         return [asset for asset in assets if asset is not None]
 
+    def _build_live_run_state_snapshot(
+        self, manifest: RunManifest, *, detailed_paragraph_no: int | None = None
+    ) -> LiveRunStateSnapshot:
+        paragraph_states: dict[int, LiveParagraphStateSnapshot] = {}
+        for entry in manifest.paragraph_entries:
+            state = LiveParagraphStateSnapshot(
+                paragraph_no=entry.paragraph_no,
+                status=entry.status,
+                user_decision_status=entry.user_decision_status,
+            )
+            if (
+                detailed_paragraph_no is not None
+                and entry.paragraph_no == detailed_paragraph_no
+            ):
+                state.selected_assets = self._selection_asset_snapshots(entry.selection)
+                state.candidate_assets = self._candidate_asset_snapshots(entry)
+                state.rejection_reasons = list(entry.rejection_reasons)
+            paragraph_states[entry.paragraph_no] = state
+        return LiveRunStateSnapshot(
+            run_id=manifest.run_id,
+            paragraph_states=paragraph_states,
+        )
+
+    def _selection_asset_snapshots(
+        self, selection: AssetSelection | None
+    ) -> list[LiveAssetSnapshot]:
+        if selection is None:
+            return []
+        snapshots: list[LiveAssetSnapshot] = []
+        if selection.primary_asset is not None:
+            snapshots.append(
+                LiveAssetSnapshot(
+                    asset=self._clone_asset(selection.primary_asset),
+                    role="primary",
+                    locked=selection.user_locked,
+                )
+            )
+        snapshots.extend(
+            LiveAssetSnapshot(
+                asset=self._clone_asset(asset),
+                role="supporting",
+                locked=selection.user_locked,
+            )
+            for asset in selection.supporting_assets
+        )
+        snapshots.extend(
+            LiveAssetSnapshot(
+                asset=self._clone_asset(asset),
+                role="fallback",
+                locked=selection.user_locked,
+            )
+            for asset in selection.fallback_assets
+        )
+        return snapshots
+
+    def _candidate_asset_snapshots(
+        self, entry: ParagraphManifestEntry
+    ) -> list[LiveAssetSnapshot]:
+        if entry.selection is None:
+            return []
+        seen: set[str] = set()
+        snapshots: list[LiveAssetSnapshot] = []
+        for result in entry.selection.provider_results:
+            for asset in result.candidates:
+                if asset.asset_id in seen:
+                    continue
+                seen.add(asset.asset_id)
+                snapshots.append(
+                    LiveAssetSnapshot(asset=self._clone_asset(asset), role="candidate")
+                )
+        return snapshots
+
+    def _clone_asset(self, asset: AssetCandidate) -> AssetCandidate:
+        return AssetCandidate.from_dict(asset.to_dict())
+
     def _sync_manifest_entry_index(self, manifest: RunManifest) -> None:
-        self._manifest_entry_indexes[manifest.run_id] = {
-            entry.paragraph_no: entry for entry in manifest.paragraph_entries
-        }
-        self._manifest_index_owners[manifest.run_id] = id(manifest)
+        run_lock = self._run_lock(manifest.run_id)
+        with run_lock:
+            self._manifest_entry_indexes[manifest.run_id] = {
+                entry.paragraph_no: entry for entry in manifest.paragraph_entries
+            }
+            self._manifest_index_owners[manifest.run_id] = id(manifest)
 
     def _entry_for(
         self, manifest: RunManifest, paragraph_no: int
     ) -> ParagraphManifestEntry:
-        index = self._manifest_entry_indexes.get(manifest.run_id)
-        owner = self._manifest_index_owners.get(manifest.run_id)
-        if (
-            index is None
-            or owner != id(manifest)
-            or len(index) != len(manifest.paragraph_entries)
-        ):
-            self._sync_manifest_entry_index(manifest)
-            index = self._manifest_entry_indexes[manifest.run_id]
-        entry = index.get(paragraph_no)
-        if entry is None:
-            self._sync_manifest_entry_index(manifest)
-            entry = self._manifest_entry_indexes[manifest.run_id].get(paragraph_no)
-        if entry is None:
-            raise KeyError(paragraph_no)
-        return entry
+        run_lock = self._run_lock(manifest.run_id)
+        with run_lock:
+            index = self._manifest_entry_indexes.get(manifest.run_id)
+            owner = self._manifest_index_owners.get(manifest.run_id)
+            if (
+                index is None
+                or owner != id(manifest)
+                or len(index) != len(manifest.paragraph_entries)
+            ):
+                self._sync_manifest_entry_index(manifest)
+                index = self._manifest_entry_indexes[manifest.run_id]
+            entry = index.get(paragraph_no)
+            if entry is None:
+                self._sync_manifest_entry_index(manifest)
+                entry = self._manifest_entry_indexes[manifest.run_id].get(paragraph_no)
+            if entry is None:
+                raise KeyError(paragraph_no)
+            return entry
+
+    def _run_lock(self, run_id: str) -> RLock:
+        with self._run_state_guard:
+            lock = self._run_locks.get(run_id)
+            if lock is None:
+                lock = RLock()
+                self._run_locks[run_id] = lock
+            return lock
 
     def _total_candidates(self, results: list[ProviderResult]) -> int:
         return sum(len(result.candidates) for result in results)
@@ -3093,14 +3785,22 @@ class ParagraphMediaRunService:
                 perf_context_id=perf_context.context_id,
             )
         active_manifest = cast(RunManifest, manifest)
+        self._pipeline.register_live_manifest(active_manifest)
 
         def processor(paragraph: ParagraphUnit) -> AssetSelection:
             paragraph_started_at = perf_counter()
+            cancelled_at_start = self._orchestrator.is_cancel_requested(run.run_id)
+            paragraph_config = replace(
+                selection_config,
+                should_cancel=(
+                    lambda cancelled_at_start=cancelled_at_start: cancelled_at_start
+                ),
+            )
             try:
                 return self._pipeline.process_paragraph(
                     active_manifest,
                     paragraph,
-                    selection_config,
+                    paragraph_config,
                     perf_context=perf_context,
                 )
             except InterruptedError:
@@ -3155,14 +3855,22 @@ class ParagraphMediaRunService:
                 perf_context_id=perf_context.context_id,
             )
         active_manifest = cast(RunManifest, manifest)
+        self._pipeline.register_live_manifest(active_manifest)
 
         def processor(paragraph: ParagraphUnit) -> AssetSelection:
             paragraph_started_at = perf_counter()
+            cancelled_at_start = self._orchestrator.is_cancel_requested(run.run_id)
+            paragraph_config = replace(
+                selection_config,
+                should_cancel=(
+                    lambda cancelled_at_start=cancelled_at_start: cancelled_at_start
+                ),
+            )
             try:
                 return self._pipeline.process_paragraph(
                     active_manifest,
                     paragraph,
-                    selection_config,
+                    paragraph_config,
                     perf_context=perf_context,
                 )
             except InterruptedError:
@@ -3240,6 +3948,16 @@ class ParagraphMediaRunService:
     def load_manifest(self, run_id: str) -> RunManifest | None:
         return self._pipeline.load_manifest(run_id)
 
+    def snapshot_manifest(self, run_id: str) -> RunManifest | None:
+        return self._pipeline.snapshot_manifest(run_id)
+
+    def snapshot_live_run_state(
+        self, run_id: str, *, detailed_paragraph_no: int | None = None
+    ) -> LiveRunStateSnapshot | None:
+        return self._pipeline.snapshot_live_run_state(
+            run_id, detailed_paragraph_no=detailed_paragraph_no
+        )
+
     def pause_after_current(self, run_id: str) -> None:
         self._orchestrator.pause_after_current(run_id)
 
@@ -3296,12 +4014,21 @@ class ParagraphMediaRunService:
     def _validate_storyblocks_concurrency(
         self, config: MediaSelectionConfig
     ) -> None:
-        uses_storyblocks = config.video_enabled or config.storyblocks_images_enabled
-        if uses_storyblocks and self._orchestrator.max_workers > 1:
+        mode_resolution = self._pipeline._resolve_concurrency_mode(config)
+        if (
+            mode_resolution.requires_serial_paragraph_workers
+            and self._orchestrator.max_workers > 1
+        ):
             raise ConfigError(
                 "storyblocks_parallelism_guard",
                 "Storyblocks режимы поддерживают только paragraph_workers=1 для безопасной сессии браузера.",
-                details={"paragraph_workers": self._orchestrator.max_workers},
+                details={
+                    "paragraph_workers": self._orchestrator.max_workers,
+                    "concurrency_mode": mode_resolution.mode.value,
+                    "selected_provider_ids": list(
+                        mode_resolution.selected_provider_ids
+                    ),
+                },
             )
 
 

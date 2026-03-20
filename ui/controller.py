@@ -13,6 +13,8 @@ from domain.enums import RunStage, RunStatus, SessionHealth
 from domain.models import (
     AssetCandidate,
     AssetSelection,
+    LiveAssetSnapshot,
+    LiveRunStateSnapshot,
     ParagraphIntent,
     Preset,
     Project,
@@ -74,6 +76,7 @@ class DesktopGuiController:
     def __init__(self, application: DesktopApplication):
         self.application = application
         self.notifications: list[UiNotification] = []
+        self._project_cache: dict[str, Project] = {}
         self._background_run: _BackgroundRunTask | None = None
         self._background_lock = threading.Lock()
 
@@ -144,8 +147,9 @@ class DesktopGuiController:
         active_project_id: str | None = None,
         active_run_id: str | None = None,
         selected_paragraph_no: int | None = None,
+        live_snapshot: UiLiveSnapshotViewModel | None = None,
     ) -> UiLiveRunStateViewModel:
-        live = self.build_live_snapshot(
+        live = live_snapshot or self.build_live_snapshot(
             active_project_id=active_project_id,
             active_run_id=active_run_id,
         )
@@ -156,37 +160,30 @@ class DesktopGuiController:
             run_progress=live.run_progress,
         )
         resolved_run_id = live.active_run_id
-        if resolved_run_id is None:
+        if resolved_run_id is None or active_project_id is None:
             return state
 
-        manifest = self._safe_load_manifest(resolved_run_id)
+        detailed_paragraph_no = selected_paragraph_no
+        if detailed_paragraph_no is None and state.run_progress is not None:
+            detailed_paragraph_no = state.run_progress.current_paragraph_no
+        live_run_state = self._safe_snapshot_live_run_state(
+            resolved_run_id,
+            detailed_paragraph_no=detailed_paragraph_no,
+        )
+        if live_run_state is None:
+            return state
         latest_events = (
             self.application.container.event_recorder.latest_by_paragraph_for_run(
                 resolved_run_id
             )
         )
-        if active_project_id is not None:
-            state.paragraph_items = self.build_paragraph_workbench(
-                active_project_id,
-                resolved_run_id,
-                manifest=manifest,
-                latest_events=latest_events,
-                detailed_paragraph_no=selected_paragraph_no,
-            )
-        if state.run_progress is not None:
-            current = state.run_progress.current_paragraph_no
-            if (
-                current is not None
-                and selected_paragraph_no is None
-                and active_project_id is not None
-            ):
-                state.paragraph_items = self.build_paragraph_workbench(
-                    active_project_id,
-                    resolved_run_id,
-                    manifest=manifest,
-                    latest_events=latest_events,
-                    detailed_paragraph_no=current,
-                )
+        state.paragraph_items = self.build_paragraph_workbench(
+            active_project_id,
+            resolved_run_id,
+            live_run_state=live_run_state,
+            latest_events=latest_events,
+            detailed_paragraph_no=detailed_paragraph_no,
+        )
         return state
 
     def build_live_snapshot(
@@ -217,6 +214,7 @@ class DesktopGuiController:
             latest_event=latest_event,
             project=None,
             load_manifest=False,
+            load_project=False,
         )
         if state.run_progress is not None:
             current = (
@@ -242,8 +240,9 @@ class DesktopGuiController:
     ) -> str | None:
         if active_run_id is not None or active_project_id is None:
             return active_run_id
-        project = self.application.container.project_repository.load(active_project_id)
-        if project is None:
+        try:
+            project = self._require_project(active_project_id)
+        except KeyError:
             return None
         return project.active_run_id
 
@@ -364,7 +363,7 @@ class DesktopGuiController:
     ) -> UiProjectSummary:
         path = Path(script_path)
         name = project_name or path.stem.replace("_", " ").strip() or "Проект"
-        project = self.application.create_project(name, path)
+        project = self._remember_project(self.application.create_project(name, path))
         self.notifications.append(
             UiNotification(
                 "Сценарий загружен", f"Импортирован файл {path.name}", "success"
@@ -477,6 +476,7 @@ class DesktopGuiController:
         run_id: str | None = None,
         *,
         manifest: RunManifest | None = None,
+        live_run_state: LiveRunStateSnapshot | None = None,
         latest_events: dict[int, AppEvent] | None = None,
         detailed_paragraph_no: int | None = None,
     ) -> list[UiParagraphWorkbenchItem]:
@@ -487,11 +487,20 @@ class DesktopGuiController:
         manifest = (
             manifest
             if manifest is not None
-            else (self._safe_load_manifest(run_id) if run_id is not None else None)
+            else (
+                self._safe_load_manifest(run_id)
+                if run_id is not None and live_run_state is None
+                else None
+            )
         )
         manifest_entries = (
             {entry.paragraph_no: entry for entry in manifest.paragraph_entries}
             if manifest is not None
+            else {}
+        )
+        live_states = (
+            dict(live_run_state.paragraph_states)
+            if live_run_state is not None
             else {}
         )
         latest_events = (
@@ -503,10 +512,21 @@ class DesktopGuiController:
         items: list[UiParagraphWorkbenchItem] = []
         for paragraph in document.paragraphs:
             entry = manifest_entries.get(paragraph.paragraph_no)
+            live_state = live_states.get(paragraph.paragraph_no)
             selection = entry.selection if entry is not None else None
-            status = entry.status if entry is not None else "pending"
+            status = (
+                live_state.status
+                if live_state is not None
+                else (entry.status if entry is not None else "pending")
+            )
             decision = (
-                entry.user_decision_status if entry is not None else "auto_selected"
+                live_state.user_decision_status
+                if live_state is not None
+                else (
+                    entry.user_decision_status
+                    if entry is not None
+                    else "auto_selected"
+                )
             )
             latest_event = latest_events.get(paragraph.paragraph_no)
             include_detail = (
@@ -542,16 +562,32 @@ class DesktopGuiController:
                         if include_detail and paragraph.query_bundle is not None
                         else []
                     ),
-                    selected_assets=self._selected_assets(selection)
-                    if include_detail
-                    else [],
-                    candidate_assets=self._candidate_assets(entry)
-                    if include_detail
-                    else [],
+                    selected_assets=(
+                        self._live_asset_previews(live_state.selected_assets)
+                        if include_detail and live_state is not None
+                        else (
+                            self._selected_assets(selection)
+                            if include_detail
+                            else []
+                        )
+                    ),
+                    candidate_assets=(
+                        self._live_asset_previews(live_state.candidate_assets)
+                        if include_detail and live_state is not None
+                        else (
+                            self._candidate_assets(entry)
+                            if include_detail
+                            else []
+                        )
+                    ),
                     rejection_reasons=list(
-                        entry.rejection_reasons
-                        if include_detail and entry is not None
-                        else []
+                        live_state.rejection_reasons
+                        if include_detail and live_state is not None
+                        else (
+                            entry.rejection_reasons
+                            if include_detail and entry is not None
+                            else []
+                        )
                     ),
                 )
             )
@@ -608,6 +644,7 @@ class DesktopGuiController:
             intent=updated_intent,
             query_bundle=query_bundle,
         )
+        self._remember_project(updated)
         self.notifications.append(
             UiNotification(
                 "Абзац обновлен",
@@ -632,6 +669,7 @@ class DesktopGuiController:
             manual_prompt=quick.manual_prompt,
             attach_full_script_context=quick.attach_full_script_context,
         )
+        self._remember_project(updated)
         self.notifications.append(
             UiNotification(
                 "AI enrichment",
@@ -654,6 +692,7 @@ class DesktopGuiController:
             selected_paragraphs=quick.selected_paragraphs or None,
             config=self._media_config_from_forms(quick, advanced),
         )
+        self._remember_active_run(project_id, run.run_id)
         self.notifications.append(
             UiNotification(
                 "Запуск завершен",
@@ -677,6 +716,7 @@ class DesktopGuiController:
             selected_paragraphs=quick.selected_paragraphs or None,
             config=config,
         )
+        self._remember_active_run(project_id, run.run_id)
         self._start_background_run(
             run.run_id,
             project_id,
@@ -713,6 +753,7 @@ class DesktopGuiController:
             "resume",
             lambda: self.application.resume_media_run(run_id, config=config),
         )
+        self._remember_active_run(run.project_id, run_id)
         self._push_notification(
             UiNotification(
                 "Запуск продолжен",
@@ -748,6 +789,7 @@ class DesktopGuiController:
             selected_paragraphs=list(source_run.failed_paragraphs),
             config=config,
         )
+        self._remember_active_run(source_run.project_id, new_run.run_id)
         self._start_background_run(
             new_run.run_id,
             source_run.project_id,
@@ -819,6 +861,7 @@ class DesktopGuiController:
             selected_paragraphs=paragraph_numbers,
             config=config,
         )
+        self._remember_active_run(project_id, run.run_id)
         self._start_background_run(
             run.run_id,
             project_id,
@@ -1624,6 +1667,7 @@ class DesktopGuiController:
         latest_event: AppEvent | None = None,
         project: Project | None = None,
         load_manifest: bool = True,
+        load_project: bool = True,
     ) -> UiRunProgressViewModel | None:
         run = run if run is not None else self._safe_load_run(run_id)
         if run is None:
@@ -1638,13 +1682,11 @@ class DesktopGuiController:
             if latest_event is not None
             else self.application.container.event_recorder.latest_for_run(run_id)
         )
-        project = (
-            project
-            if project is not None
-            else self.application.container.project_repository.load(
-                active_project_id or run.project_id
-            )
-        )
+        if project is None and load_project and (active_project_id or run.project_id):
+            try:
+                project = self._require_project(active_project_id or run.project_id)
+            except KeyError:
+                project = None
         total = 0
         processed = len(run.completed_paragraphs) + len(run.failed_paragraphs)
         failed = len(run.failed_paragraphs)
@@ -1704,9 +1746,10 @@ class DesktopGuiController:
             0.0 if total <= 0 else round((processed / max(1, total)) * 100.0, 1)
         )
         eta_text = self._eta_text(run, processed, total)
+        effective_status = self._effective_run_status(run, latest_event)
         return UiRunProgressViewModel(
             run_id=run.run_id,
-            status=run.status.value,
+            status=effective_status.value,
             eta_text=eta_text,
             current_stage=stage.value,
             current_paragraph_no=latest_event.paragraph_no
@@ -1731,13 +1774,16 @@ class DesktopGuiController:
             paragraph_progress_completed=paragraph_stage_value,
             paragraphs_failed=failed,
             percent_complete=percent_complete,
-            live_state=self._live_state(run, latest_event),
-            can_pause=run.status == RunStatus.RUNNING,
-            can_resume=run.status == RunStatus.PAUSED,
-            can_cancel=run.status == RunStatus.RUNNING,
+            live_state=self._live_state(run, latest_event, status=effective_status),
+            can_pause=effective_status == RunStatus.RUNNING,
+            can_resume=effective_status == RunStatus.PAUSED,
+            can_cancel=effective_status == RunStatus.RUNNING,
             can_retry_failed=bool(run.failed_paragraphs),
-            can_rerun_selected=project is not None,
-            checkpoint_message=self._checkpoint_message(run),
+            can_rerun_selected=project is not None or bool(active_project_id or run.project_id),
+            checkpoint_message=self._checkpoint_message(
+                run,
+                status=effective_status,
+            ),
         )
 
     def format_run_log(self, run_id: str) -> str:
@@ -1841,7 +1887,33 @@ class DesktopGuiController:
             run_id
         )
 
-    def _live_state(self, run: Run, latest_event: AppEvent | None) -> str:
+    def _effective_run_status(
+        self,
+        run: Run,
+        latest_event: AppEvent | None,
+    ) -> RunStatus:
+        if latest_event is not None:
+            status_by_event = {
+                "run.started": RunStatus.RUNNING,
+                "run.resumed": RunStatus.RUNNING,
+                "run.paused": RunStatus.PAUSED,
+                "run.cancelled": RunStatus.CANCELLED,
+                "run.completed": RunStatus.COMPLETED,
+                "run.failed": RunStatus.FAILED,
+            }
+            resolved = status_by_event.get(latest_event.name)
+            if resolved is not None:
+                return resolved
+        return run.status
+
+    def _live_state(
+        self,
+        run: Run,
+        latest_event: AppEvent | None,
+        *,
+        status: RunStatus | None = None,
+    ) -> str:
+        effective_status = status or run.status
         if latest_event is not None:
             if latest_event.name == "run.pause_requested":
                 return "запрошена пауза"
@@ -1867,31 +1939,37 @@ class DesktopGuiController:
                 return "истек лимит поиска"
             if latest_event.name == "run.resumed":
                 return "продолжено с контрольной точки"
-        if run.status == RunStatus.PAUSED:
+        if effective_status == RunStatus.PAUSED:
             return "на паузе"
-        if run.status == RunStatus.COMPLETED:
+        if effective_status == RunStatus.COMPLETED:
             return "завершено"
-        if run.status == RunStatus.FAILED:
+        if effective_status == RunStatus.FAILED:
             return "с ошибкой"
-        if run.status == RunStatus.CANCELLED:
+        if effective_status == RunStatus.CANCELLED:
             return "остановлено"
-        if run.status == RunStatus.RUNNING:
+        if effective_status == RunStatus.RUNNING:
             return "выполняется"
         return "ожидание"
 
-    def _checkpoint_message(self, run: Run) -> str:
+    def _checkpoint_message(
+        self,
+        run: Run,
+        *,
+        status: RunStatus | None = None,
+    ) -> str:
+        effective_status = status or run.status
         current_paragraph = (
             run.checkpoint.current_paragraph_no if run.checkpoint is not None else None
         )
-        if run.status == RunStatus.PAUSED:
+        if effective_status == RunStatus.PAUSED:
             return (
                 f"Пауза после абзаца {current_paragraph}"
                 if current_paragraph is not None
                 else "Пауза на контрольной точке"
             )
-        if run.status == RunStatus.RUNNING:
+        if effective_status == RunStatus.RUNNING:
             return "Пауза и остановка применяются после завершения текущего абзаца"
-        if run.status == RunStatus.FAILED:
+        if effective_status == RunStatus.FAILED:
             return (
                 f"Абзацы с ошибкой: {', '.join(str(item) for item in run.failed_paragraphs)}"
                 if run.failed_paragraphs
@@ -1900,7 +1978,7 @@ class DesktopGuiController:
                     or "Запуск завершился с ошибкой"
                 )
             )
-        if run.status == RunStatus.CANCELLED:
+        if effective_status == RunStatus.CANCELLED:
             return "Запуск остановлен до обработки всех абзацев"
         return ""
 
@@ -2036,9 +2114,13 @@ class DesktopGuiController:
                 "Для выбранного режима не включены нужные провайдеры. Включите их перед запуском.",
                 {"mode": mode.mode_id},
             )
+        mode_resolution = self._resolve_concurrency_mode_for_request(
+            resolved_quick, advanced
+        )
+        selected_providers = list(mode_resolution.selected_provider_ids)
         if (
             advanced.paragraph_workers > 1
-            and self._uses_storyblocks_provider(selected_providers)
+            and mode_resolution.requires_serial_paragraph_workers
         ):
             raise AppError(
                 "storyblocks_parallelism_guard",
@@ -2047,6 +2129,8 @@ class DesktopGuiController:
                     "mode": mode.mode_id,
                     "paragraph_workers": advanced.paragraph_workers,
                     "recommended_paragraph_workers": 1,
+                    "concurrency_mode": mode_resolution.mode.value,
+                    "selected_provider_ids": selected_providers,
                 },
             )
         free_provider_ids = [
@@ -2198,10 +2282,49 @@ class DesktopGuiController:
                 previews.append(self._asset_preview(asset))
         return previews
 
+    def _live_asset_previews(
+        self, snapshots: list[LiveAssetSnapshot]
+    ) -> list[UiAssetPreview]:
+        return [
+            self._asset_preview(
+                snapshot.asset,
+                role=snapshot.role,
+                locked=snapshot.locked,
+            )
+            for snapshot in snapshots
+        ]
+
     def _uses_storyblocks_provider(self, provider_ids: list[str]) -> bool:
         return any(
             provider_id in {"storyblocks_video", "storyblocks_image"}
             for provider_id in provider_ids
+        )
+
+    def _resolve_concurrency_mode_for_request(
+        self,
+        quick: UiQuickLaunchSettingsViewModel,
+        advanced: UiAdvancedSettingsViewModel,
+    ):
+        mode = get_project_mode(quick.mode_id)
+        settings = self.application.container.settings_manager.load()
+        settings.providers.enabled_providers = list(
+            dict.fromkeys(
+                self._selected_provider_ids(
+                    quick, allow_generic_web_image=advanced.allow_generic_web_image
+                )
+            )
+        )
+        settings.providers.allow_generic_web_image = advanced.allow_generic_web_image
+        settings.providers.free_images_only = mode.mode_id == "free_images_only"
+        settings.providers.mixed_image_fallback = mode.mode_id in {
+            "sb_video_plus_free_images",
+            "sb_images_plus_free_images",
+        }
+        return self.application.container.provider_registry.resolve_concurrency_mode(
+            settings.providers,
+            video_enabled=mode.video_enabled,
+            storyblocks_images_enabled=mode.storyblocks_images_enabled,
+            free_images_enabled=mode.free_images_enabled,
         )
 
     def _asset_preview(
@@ -2226,10 +2349,12 @@ class DesktopGuiController:
         return summary or "Intent prepared"
 
     def _require_project(self, project_id: str) -> Project:
-        project = self.application.container.project_repository.load(project_id)
+        project = self._project_cache.get(project_id)
+        if project is None:
+            project = self.application.container.project_repository.load(project_id)
         if project is None:
             raise KeyError(project_id)
-        return project
+        return self._remember_project(project)
 
     def _require_run(self, run_id: str) -> Run:
         run = self.application.container.run_repository.load(run_id)
@@ -2248,6 +2373,38 @@ class DesktopGuiController:
             return self.application.container.media_run_service.load_manifest(run_id)
         except (JSONDecodeError, ValueError):
             return None
+
+    def _safe_snapshot_manifest(self, run_id: str) -> RunManifest | None:
+        try:
+            return self.application.container.media_run_service.snapshot_manifest(run_id)
+        except (JSONDecodeError, ValueError):
+            return None
+
+    def _safe_snapshot_live_run_state(
+        self,
+        run_id: str,
+        *,
+        detailed_paragraph_no: int | None = None,
+    ) -> LiveRunStateSnapshot | None:
+        try:
+            return self.application.container.media_run_service.snapshot_live_run_state(
+                run_id,
+                detailed_paragraph_no=detailed_paragraph_no,
+            )
+        except (JSONDecodeError, ValueError):
+            return None
+
+    def _remember_project(self, project: Project) -> Project:
+        self._project_cache[project.project_id] = project
+        return project
+
+    def _remember_active_run(self, project_id: str, run_id: str) -> None:
+        try:
+            project = self._require_project(project_id)
+        except KeyError:
+            return
+        project.active_run_id = run_id
+        self._remember_project(project)
 
     def _require_paragraph(self, project: Project, paragraph_no: int):
         document = project.script_document

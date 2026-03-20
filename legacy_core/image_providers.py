@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .licenses import normalize_license_info
-from .network import http_get_json
+from .network import HttpClientConfig, SafeHttpClient, http_get_json
 
 
 def _strip_html(value: str) -> str:
@@ -107,15 +107,45 @@ class SearchCandidate:
 class PexelsProvider:
     name = "pexels"
 
-    def __init__(self, api_key: str, timeout_seconds: float, user_agent: str):
+    def __init__(
+        self,
+        api_key: str,
+        timeout_seconds: float,
+        user_agent: str,
+        *,
+        http_client: SafeHttpClient | None = None,
+    ):
         self._api_key = api_key.strip()
         self._timeout = timeout_seconds
         self._user_agent = user_agent
+        self._http_client = http_client or SafeHttpClient(
+            HttpClientConfig(user_agent=user_agent)
+        )
+        self._owns_http_client = http_client is None
         if not self._api_key:
             raise ValueError("Missing PEXELS_API_KEY")
 
-    def search(self, query: str, limit: int) -> list[SearchCandidate]:
+    @property
+    def http_client(self) -> SafeHttpClient:
+        return self._http_client
+
+    def close(self) -> None:
+        if self._owns_http_client:
+            self._http_client.close()
+
+    def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[SearchCandidate]:
         per_page = max(5, min(80, int(limit)))
+        effective_timeout = (
+            self._timeout
+            if timeout_seconds is None or timeout_seconds <= 0
+            else timeout_seconds
+        )
         payload = http_get_json(
             "https://api.pexels.com/v1/search",
             params={
@@ -125,8 +155,10 @@ class PexelsProvider:
                 "locale": "en-US",
             },
             headers={"Authorization": self._api_key},
-            timeout_seconds=self._timeout,
+            timeout_seconds=effective_timeout,
             user_agent=self._user_agent,
+            provider_id=self.name,
+            http_client=self._http_client,
         )
 
         photos = payload.get("photos")
@@ -169,15 +201,45 @@ class PexelsProvider:
 class PixabayProvider:
     name = "pixabay"
 
-    def __init__(self, api_key: str, timeout_seconds: float, user_agent: str):
+    def __init__(
+        self,
+        api_key: str,
+        timeout_seconds: float,
+        user_agent: str,
+        *,
+        http_client: SafeHttpClient | None = None,
+    ):
         self._api_key = api_key.strip()
         self._timeout = timeout_seconds
         self._user_agent = user_agent
+        self._http_client = http_client or SafeHttpClient(
+            HttpClientConfig(user_agent=user_agent)
+        )
+        self._owns_http_client = http_client is None
         if not self._api_key:
             raise ValueError("Missing PIXABAY_API_KEY")
 
-    def search(self, query: str, limit: int) -> list[SearchCandidate]:
+    @property
+    def http_client(self) -> SafeHttpClient:
+        return self._http_client
+
+    def close(self) -> None:
+        if self._owns_http_client:
+            self._http_client.close()
+
+    def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[SearchCandidate]:
         per_page = max(10, min(200, int(limit)))
+        effective_timeout = (
+            self._timeout
+            if timeout_seconds is None or timeout_seconds <= 0
+            else timeout_seconds
+        )
         payload = http_get_json(
             "https://pixabay.com/api/",
             params={
@@ -188,8 +250,10 @@ class PixabayProvider:
                 "per_page": per_page,
                 "page": 1,
             },
-            timeout_seconds=self._timeout,
+            timeout_seconds=effective_timeout,
             user_agent=self._user_agent,
+            provider_id=self.name,
+            http_client=self._http_client,
         )
 
         hits = payload.get("hits")
@@ -234,12 +298,41 @@ class PixabayProvider:
 class OpenverseProvider:
     name = "openverse"
 
-    def __init__(self, timeout_seconds: float, user_agent: str):
+    def __init__(
+        self,
+        timeout_seconds: float,
+        user_agent: str,
+        *,
+        http_client: SafeHttpClient | None = None,
+    ):
         self._timeout = timeout_seconds
         self._user_agent = user_agent
+        self._http_client = http_client or SafeHttpClient(
+            HttpClientConfig(user_agent=user_agent)
+        )
+        self._owns_http_client = http_client is None
 
-    def search(self, query: str, limit: int) -> list[SearchCandidate]:
+    @property
+    def http_client(self) -> SafeHttpClient:
+        return self._http_client
+
+    def close(self) -> None:
+        if self._owns_http_client:
+            self._http_client.close()
+
+    def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[SearchCandidate]:
         page_size = max(10, min(80, int(limit)))
+        effective_timeout = (
+            self._timeout
+            if timeout_seconds is None or timeout_seconds <= 0
+            else timeout_seconds
+        )
         payload = http_get_json(
             "https://api.openverse.org/v1/images/",
             params={
@@ -248,8 +341,10 @@ class OpenverseProvider:
                 "mature": "false",
                 "extension": ["jpg", "jpeg", "png", "webp"],
             },
-            timeout_seconds=self._timeout,
+            timeout_seconds=effective_timeout,
             user_agent=self._user_agent,
+            provider_id=self.name,
+            http_client=self._http_client,
         )
 
         results_raw = payload.get("results")
@@ -292,12 +387,41 @@ class OpenverseProvider:
 class WikimediaProvider:
     name = "wikimedia"
 
-    def __init__(self, timeout_seconds: float, user_agent: str):
+    def __init__(
+        self,
+        timeout_seconds: float,
+        user_agent: str,
+        *,
+        http_client: SafeHttpClient | None = None,
+    ):
         self._timeout = timeout_seconds
         self._user_agent = user_agent
+        self._http_client = http_client or SafeHttpClient(
+            HttpClientConfig(user_agent=user_agent)
+        )
+        self._owns_http_client = http_client is None
 
-    def search(self, query: str, limit: int) -> list[SearchCandidate]:
+    @property
+    def http_client(self) -> SafeHttpClient:
+        return self._http_client
+
+    def close(self) -> None:
+        if self._owns_http_client:
+            self._http_client.close()
+
+    def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[SearchCandidate]:
         amount = max(10, min(50, int(limit)))
+        effective_timeout = (
+            self._timeout
+            if timeout_seconds is None or timeout_seconds <= 0
+            else timeout_seconds
+        )
         payload = http_get_json(
             "https://commons.wikimedia.org/w/api.php",
             params={
@@ -310,8 +434,10 @@ class WikimediaProvider:
                 "prop": "imageinfo",
                 "iiprop": "url|extmetadata",
             },
-            timeout_seconds=self._timeout,
+            timeout_seconds=effective_timeout,
             user_agent=self._user_agent,
+            provider_id=self.name,
+            http_client=self._http_client,
         )
 
         query_data = payload.get("query")
@@ -382,7 +508,13 @@ class BingProvider:
         self._search_func = BING_SEARCH_FUNC
         self._adult_filter_off = bool(adult_filter_off)
 
-    def search(self, query: str, limit: int) -> list[SearchCandidate]:
+    def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[SearchCandidate]:
         try:
             asyncio.get_event_loop()
         except RuntimeError:

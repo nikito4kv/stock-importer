@@ -18,10 +18,18 @@ from browser import (
     PersistentBrowserHandle,
     StoryblocksSessionProbe,
 )
-from domain.enums import AssetKind, ProviderCapability, SessionHealth
-from domain.models import AssetCandidate
+from domain.enums import (
+    AssetKind,
+    EventLevel,
+    ProviderCapability,
+    RunStage,
+    RunStatus,
+    SessionHealth,
+)
+from domain.models import AssetCandidate, AssetSelection, ProviderResult
 from pipeline import CallbackCandidateSearchBackend
 from services.errors import AppError
+from services.events import AppEvent
 from ui.controller import DesktopGuiController
 
 
@@ -587,6 +595,10 @@ class UiControllerTests(unittest.TestCase):
                 ctx.exception.details.get("recommended_paragraph_workers"),
                 1,
             )
+            self.assertEqual(
+                ctx.exception.details.get("concurrency_mode"),
+                "storyblocks_safe",
+            )
 
     def test_controller_allows_free_image_parallelism_over_one_worker(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -646,8 +658,16 @@ class UiControllerTests(unittest.TestCase):
 
             with patch.object(
                 controller.application.container.media_run_service,
+                "snapshot_manifest",
+                side_effect=AssertionError("manifest snapshot should not happen"),
+            ), patch.object(
+                controller.application.container.media_run_service,
                 "load_manifest",
                 side_effect=AssertionError("manifest load should not happen"),
+            ), patch.object(
+                controller.application.container.project_repository,
+                "load",
+                side_effect=AssertionError("project load should not happen"),
             ):
                 snapshot = controller.build_live_snapshot(
                     active_project_id=project.project_id,
@@ -669,77 +689,157 @@ class UiControllerTests(unittest.TestCase):
                     break
                 time.sleep(0.05)
 
-    def test_build_live_run_state_keeps_paragraph_statuses_and_selected_detail(self) -> None:
+    def test_build_live_run_state_uses_compact_snapshot_and_builds_workbench_once(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             script_path = _write_docx(
                 temp_dir, ["HEADER", "1. River boat scene", "2. Camp scene"]
             )
             controller = DesktopGuiController.create(temp_dir)
-            project = controller.open_script(script_path, project_name="Live Run State")
-            _mark_storyblocks_ready(controller)
+            project = controller.open_script(
+                script_path, project_name="Live Run State"
+            )
             container = controller.application.container
-            descriptor = container.provider_registry.get("storyblocks_video")
-            assert descriptor is not None
+            run, manifest = container.media_run_service.create_run(project.project_id)
+            run.status = RunStatus.RUNNING
+            run.stage = RunStage.PROVIDER_SEARCH
+            assert run.checkpoint is not None
+            run.checkpoint.stage = RunStage.PROVIDER_SEARCH
+            run.checkpoint.current_paragraph_no = 1
+            container.run_repository.save(run)
 
-            def slow_video(paragraph, query, limit):
-                time.sleep(0.25)
-                return [
-                    _candidate(
-                        f"video-{paragraph.paragraph_no}",
-                        "storyblocks_video",
-                        AssetKind.VIDEO,
-                        10.0,
+            detail_candidate = _candidate(
+                "video-1", "storyblocks_video", AssetKind.VIDEO, 10.0
+            )
+            detail_entry = manifest.paragraph_entries[0]
+            detail_entry.selection = AssetSelection(
+                paragraph_no=1,
+                primary_asset=detail_candidate,
+                provider_results=[
+                    ProviderResult(
+                        provider_name="storyblocks_video",
+                        capability=ProviderCapability.VIDEO,
+                        query="river boat",
+                        candidates=[detail_candidate],
                     )
-                ]
-
-            container.media_pipeline.register_backend(
-                CallbackCandidateSearchBackend(
-                    provider_id="storyblocks_video",
-                    capability=ProviderCapability.VIDEO,
-                    descriptor=descriptor,
-                    search_fn=slow_video,
+                ],
+                user_locked=True,
+                user_decision_status="locked",
+                status="locked",
+            )
+            detail_entry.status = "locked"
+            detail_entry.user_decision_status = "locked"
+            detail_entry.rejection_reasons = ["manual override"]
+            container.media_pipeline.register_live_manifest(manifest)
+            container.event_recorder(
+                AppEvent(
+                    name="provider.search.started",
+                    level=EventLevel.INFO,
+                    message="Provider search started",
+                    project_id=project.project_id,
+                    run_id=run.run_id,
+                    paragraph_no=1,
+                    provider_name="storyblocks_video",
+                    query="river boat",
+                    stage=RunStage.PROVIDER_SEARCH,
                 )
             )
 
-            quick = controller.build_quick_launch_settings()
-            advanced = controller.build_advanced_settings()
-            quick.mode_id = "sb_video_only"
-            advanced.paragraph_workers = 1
-            run_id = controller.start_run_async(project.project_id, quick, advanced)
-
-            live_state = None
-            deadline = time.time() + 5.0
-            while time.time() < deadline:
+            with patch.object(
+                controller.application.container.media_run_service,
+                "snapshot_live_run_state",
+                wraps=(
+                    controller.application.container.media_run_service.snapshot_live_run_state
+                ),
+            ) as snapshot_live_run_state, patch.object(
+                controller.application.container.media_run_service,
+                "snapshot_manifest",
+                side_effect=AssertionError("manifest snapshot should not happen"),
+            ), patch.object(
+                controller.application.container.media_run_service,
+                "load_manifest",
+                side_effect=AssertionError("manifest load should not happen"),
+            ), patch.object(
+                controller.application.container.project_repository,
+                "load",
+                side_effect=AssertionError("project load should not happen"),
+            ), patch.object(
+                controller,
+                "build_paragraph_workbench",
+                wraps=controller.build_paragraph_workbench,
+            ) as build_paragraph_workbench:
                 live_state = controller.build_live_run_state(
                     active_project_id=project.project_id,
-                    active_run_id=run_id,
-                    selected_paragraph_no=2,
+                    active_run_id=run.run_id,
                 )
-                if live_state.run_progress is not None and live_state.paragraph_items:
-                    break
-                time.sleep(0.05)
 
-            assert live_state is not None
-            assert live_state.run_progress is not None
+            snapshot_live_run_state.assert_called_once_with(
+                run.run_id, detailed_paragraph_no=1
+            )
+            build_paragraph_workbench.assert_called_once()
+            self.assertIsNotNone(live_state.run_progress)
             self.assertEqual(len(live_state.paragraph_items), 2)
             item_by_no = {
                 item.paragraph_no: item for item in live_state.paragraph_items
             }
-            self.assertEqual(item_by_no[1].text, "")
-            self.assertTrue(item_by_no[2].text)
+            self.assertTrue(item_by_no[1].text)
+            self.assertEqual(item_by_no[2].text, "")
+            self.assertEqual(len(item_by_no[1].selected_assets), 1)
+            self.assertEqual(len(item_by_no[1].candidate_assets), 1)
+            self.assertEqual(item_by_no[1].rejection_reasons, ["manual override"])
 
-            deadline = time.time() + 5.0
-            while time.time() < deadline:
-                state = controller.build_state(
-                    active_project_id=project.project_id, active_run_id=run_id
+    def test_build_live_run_state_does_not_fallback_to_manifest_after_live_release(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = _write_docx(temp_dir, ["HEADER", "1. River boat scene"])
+            controller = DesktopGuiController.create(temp_dir)
+            project = controller.open_script(script_path, project_name="Released Live")
+            container = controller.application.container
+            run, manifest = container.media_run_service.create_run(project.project_id)
+            run.status = RunStatus.COMPLETED
+            run.stage = RunStage.COMPLETE
+            container.run_repository.save(run)
+            container.media_pipeline.register_live_manifest(manifest)
+            container.media_pipeline.release_run_state(run.run_id)
+            container.event_recorder(
+                AppEvent(
+                    name="run.completed",
+                    level=EventLevel.INFO,
+                    message="Run completed",
+                    project_id=project.project_id,
+                    run_id=run.run_id,
+                    stage=RunStage.COMPLETE,
                 )
-                if state.run_progress is not None and state.run_progress.status in {
-                    "completed",
-                    "failed",
-                    "cancelled",
-                }:
-                    break
-                time.sleep(0.05)
+            )
+
+            with patch.object(
+                controller.application.container.media_run_service,
+                "snapshot_live_run_state",
+                wraps=(
+                    controller.application.container.media_run_service.snapshot_live_run_state
+                ),
+            ) as snapshot_live_run_state, patch.object(
+                controller.application.container.media_run_service,
+                "snapshot_manifest",
+                side_effect=AssertionError("manifest snapshot should not happen"),
+            ), patch.object(
+                controller.application.container.media_run_service,
+                "load_manifest",
+                side_effect=AssertionError("manifest load should not happen"),
+            ):
+                live_state = controller.build_live_run_state(
+                    active_project_id=project.project_id,
+                    active_run_id=run.run_id,
+                )
+
+            snapshot_live_run_state.assert_called_once_with(
+                run.run_id, detailed_paragraph_no=None
+            )
+            self.assertIsNotNone(live_state.run_progress)
+            self.assertEqual(live_state.run_progress.status, "completed")
+            self.assertEqual(live_state.paragraph_items, [])
 
     def test_controller_blocks_session_changes_while_run_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

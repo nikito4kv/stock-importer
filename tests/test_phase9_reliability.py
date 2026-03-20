@@ -553,6 +553,7 @@ class Phase9ReliabilityTests(unittest.TestCase):
             self.assertEqual(paused_run.status, RunStatus.PAUSED)
             self.assertEqual(paused_manifest.summary["paragraphs_completed"], 1)
 
+            container.close()
             restarted = bootstrap_application(temp_dir)
             self._register_video_backend(restarted)
             resumed_run, resumed_manifest = restarted.media_run_service.resume(
@@ -561,6 +562,7 @@ class Phase9ReliabilityTests(unittest.TestCase):
 
             self.assertEqual(resumed_run.status, RunStatus.COMPLETED)
             self.assertEqual(resumed_manifest.summary["paragraphs_completed"], 3)
+            restarted.close()
 
     def test_failing_event_listener_does_not_break_run_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -599,6 +601,7 @@ class Phase9ReliabilityTests(unittest.TestCase):
             self.assertTrue(manifest_path.exists())
             self.assertEqual(manifest.run_id, run.run_id)
             self.assertEqual(len(container.run_repository.list_all()), 1)
+            container.close()
 
     def test_locked_selection_survives_application_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -674,6 +677,7 @@ class Phase9ReliabilityTests(unittest.TestCase):
             self.assertEqual(
                 mixed_selection.fallback_assets[0].provider_name, "openverse"
             )
+            container.close()
 
     def test_high_load_free_image_mode_stays_stable_with_parallelism(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -44,7 +44,10 @@ from .storyblocks import (
     first_available_selector,
     slugify_storyblocks_query,
 )
-from .storyblocks_backend import StoryblocksCandidateSearchBackend
+from .storyblocks_backend import (
+    StoryblocksCandidateSearchBackend,
+    StoryblocksOperationPolicy,
+)
 
 __all__ = [
     "AuthorizationSnapshot",
@@ -74,6 +77,7 @@ __all__ = [
     "StoryblocksDownloadRecord",
     "StoryblocksDownloadRequest",
     "StoryblocksImageSearchAdapter",
+    "StoryblocksOperationPolicy",
     "StoryblocksCandidateSearchBackend",
     "StoryblocksSearchFilter",
     "StoryblocksSelectorCatalog",

@@ -11,6 +11,7 @@ from browser import (
     StoryblocksCandidateSearchBackend,
     StoryblocksDomContractChecker,
     StoryblocksImageSearchAdapter,
+    StoryblocksOperationPolicy,
     StoryblocksSessionProbe,
     StoryblocksVideoSearchAdapter,
 )
@@ -63,6 +64,11 @@ class ApplicationContainer:
     media_run_service: ParagraphMediaRunService
     event_bus: EventBus
     event_recorder: EventRecorder
+
+    def close(self) -> None:
+        self.media_pipeline.close()
+        self.image_provider_search_service.close()
+        self.session_manager.close_browsers_owned_by_current_thread()
 
 
 def bootstrap_application(
@@ -135,8 +141,13 @@ def bootstrap_application(
                 session_manager=session_manager,
                 search_adapter=storyblocks_video_adapter,
                 dom_checker=storyblocks_dom_checker,
-                download_retries=max(0, int(settings.concurrency.retry_budget)),
-                download_timeout_seconds=settings.browser.downloads_timeout_seconds,
+                operation_policy=StoryblocksOperationPolicy(
+                    search_timeout_seconds=max(
+                        0.0, float(settings.concurrency.search_timeout_seconds)
+                    ),
+                    download_retries=max(0, int(settings.concurrency.retry_budget)),
+                    download_timeout_seconds=settings.browser.downloads_timeout_seconds,
+                ),
             )
         )
     if storyblocks_image_descriptor is not None:
@@ -148,8 +159,13 @@ def bootstrap_application(
                 session_manager=session_manager,
                 search_adapter=storyblocks_image_adapter,
                 dom_checker=storyblocks_dom_checker,
-                download_retries=max(0, int(settings.concurrency.retry_budget)),
-                download_timeout_seconds=settings.browser.downloads_timeout_seconds,
+                operation_policy=StoryblocksOperationPolicy(
+                    search_timeout_seconds=max(
+                        0.0, float(settings.concurrency.search_timeout_seconds)
+                    ),
+                    download_retries=max(0, int(settings.concurrency.retry_budget)),
+                    download_timeout_seconds=settings.browser.downloads_timeout_seconds,
+                ),
             )
         )
     media_pipeline.build_default_free_image_backends(
@@ -177,7 +193,7 @@ def bootstrap_application(
         concurrency_settings=settings.concurrency,
     )
 
-    return ApplicationContainer(
+    container = ApplicationContainer(
         settings=settings,
         workspace=workspace,
         settings_manager=settings_manager,
@@ -200,3 +216,5 @@ def bootstrap_application(
         event_bus=event_bus,
         event_recorder=event_recorder,
     )
+    atexit.register(container.close)
+    return container

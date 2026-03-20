@@ -60,7 +60,13 @@ class PlaywrightDownloadDriver:
                 message="Playwright page does not support expect_download().",
             )
 
-        self._page.goto(request.detail_url)
+        try:
+            if self._timeout_ms is not None:
+                self._page.goto(request.detail_url, timeout=self._timeout_ms)
+            else:
+                self._page.goto(request.detail_url)
+        except TypeError:
+            self._page.goto(request.detail_url)
         try:
             if self._timeout_ms is not None:
                 download_context = self._page.expect_download(timeout=self._timeout_ms)

@@ -236,6 +236,29 @@ class RunManifest(SerializableModel):
 
 
 @dataclass(slots=True)
+class LiveAssetSnapshot:
+    asset: AssetCandidate
+    role: str = "candidate"
+    locked: bool = False
+
+
+@dataclass(slots=True)
+class LiveParagraphStateSnapshot:
+    paragraph_no: int
+    status: str = "pending"
+    user_decision_status: str = "auto_selected"
+    selected_assets: list[LiveAssetSnapshot] = field(default_factory=list)
+    candidate_assets: list[LiveAssetSnapshot] = field(default_factory=list)
+    rejection_reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class LiveRunStateSnapshot:
+    run_id: str
+    paragraph_states: dict[int, LiveParagraphStateSnapshot] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class BrowserProfile(SerializableModel):
     profile_id: str
     display_name: str

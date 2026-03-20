@@ -26,6 +26,13 @@ class ConcurrencyModeResolution:
     def uses_storyblocks(self) -> bool:
         return bool(self.storyblocks_provider_ids)
 
+    @property
+    def requires_serial_paragraph_workers(self) -> bool:
+        return self.mode in {
+            ExecutionConcurrencyMode.STORYBLOCKS_SAFE,
+            ExecutionConcurrencyMode.MIXED_SAFE,
+        }
+
 
 @dataclass(slots=True)
 class ProviderRegistry:

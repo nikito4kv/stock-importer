@@ -160,55 +160,121 @@ class RunOrchestrator:
 
             return self._finalize_run(run, perf_context=perf_context)
 
-        with BoundedExecutor[ParagraphUnit, AssetSelection](
+        executor = BoundedExecutor[ParagraphUnit, AssetSelection](
             max_workers=self._max_workers,
             queue_size=self._queue_size,
-        ) as executor:
-            remaining_iter = iter(remaining)
+        )
+        transition: str | None = None
+        transition_payload: dict[str, object] | None = None
+        try:
+            next_submit_index = 0
             pending: dict[Future[AssetSelection], ParagraphUnit] = {}
+            submission_window = max(1, min(self._max_workers, self._queue_size))
 
             def submit_next() -> bool:
-                if controls.cancel_requested:
+                nonlocal next_submit_index
+                if transition is not None or controls.cancel_requested:
                     return False
-                try:
-                    paragraph = next(remaining_iter)
-                except StopIteration:
+                if next_submit_index >= len(remaining):
                     return False
+                paragraph = remaining[next_submit_index]
+                next_submit_index += 1
                 pending[executor.submit(processor, paragraph)] = paragraph
                 return True
 
-            while len(pending) < self._queue_size and submit_next():
+            while len(pending) < submission_window and submit_next():
                 pass
 
-            while pending:
-                if controls.cancel_requested:
-                    return self._cancel_run(run, perf_context=perf_context)
+            if controls.cancel_requested and not pending:
+                return self._cancel_run(
+                    run,
+                    perf_context=perf_context,
+                    payload=self._transition_payload(
+                        "cancel",
+                        done_futures=0,
+                        pending_futures=0,
+                        cancelled_futures=0,
+                    ),
+                )
 
+            while pending:
                 done, _ = wait(tuple(pending.keys()), return_when=FIRST_COMPLETED)
+                batch_done = len(done)
+                batch_cancelled = 0
+                saw_interrupt = False
                 for future in done:
                     paragraph = pending.pop(future)
+                    if future.cancelled():
+                        batch_cancelled += 1
+                        continue
                     try:
                         result = future.result()
                     except InterruptedError:
-                        return self._cancel_run(run, perf_context=perf_context)
+                        saw_interrupt = True
+                        continue
                     except Exception as exc:
                         self._record_failure(
                             run, paragraph.paragraph_no, exc, perf_context=perf_context
                         )
-                        if controls.pause_after_current:
-                            return self._pause_run(run, perf_context=perf_context)
                         continue
 
                     self._record_success(
                         run, result.paragraph_no, perf_context=perf_context
                     )
-                    if controls.pause_after_current:
-                        return self._pause_run(run, perf_context=perf_context)
+                if saw_interrupt:
+                    controls.cancel_requested = True
 
-                while len(pending) < self._queue_size and submit_next():
+                decision = transition
+                if controls.cancel_requested:
+                    decision = "cancel"
+                elif transition is None and controls.pause_after_current:
+                    # In multi-worker mode "after current" means:
+                    # stop new submissions, cancel queued-but-not-started work,
+                    # and drain only already running paragraphs.
+                    decision = "pause"
+                if decision is not None:
+                    cancelled_now = self._cancel_pending_futures(pending)
+                    cancelled_unsubmitted = max(
+                        0,
+                        len(remaining) - next_submit_index,
+                    )
+                    transition = decision
+                    transition_payload = self._transition_payload(
+                        decision,
+                        done_futures=batch_done,
+                        pending_futures=len(pending),
+                        cancelled_futures=(
+                            batch_cancelled + cancelled_now + cancelled_unsubmitted
+                        ),
+                    )
+                    if not pending:
+                        if decision == "cancel":
+                            return self._cancel_run(
+                                run,
+                                perf_context=perf_context,
+                                payload=transition_payload,
+                            )
+                        return self._pause_run(
+                            run,
+                            perf_context=perf_context,
+                            payload=transition_payload,
+                        )
+                    continue
+
+                while len(pending) < submission_window and submit_next():
                     pass
 
-        return self._finalize_run(run, perf_context=perf_context)
+            if transition == "cancel":
+                return self._cancel_run(
+                    run, perf_context=perf_context, payload=transition_payload
+                )
+            if transition == "pause":
+                return self._pause_run(
+                    run, perf_context=perf_context, payload=transition_payload
+                )
+            return self._finalize_run(run, perf_context=perf_context)
+        finally:
+            executor.shutdown(wait=transition is None, cancel_futures=transition is not None)
 
     def resume(
         self,
@@ -234,7 +300,11 @@ class RunOrchestrator:
         return self.execute(run, pending, processor, perf_context=perf_context)
 
     def _cancel_run(
-        self, run: Run, *, perf_context: PerformanceContext | None = None
+        self,
+        run: Run,
+        *,
+        perf_context: PerformanceContext | None = None,
+        payload: dict[str, object] | None = None,
     ) -> Run:
         run.status = RunStatus.CANCELLED
         run.finished_at = _now()
@@ -244,11 +314,21 @@ class RunOrchestrator:
             run.checkpoint.completed_paragraphs = list(run.completed_paragraphs)
             run.checkpoint.failed_paragraphs = list(run.failed_paragraphs)
             run.checkpoint.updated_at = _now()
-        self._emit("run.cancelled", EventLevel.WARNING, "Run cancelled", run)
+        self._emit(
+            "run.cancelled",
+            EventLevel.WARNING,
+            "Run cancelled",
+            run,
+            payload=payload,
+        )
         return self._save_run(run, perf_context=perf_context)
 
     def _pause_run(
-        self, run: Run, *, perf_context: PerformanceContext | None = None
+        self,
+        run: Run,
+        *,
+        perf_context: PerformanceContext | None = None,
+        payload: dict[str, object] | None = None,
     ) -> Run:
         run.status = RunStatus.PAUSED
         run.stage = RunStage.PERSIST
@@ -257,7 +337,13 @@ class RunOrchestrator:
             run.checkpoint.completed_paragraphs = list(run.completed_paragraphs)
             run.checkpoint.failed_paragraphs = list(run.failed_paragraphs)
             run.checkpoint.updated_at = _now()
-        self._emit("run.paused", EventLevel.INFO, "Run paused", run)
+        self._emit(
+            "run.paused",
+            EventLevel.INFO,
+            "Run paused",
+            run,
+            payload=payload,
+        )
         return self._save_run(run, perf_context=perf_context)
 
     def _record_failure(
@@ -418,3 +504,29 @@ class RunOrchestrator:
                 payload=dict(payload or {}),
             )
         )
+
+    def _cancel_pending_futures(
+        self, pending: dict[Future[AssetSelection], ParagraphUnit]
+    ) -> int:
+        cancelled = 0
+        for future in list(pending.keys()):
+            if not future.cancel():
+                continue
+            pending.pop(future, None)
+            cancelled += 1
+        return cancelled
+
+    def _transition_payload(
+        self,
+        decision: str,
+        *,
+        done_futures: int,
+        pending_futures: int,
+        cancelled_futures: int,
+    ) -> dict[str, object]:
+        return {
+            "decision": decision,
+            "done_futures": max(0, int(done_futures)),
+            "pending_futures": max(0, int(pending_futures)),
+            "cancelled_futures": max(0, int(cancelled_futures)),
+        }

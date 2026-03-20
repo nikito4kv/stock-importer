@@ -36,6 +36,13 @@ def is_storyblocks_fatal_error_code(code: str) -> bool:
     return str(code or "").strip().casefold() in STORYBLOCKS_FATAL_ERROR_CODES
 
 
+@dataclass(frozen=True, slots=True)
+class StoryblocksOperationPolicy:
+    search_timeout_seconds: float = 20.0
+    download_retries: int = 2
+    download_timeout_seconds: float = 120.0
+
+
 @dataclass(slots=True)
 class StoryblocksCandidateSearchBackend:
     provider_id: str
@@ -45,8 +52,9 @@ class StoryblocksCandidateSearchBackend:
     search_adapter: Any
     dom_checker: StoryblocksDomContractChecker
     search_filters: list[Any] = field(default_factory=list)
-    download_retries: int = 2
-    download_timeout_seconds: float = 120.0
+    operation_policy: StoryblocksOperationPolicy = field(
+        default_factory=StoryblocksOperationPolicy
+    )
 
     def _raise_for_session_state(
         self,
@@ -107,7 +115,12 @@ class StoryblocksCandidateSearchBackend:
             )
 
     def search(
-        self, paragraph: ParagraphUnit, query: str, limit: int
+        self,
+        paragraph: ParagraphUnit,
+        query: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None = None,
     ) -> ProviderResult:
         rescue_url = self.search_adapter.build_direct_search_url(query)
         try:
@@ -137,8 +150,18 @@ class StoryblocksCandidateSearchBackend:
                 message="Persistent browser page does not expose HTML content for Storyblocks parsing.",
             )
 
+        policy = self.operation_policy
+        effective_timeout_seconds = (
+            float(timeout_seconds)
+            if timeout_seconds is not None
+            else float(policy.search_timeout_seconds)
+        )
+        self._apply_page_timeouts(page, timeout_seconds=effective_timeout_seconds)
         self.search_adapter.open_search(page, query, filters=list(self.search_filters))
-        snapshot = capture_storyblocks_page_snapshot(page)
+        snapshot = capture_storyblocks_page_snapshot(
+            page,
+            wait_timeout_ms=self._snapshot_wait_timeout_ms(effective_timeout_seconds),
+        )
         html = snapshot.html
         state = self.session_manager.check_authorization(
             html=html,
@@ -179,12 +202,29 @@ class StoryblocksCandidateSearchBackend:
             diagnostics=diagnostics,
         )
 
+    def _apply_page_timeouts(self, page: Any, *, timeout_seconds: float) -> None:
+        if timeout_seconds <= 0:
+            return
+        timeout_ms = max(1, int(timeout_seconds * 1000.0))
+        setter = getattr(page, "set_default_timeout", None)
+        if callable(setter):
+            setter(timeout_ms)
+        navigation_setter = getattr(page, "set_default_navigation_timeout", None)
+        if callable(navigation_setter):
+            navigation_setter(timeout_ms)
+
+    def _snapshot_wait_timeout_ms(self, timeout_seconds: float) -> int:
+        if timeout_seconds <= 0:
+            return 2000
+        return max(250, min(2000, int(timeout_seconds * 1000.0)))
+
     def download_asset(
         self,
         asset: AssetCandidate,
         *,
         destination_dir: Path,
         filename: str,
+        operation_policy: StoryblocksOperationPolicy | None = None,
     ) -> AssetCandidate:
         detail_url = str(
             asset.source_url or asset.metadata.get("detail_url", "")
@@ -196,16 +236,19 @@ class StoryblocksCandidateSearchBackend:
                 details={
                     "asset_id": asset.asset_id,
                     "provider_id": self.provider_id,
-                    "fatal": True,
                 },
+                fatal=True,
             )
         session = self.session_manager.open_browser()
+        policy = operation_policy or self.operation_policy
         driver = PlaywrightDownloadDriver(
             session.handle.page,
             download_button_selectors=self.search_adapter.selectors.detail_download_button,
-            timeout_ms=max(1, int(self.download_timeout_seconds * 1000.0)),
+            timeout_ms=max(1, int(policy.download_timeout_seconds * 1000.0)),
         )
-        manager = StoryblocksDownloadManager(driver, max_retries=self.download_retries)
+        manager = StoryblocksDownloadManager(
+            driver, max_retries=policy.download_retries
+        )
         record = manager.download_one(
             StoryblocksDownloadRequest(
                 asset_id=asset.asset_id,

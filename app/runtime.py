@@ -60,6 +60,9 @@ class DesktopApplication:
             browser_profiles=profiles,
         )
 
+    def close(self) -> None:
+        self.container.close()
+
     def create_project(self, name: str, script_path: str | Path) -> Project:
         import_started_at = perf_counter()
         ingestion_ms = 0

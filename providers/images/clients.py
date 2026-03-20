@@ -31,7 +31,13 @@ class ImageSearchProvider(Protocol):
     provider_id: str
     descriptor: ProviderDescriptor
 
-    def search(self, query: str, limit: int) -> list[SearchCandidate]: ...
+    def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[SearchCandidate]: ...
 
 
 @dataclass(slots=True)
@@ -52,8 +58,25 @@ class WrappedImageSearchProvider:
     descriptor: ProviderDescriptor
     client: Any
 
-    def search(self, query: str, limit: int) -> list[SearchCandidate]:
-        return list(self.client.search(query, limit))
+    def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[SearchCandidate]:
+        return list(
+            self.client.search(query, limit, timeout_seconds=timeout_seconds)
+        )
+
+    @property
+    def http_client(self) -> Any | None:
+        return getattr(self.client, "http_client", None)
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
 
 def build_image_provider_clients(

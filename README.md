@@ -4,10 +4,19 @@ Desktop tool for paragraph-first media sourcing from Storyblocks and free image 
 
 ## Quick Start
 
-- Create a virtual environment and install dependencies: `python -m pip install -r requirements.txt`
-- Run tests: `python -m unittest discover -s tests`
-- Run startup smoke: `python -m app --smoke --no-gui`
-- Launch the app: `python -m app`
+- Supported local runtime: `CPython 3.13`
+- Create or recreate `.venv` with a real `python.exe` from a CPython 3.13 install:
+  `C:\path\to\python.exe -m venv .venv`
+- Install dependencies into that environment:
+  `.venv\Scripts\python.exe -m pip install -r requirements.txt`
+- Install Ruff in the same environment:
+  `.venv\Scripts\python.exe -m pip install ruff`
+- Run tests:
+  `.venv\Scripts\python.exe -m unittest discover -s tests`
+- Run startup smoke:
+  `.venv\Scripts\python.exe -m app --smoke --no-gui`
+- Launch the app:
+  `.venv\Scripts\python.exe -m app`
 
 ## Canonical Architecture
 
@@ -29,9 +38,12 @@ Desktop tool for paragraph-first media sourcing from Storyblocks and free image 
 
 ## Main Commands
 
-- `python -m unittest discover -s tests`
-- `python -m app --smoke --no-gui`
-- `python -m app --workspace tmp_manual_smoke_workspace`
+- `.venv\Scripts\python.exe -m unittest tests.test_image_provider_architecture`
+- `.venv\Scripts\python.exe -m unittest tests.test_media_pipeline`
+- `.venv\Scripts\python.exe -m unittest discover -s tests`
+- `.venv\Scripts\python.exe -m ruff check .`
+- `.venv\Scripts\python.exe -m app --smoke --no-gui`
+- `.venv\Scripts\python.exe -m app --workspace tmp_manual_smoke_workspace`
 
 ## Change Rules
 
