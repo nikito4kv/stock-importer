@@ -22,7 +22,7 @@ class CoreUtilityTests(unittest.TestCase):
             ("CC0", True, False),
         )
         self.assertEqual(
-            normalize_license_info("wikimedia", "CC BY 4.0", None),
+            normalize_license_info("openverse", "CC BY 4.0", None),
             ("CC BY 4.0", True, True),
         )
 
@@ -35,10 +35,10 @@ class CoreUtilityTests(unittest.TestCase):
 
         self.assertIn("river boat photo", variants)
         self.assertEqual(
-            parse_sources("bing,openverse,bing", default_sources=["wikimedia"]),
-            ["bing", "openverse"],
+            parse_sources("openverse,pixabay,openverse", default_sources=["pexels"]),
+            ["openverse", "pixabay"],
         )
-        self.assertEqual(parse_sources("", default_sources=["wikimedia"]), ["wikimedia"])
+        self.assertEqual(parse_sources("", default_sources=["openverse"]), ["openverse"])
 
     def test_file_helpers_create_run_dir_and_hashed_temp_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

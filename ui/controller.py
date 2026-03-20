@@ -52,6 +52,14 @@ from .contracts import (
     UiSessionPanelViewModel,
     UiStateViewModel,
 )
+from .launch_profiles import (
+    LaunchProfileCustomTiming,
+    ResolvedLaunchProfile,
+    default_custom_timing,
+    describe_custom_timing_overrides,
+    normalize_launch_profile_id,
+    resolve_launch_profile,
+)
 from .presentation import (
     normalize_ui_theme,
     translate_error_text,
@@ -311,51 +319,49 @@ class DesktopGuiController:
         ]
 
     def build_quick_launch_settings(self) -> UiQuickLaunchSettingsViewModel:
-        settings = self.application.container.settings
+        return self._quick_launch_from_settings(self.application.container.settings)
+
+    def build_advanced_settings(self) -> UiAdvancedSettingsViewModel:
+        return self._advanced_settings_from_settings(
+            self.application.container.settings
+        )
+
+    def _quick_launch_from_settings(
+        self, settings: ApplicationSettings
+    ) -> UiQuickLaunchSettingsViewModel:
         provider_ids = normalize_free_image_provider_ids(
             [
                 provider_id
                 for provider_id in settings.providers.enabled_providers
-                if provider_id in set(DEFAULT_FREE_IMAGE_PROVIDER_IDS) | {"bing"}
+                if provider_id in DEFAULT_FREE_IMAGE_PROVIDER_IDS
             ]
         )
         return UiQuickLaunchSettingsViewModel(
             output_dir=str(self.application.container.workspace.paths.runs_dir),
             mode_id=normalize_project_mode(settings.providers.project_mode),
+            launch_profile_id=self._infer_launch_profile_id(settings),
             strictness="balanced",
-            slow_mode=settings.browser.slow_mode,
             provider_ids=provider_ids,
             supporting_image_limit=max(0, settings.providers.supporting_image_limit),
             fallback_image_limit=max(0, settings.providers.fallback_image_limit),
         )
 
-    def build_advanced_settings(self) -> UiAdvancedSettingsViewModel:
-        settings = self.application.container.settings
+    def _advanced_settings_from_settings(
+        self, settings: ApplicationSettings
+    ) -> UiAdvancedSettingsViewModel:
         return UiAdvancedSettingsViewModel(
-            paragraph_workers=settings.concurrency.paragraph_workers,
-            provider_workers=settings.concurrency.provider_workers,
-            provider_queue_size=settings.concurrency.provider_queue_size,
-            download_workers=settings.concurrency.download_workers,
-            download_queue_size=settings.concurrency.download_queue_size,
-            relevance_workers=settings.concurrency.relevance_workers,
-            relevance_queue_size=settings.concurrency.relevance_queue_size,
-            queue_size=settings.concurrency.queue_size,
-            search_timeout_seconds=settings.concurrency.search_timeout_seconds,
-            relevance_timeout_seconds=settings.concurrency.relevance_timeout_seconds,
+            action_delay_ms=max(0, int(settings.browser.action_delay_ms)),
             launch_timeout_ms=settings.browser.launch_timeout_ms,
             navigation_timeout_ms=settings.browser.navigation_timeout_ms,
             downloads_timeout_seconds=settings.browser.downloads_timeout_seconds,
-            top_k_to_relevance=24,
-            retry_budget=settings.concurrency.retry_budget,
-            early_stop_quality_threshold=settings.concurrency.early_stop_quality_threshold,
-            fail_fast_storyblocks_errors=settings.concurrency.fail_fast_storyblocks_errors,
-            cache_root=str(self.application.container.workspace.paths.cache_dir),
-            browser_profile_path=str(
-                self.application.container.workspace.paths.browser_profiles_dir
-            ),
-            allow_generic_web_image=settings.providers.allow_generic_web_image,
-            no_match_budget_seconds=settings.providers.no_match_budget_seconds,
-            full_script_context_char_budget=settings.ai.full_script_context_char_budget,
+        )
+
+    def _forms_from_settings(
+        self, settings: ApplicationSettings
+    ) -> tuple[UiQuickLaunchSettingsViewModel, UiAdvancedSettingsViewModel]:
+        return (
+            self._quick_launch_from_settings(settings),
+            self._advanced_settings_from_settings(settings),
         )
 
     def open_script(
@@ -392,6 +398,7 @@ class DesktopGuiController:
         project = self._require_project(project_id)
         document = project.script_document
         resolved_quick = self._resolve_quick_launch_settings(project, quick)
+        launch_profile = self._resolve_runtime_launch_profile(resolved_quick, advanced)
         mode = get_project_mode(quick.mode_id)
         selected = resolved_quick.selected_paragraphs or [
             paragraph.paragraph_no
@@ -402,7 +409,7 @@ class DesktopGuiController:
         free_provider_ids = [
             provider_id
             for provider_id in providers
-            if provider_id in set(DEFAULT_FREE_IMAGE_PROVIDER_IDS) | {"bing"}
+            if provider_id in DEFAULT_FREE_IMAGE_PROVIDER_IDS
         ]
         usable_free_provider_ids = self._usable_free_image_provider_ids(
             free_provider_ids
@@ -418,7 +425,7 @@ class DesktopGuiController:
             and not usable_free_provider_ids
         ):
             warnings.append(
-                "Для бесплатных изображений сейчас нет ни одного доступного провайдера. Добавьте API key для Pexels/Pixabay или включите Openverse/Wikimedia Commons."
+                "Для бесплатных изображений сейчас нет ни одного доступного провайдера. Добавьте API key для Pexels/Pixabay или оставьте включенным Openverse."
             )
         if (
             mode.requires_storyblocks
@@ -441,13 +448,17 @@ class DesktopGuiController:
         )
         summary_lines = [
             scope_label,
-            f"Медленный режим: {'вкл' if resolved_quick.slow_mode else 'выкл'}",
-            f"Веб-поиск изображений: {'вкл' if advanced.allow_generic_web_image else 'выкл'}",
+            f"Профиль запуска: {launch_profile.label}",
             f"Основные изображения: {resolved_quick.supporting_image_limit}",
             f"Резервные изображения: {resolved_quick.fallback_image_limit}",
-            f"Лимит no-match: {advanced.no_match_budget_seconds:.1f} c",
             "Сохраняются лучшие кандидаты по стратегии, а не по одному файлу с каждого сервиса.",
         ]
+        if launch_profile.launch_profile_id == "custom":
+            overrides = describe_custom_timing_overrides(
+                self._custom_timing_from_advanced(advanced)
+            )
+            if overrides:
+                summary_lines.append(f"Custom: {', '.join(overrides)}")
         if resolved_quick.paragraph_selection_text.strip():
             summary_lines.append(
                 f"Диапазон абзацев: {resolved_quick.paragraph_selection_text.strip()}"
@@ -499,9 +510,7 @@ class DesktopGuiController:
             else {}
         )
         live_states = (
-            dict(live_run_state.paragraph_states)
-            if live_run_state is not None
-            else {}
+            dict(live_run_state.paragraph_states) if live_run_state is not None else {}
         )
         latest_events = (
             latest_events
@@ -523,9 +532,7 @@ class DesktopGuiController:
                 live_state.user_decision_status
                 if live_state is not None
                 else (
-                    entry.user_decision_status
-                    if entry is not None
-                    else "auto_selected"
+                    entry.user_decision_status if entry is not None else "auto_selected"
                 )
             )
             latest_event = latest_events.get(paragraph.paragraph_no)
@@ -566,19 +573,13 @@ class DesktopGuiController:
                         self._live_asset_previews(live_state.selected_assets)
                         if include_detail and live_state is not None
                         else (
-                            self._selected_assets(selection)
-                            if include_detail
-                            else []
+                            self._selected_assets(selection) if include_detail else []
                         )
                     ),
                     candidate_assets=(
                         self._live_asset_previews(live_state.candidate_assets)
                         if include_detail and live_state is not None
-                        else (
-                            self._candidate_assets(entry)
-                            if include_detail
-                            else []
-                        )
+                        else (self._candidate_assets(entry) if include_detail else [])
                     ),
                     rejection_reasons=list(
                         live_state.rejection_reasons
@@ -631,8 +632,6 @@ class DesktopGuiController:
         )
         provider_queries["storyblocks_image"] = list(updated_intent.image_queries)
         provider_queries["free_image"] = list(updated_intent.image_queries)
-        if "generic_web_image" in provider_queries:
-            provider_queries["generic_web_image"] = list(updated_intent.image_queries)
         query_bundle = QueryBundle(
             video_queries=list(updated_intent.primary_video_queries),
             image_queries=list(updated_intent.image_queries),
@@ -665,7 +664,6 @@ class DesktopGuiController:
         updated = self.application.enrich_project_intents(
             project_id,
             strictness=quick.strictness,
-            include_generic_web_image=advanced.allow_generic_web_image,
             manual_prompt=quick.manual_prompt,
             attach_full_script_context=quick.attach_full_script_context,
         )
@@ -1246,11 +1244,20 @@ class DesktopGuiController:
     def load_preset(
         self, name: str
     ) -> tuple[UiQuickLaunchSettingsViewModel, UiAdvancedSettingsViewModel]:
-        settings = self.application.container.settings_manager.apply_preset(
-            self.application.container.settings, name
-        )
-        self._apply_settings_object(settings)
-        return self.build_quick_launch_settings(), self.build_advanced_settings()
+        preset = self.application.container.settings_manager.load_preset(name)
+        if preset is None:
+            raise KeyError(name)
+        if self._is_compact_preset_snapshot(preset.settings_snapshot):
+            quick, advanced = self._forms_from_compact_preset_snapshot(
+                preset.settings_snapshot
+            )
+        else:
+            settings = self.application.container.settings_manager.apply_preset(
+                self.application.container.settings, name
+            )
+            quick, advanced = self._forms_from_settings(settings)
+        self.apply_forms_to_settings(quick, advanced)
+        return quick, advanced
 
     def export_preset(self, name: str, destination: str | Path) -> Path:
         return self.application.container.settings_manager.export_preset(
@@ -1265,6 +1272,78 @@ class DesktopGuiController:
             )
         )
         return preset
+
+    def _is_compact_preset_snapshot(self, snapshot: dict[str, object]) -> bool:
+        return isinstance(snapshot.get("quick_launch"), dict)
+
+    def _forms_from_compact_preset_snapshot(
+        self, snapshot: dict[str, object]
+    ) -> tuple[UiQuickLaunchSettingsViewModel, UiAdvancedSettingsViewModel]:
+        quick_payload = snapshot.get("quick_launch", {})
+        if not isinstance(quick_payload, dict):
+            quick_payload = {}
+        quick = self.build_quick_launch_settings()
+        quick.mode_id = normalize_project_mode(
+            str(quick_payload.get("mode_id", quick.mode_id))
+        )
+        quick.launch_profile_id = normalize_launch_profile_id(
+            str(snapshot.get("launch_profile_id", quick.launch_profile_id))
+        )
+        quick.strictness = str(quick_payload.get("strictness", quick.strictness))
+        provider_ids = quick_payload.get("provider_ids")
+        if isinstance(provider_ids, list):
+            quick.provider_ids = normalize_free_image_provider_ids(provider_ids)
+        quick.supporting_image_limit = max(
+            0,
+            int(
+                quick_payload.get(
+                    "supporting_image_limit", quick.supporting_image_limit
+                )
+            ),
+        )
+        quick.fallback_image_limit = max(
+            0,
+            int(quick_payload.get("fallback_image_limit", quick.fallback_image_limit)),
+        )
+        quick.manual_prompt = str(quick_payload.get("manual_prompt", "")).strip()
+        quick.attach_full_script_context = bool(
+            quick_payload.get("attach_full_script_context", False)
+        )
+        advanced = self.build_advanced_settings()
+        overrides = snapshot.get("custom_timing_overrides", {})
+        if quick.launch_profile_id == "custom":
+            if not isinstance(overrides, dict):
+                overrides = {}
+            default_timing = default_custom_timing()
+            advanced.action_delay_ms = max(
+                0,
+                int(overrides.get("action_delay_ms", default_timing.action_delay_ms)),
+            )
+            advanced.launch_timeout_ms = max(
+                1000,
+                int(
+                    overrides.get("launch_timeout_ms", default_timing.launch_timeout_ms)
+                ),
+            )
+            advanced.navigation_timeout_ms = max(
+                1000,
+                int(
+                    overrides.get(
+                        "navigation_timeout_ms",
+                        default_timing.navigation_timeout_ms,
+                    )
+                ),
+            )
+            advanced.downloads_timeout_seconds = max(
+                1.0,
+                float(
+                    overrides.get(
+                        "downloads_timeout_seconds",
+                        default_timing.downloads_timeout_seconds,
+                    )
+                ),
+            )
+        return quick, advanced
 
     def set_gemini_key(self, key: str) -> UiNotification:
         validation = self.validate_gemini_key(key)
@@ -1371,8 +1450,6 @@ class DesktopGuiController:
             "pexels": "Pexels",
             "pixabay": "Pixabay",
             "openverse": "Openverse",
-            "wikimedia": "Wikimedia Commons",
-            "bing": "Bing",
         }.get(provider_id, provider_id)
 
     def _usable_free_image_provider_ids(self, provider_ids: list[str]) -> list[str]:
@@ -1414,21 +1491,131 @@ class DesktopGuiController:
             ),
         )
 
+    def _custom_timing_from_advanced(
+        self, advanced: UiAdvancedSettingsViewModel
+    ) -> LaunchProfileCustomTiming:
+        return LaunchProfileCustomTiming(
+            action_delay_ms=max(0, int(advanced.action_delay_ms)),
+            launch_timeout_ms=max(1000, int(advanced.launch_timeout_ms)),
+            navigation_timeout_ms=max(1000, int(advanced.navigation_timeout_ms)),
+            downloads_timeout_seconds=max(
+                1.0, float(advanced.downloads_timeout_seconds)
+            ),
+        )
+
+    def _concurrency_mode_for_quick(self, quick: UiQuickLaunchSettingsViewModel):
+        mode = get_project_mode(quick.mode_id)
+        settings = self.application.container.settings_manager.load()
+        settings.providers.enabled_providers = list(
+            dict.fromkeys(self._selected_provider_ids(quick))
+        )
+        settings.providers.free_images_only = mode.mode_id == "free_images_only"
+        return self.application.container.provider_registry.resolve_concurrency_mode(
+            settings.providers,
+            video_enabled=mode.video_enabled,
+            storyblocks_images_enabled=mode.storyblocks_images_enabled,
+            free_images_enabled=mode.free_images_enabled,
+        )
+
+    def _resolve_runtime_launch_profile(
+        self,
+        quick: UiQuickLaunchSettingsViewModel,
+        advanced: UiAdvancedSettingsViewModel,
+    ) -> ResolvedLaunchProfile:
+        mode_resolution = self._concurrency_mode_for_quick(quick)
+        return resolve_launch_profile(
+            quick.launch_profile_id,
+            mode_resolution.mode,
+            custom_timing=self._custom_timing_from_advanced(advanced),
+        )
+
+    def _infer_launch_profile_id(self, settings: ApplicationSettings) -> str:
+        quick = UiQuickLaunchSettingsViewModel(
+            mode_id=normalize_project_mode(settings.providers.project_mode),
+            provider_ids=normalize_free_image_provider_ids(
+                [
+                    provider_id
+                    for provider_id in settings.providers.enabled_providers
+                    if provider_id in DEFAULT_FREE_IMAGE_PROVIDER_IDS
+                ]
+            ),
+        )
+        mode_resolution = self._concurrency_mode_for_quick(quick)
+        normal = resolve_launch_profile("normal", mode_resolution.mode)
+        if self._settings_match_launch_profile(settings, normal):
+            return "normal"
+        fast = resolve_launch_profile("fast", mode_resolution.mode)
+        if self._settings_match_launch_profile(settings, fast):
+            return "fast"
+        return "custom"
+
+    def _settings_match_launch_profile(
+        self,
+        settings: ApplicationSettings,
+        launch_profile: ResolvedLaunchProfile,
+    ) -> bool:
+        return (
+            settings.browser.action_delay_ms == launch_profile.action_delay_ms
+            and settings.browser.slow_mode == launch_profile.slow_mode
+            and settings.browser.launch_timeout_ms == launch_profile.launch_timeout_ms
+            and settings.browser.navigation_timeout_ms
+            == launch_profile.navigation_timeout_ms
+            and self._float_equal(
+                settings.browser.downloads_timeout_seconds,
+                launch_profile.downloads_timeout_seconds,
+            )
+            and settings.concurrency.paragraph_workers
+            == launch_profile.paragraph_workers
+            and settings.concurrency.provider_workers == launch_profile.provider_workers
+            and settings.concurrency.provider_queue_size
+            == launch_profile.provider_queue_size
+            and settings.concurrency.download_workers == launch_profile.download_workers
+            and settings.concurrency.download_queue_size
+            == launch_profile.download_queue_size
+            and settings.concurrency.relevance_workers
+            == launch_profile.relevance_workers
+            and settings.concurrency.relevance_queue_size
+            == launch_profile.relevance_queue_size
+            and settings.concurrency.queue_size == launch_profile.queue_size
+            and self._float_equal(
+                settings.concurrency.search_timeout_seconds,
+                launch_profile.search_timeout_seconds,
+            )
+            and self._float_equal(
+                settings.concurrency.download_timeout_seconds,
+                launch_profile.downloads_timeout_seconds,
+            )
+            and self._float_equal(
+                settings.concurrency.relevance_timeout_seconds,
+                launch_profile.relevance_timeout_seconds,
+            )
+            and settings.concurrency.retry_budget == launch_profile.retry_budget
+            and self._float_equal(
+                settings.concurrency.early_stop_quality_threshold,
+                launch_profile.early_stop_quality_threshold,
+            )
+            and settings.concurrency.fail_fast_storyblocks_errors
+            == launch_profile.fail_fast_storyblocks_errors
+            and self._float_equal(
+                settings.providers.no_match_budget_seconds,
+                launch_profile.no_match_budget_seconds,
+            )
+        )
+
+    def _float_equal(self, left: float, right: float) -> bool:
+        return abs(float(left) - float(right)) <= 1e-9
+
     def apply_forms_to_settings(
         self,
         quick: UiQuickLaunchSettingsViewModel,
         advanced: UiAdvancedSettingsViewModel,
     ) -> ApplicationSettings:
         settings = self.application.container.settings_manager.load()
+        resolved_profile = self._resolve_runtime_launch_profile(quick, advanced)
         mode = get_project_mode(quick.mode_id)
-        free_provider_ids = normalize_free_image_provider_ids(quick.provider_ids)
         settings.providers.project_mode = mode.mode_id
         settings.providers.enabled_providers = list(
-            dict.fromkeys(
-                self._selected_provider_ids(
-                    quick, allow_generic_web_image=advanced.allow_generic_web_image
-                )
-            )
+            dict.fromkeys(self._selected_provider_ids(quick))
         )
         settings.providers.default_video_providers = [
             provider_id
@@ -1440,56 +1627,49 @@ class DesktopGuiController:
             for provider_id in settings.providers.enabled_providers
             if provider_id != "storyblocks_video"
         ]
-        settings.providers.allow_generic_web_image = advanced.allow_generic_web_image
         settings.providers.free_images_only = mode.mode_id == "free_images_only"
-        settings.providers.mixed_image_fallback = mode.mode_id in {
-            "sb_video_plus_free_images",
-            "sb_images_plus_free_images",
-        }
         settings.providers.supporting_image_limit = max(
             0, int(quick.supporting_image_limit)
         )
         settings.providers.fallback_image_limit = max(
             0, int(quick.fallback_image_limit)
         )
-        settings.providers.no_match_budget_seconds = max(
-            0.0, float(advanced.no_match_budget_seconds)
+        settings.providers.no_match_budget_seconds = (
+            resolved_profile.no_match_budget_seconds
         )
-        if mode.free_images_enabled and not free_provider_ids:
-            settings.providers.default_image_providers.extend(
-                DEFAULT_FREE_IMAGE_PROVIDER_IDS
-            )
-        settings.ai.full_script_context_char_budget = max(
-            1000, int(advanced.full_script_context_char_budget)
+        settings.browser.action_delay_ms = resolved_profile.action_delay_ms
+        settings.browser.slow_mode = resolved_profile.slow_mode
+        settings.browser.launch_timeout_ms = resolved_profile.launch_timeout_ms
+        settings.browser.navigation_timeout_ms = resolved_profile.navigation_timeout_ms
+        settings.browser.downloads_timeout_seconds = (
+            resolved_profile.downloads_timeout_seconds
         )
-        settings.browser.slow_mode = quick.slow_mode
-        settings.browser.launch_timeout_ms = advanced.launch_timeout_ms
-        settings.browser.navigation_timeout_ms = advanced.navigation_timeout_ms
-        settings.browser.downloads_timeout_seconds = advanced.downloads_timeout_seconds
-        settings.concurrency.paragraph_workers = advanced.paragraph_workers
-        settings.concurrency.provider_workers = advanced.provider_workers
-        settings.concurrency.provider_queue_size = advanced.provider_queue_size
-        settings.concurrency.download_workers = advanced.download_workers
-        settings.concurrency.download_queue_size = advanced.download_queue_size
-        settings.concurrency.relevance_workers = advanced.relevance_workers
-        settings.concurrency.relevance_queue_size = advanced.relevance_queue_size
-        settings.concurrency.search_timeout_seconds = max(
-            0.0, float(advanced.search_timeout_seconds)
+        settings.concurrency.paragraph_workers = resolved_profile.paragraph_workers
+        settings.concurrency.provider_workers = resolved_profile.provider_workers
+        settings.concurrency.provider_queue_size = resolved_profile.provider_queue_size
+        settings.concurrency.download_workers = resolved_profile.download_workers
+        settings.concurrency.download_queue_size = resolved_profile.download_queue_size
+        settings.concurrency.relevance_workers = resolved_profile.relevance_workers
+        settings.concurrency.relevance_queue_size = (
+            resolved_profile.relevance_queue_size
         )
-        settings.concurrency.download_timeout_seconds = max(
-            1.0, float(advanced.downloads_timeout_seconds)
+        settings.concurrency.search_timeout_seconds = (
+            resolved_profile.search_timeout_seconds
         )
-        settings.concurrency.relevance_timeout_seconds = max(
-            0.0, float(advanced.relevance_timeout_seconds)
+        settings.concurrency.download_timeout_seconds = (
+            resolved_profile.downloads_timeout_seconds
         )
-        settings.concurrency.retry_budget = max(0, int(advanced.retry_budget))
-        settings.concurrency.early_stop_quality_threshold = float(
-            advanced.early_stop_quality_threshold
+        settings.concurrency.relevance_timeout_seconds = (
+            resolved_profile.relevance_timeout_seconds
         )
-        settings.concurrency.fail_fast_storyblocks_errors = bool(
-            advanced.fail_fast_storyblocks_errors
+        settings.concurrency.retry_budget = resolved_profile.retry_budget
+        settings.concurrency.early_stop_quality_threshold = (
+            resolved_profile.early_stop_quality_threshold
         )
-        settings.concurrency.queue_size = advanced.queue_size
+        settings.concurrency.fail_fast_storyblocks_errors = (
+            resolved_profile.fail_fast_storyblocks_errors
+        )
+        settings.concurrency.queue_size = resolved_profile.queue_size
         self.application.container.orchestrator.configure(
             max_workers=settings.concurrency.paragraph_workers,
             queue_size=settings.concurrency.queue_size,
@@ -1507,77 +1687,28 @@ class DesktopGuiController:
         quick: UiQuickLaunchSettingsViewModel,
         advanced: UiAdvancedSettingsViewModel,
     ) -> dict[str, object]:
-        settings = self.apply_forms_to_settings(quick, advanced)
-        return {
-            "desktop_stack": settings.desktop_stack,
-            "ui_theme": settings.ui_theme,
-            "workspace_name": settings.workspace_name,
-            "storage": {
-                "workspace_root": str(settings.storage.workspace_root),
-                "cache_root": str(settings.storage.cache_root),
-                "logs_root": str(settings.storage.logs_root),
-                "secrets_root": str(settings.storage.secrets_root),
+        launch_profile_id = normalize_launch_profile_id(quick.launch_profile_id)
+        snapshot: dict[str, object] = {
+            "quick_launch": {
+                "mode_id": normalize_project_mode(quick.mode_id),
+                "strictness": quick.strictness,
+                "provider_ids": normalize_free_image_provider_ids(quick.provider_ids),
+                "supporting_image_limit": max(0, int(quick.supporting_image_limit)),
+                "fallback_image_limit": max(0, int(quick.fallback_image_limit)),
+                "manual_prompt": quick.manual_prompt.strip(),
+                "attach_full_script_context": bool(quick.attach_full_script_context),
             },
-            "browser": {
-                "automation_stack": settings.browser.automation_stack,
-                "profile_root": str(settings.browser.profile_root),
-                "preferred_channels": list(settings.browser.preferred_channels),
-                "slow_mode": settings.browser.slow_mode,
-                "action_delay_ms": settings.browser.action_delay_ms,
-                "launch_timeout_ms": settings.browser.launch_timeout_ms,
-                "navigation_timeout_ms": settings.browser.navigation_timeout_ms,
-                "downloads_timeout_seconds": settings.browser.downloads_timeout_seconds,
-                "storyblocks_base_url": settings.browser.storyblocks_base_url,
-            },
-            "providers": {
-                "project_mode": settings.providers.project_mode,
-                "default_video_providers": list(
-                    settings.providers.default_video_providers
-                ),
-                "default_image_providers": list(
-                    settings.providers.default_image_providers
-                ),
-                "enabled_providers": list(settings.providers.enabled_providers),
-                "image_provider_priority": list(
-                    settings.providers.image_provider_priority
-                ),
-                "allow_generic_web_image": settings.providers.allow_generic_web_image,
-                "commercial_only_images": settings.providers.commercial_only_images,
-                "allow_attribution_licenses": settings.providers.allow_attribution_licenses,
-                "free_images_only": settings.providers.free_images_only,
-                "mixed_image_fallback": settings.providers.mixed_image_fallback,
-                "supporting_image_limit": settings.providers.supporting_image_limit,
-                "fallback_image_limit": settings.providers.fallback_image_limit,
-                "no_match_budget_seconds": settings.providers.no_match_budget_seconds,
-            },
-            "ai": {
-                "full_script_context_enabled": settings.ai.full_script_context_enabled,
-                "full_script_context_char_budget": settings.ai.full_script_context_char_budget,
-            },
-            "concurrency": {
-                "paragraph_workers": settings.concurrency.paragraph_workers,
-                "provider_workers": settings.concurrency.provider_workers,
-                "provider_queue_size": settings.concurrency.provider_queue_size,
-                "download_workers": settings.concurrency.download_workers,
-                "download_queue_size": settings.concurrency.download_queue_size,
-                "relevance_workers": settings.concurrency.relevance_workers,
-                "relevance_queue_size": settings.concurrency.relevance_queue_size,
-                "search_timeout_seconds": settings.concurrency.search_timeout_seconds,
-                "download_timeout_seconds": settings.concurrency.download_timeout_seconds,
-                "relevance_timeout_seconds": settings.concurrency.relevance_timeout_seconds,
-                "retry_budget": settings.concurrency.retry_budget,
-                "early_stop_quality_threshold": settings.concurrency.early_stop_quality_threshold,
-                "fail_fast_storyblocks_errors": settings.concurrency.fail_fast_storyblocks_errors,
-                "queue_size": settings.concurrency.queue_size,
-            },
-            "security": {
-                "secret_backend": settings.security.secret_backend,
-                "storyblocks_session_secret_name": settings.security.storyblocks_session_secret_name,
-                "gemini_api_key_secret_name": settings.security.gemini_api_key_secret_name,
-                "pexels_api_key_secret_name": settings.security.pexels_api_key_secret_name,
-                "pixabay_api_key_secret_name": settings.security.pixabay_api_key_secret_name,
-            },
+            "launch_profile_id": launch_profile_id,
         }
+        if launch_profile_id == "custom":
+            custom_timing = self._custom_timing_from_advanced(advanced)
+            snapshot["custom_timing_overrides"] = {
+                "action_delay_ms": custom_timing.action_delay_ms,
+                "launch_timeout_ms": custom_timing.launch_timeout_ms,
+                "navigation_timeout_ms": custom_timing.navigation_timeout_ms,
+                "downloads_timeout_seconds": custom_timing.downloads_timeout_seconds,
+            }
+        return snapshot
 
     def _media_config_from_forms(
         self,
@@ -1585,48 +1716,51 @@ class DesktopGuiController:
         advanced: UiAdvancedSettingsViewModel,
     ) -> MediaSelectionConfig:
         mode = get_project_mode(quick.mode_id)
+        resolved_profile = self._resolve_runtime_launch_profile(quick, advanced)
         return MediaSelectionConfig(
             video_enabled=mode.video_enabled,
             storyblocks_images_enabled=mode.storyblocks_images_enabled,
             free_images_enabled=mode.free_images_enabled,
             supporting_image_limit=max(0, int(quick.supporting_image_limit)),
             fallback_image_limit=max(0, int(quick.fallback_image_limit)),
-            max_candidates_per_provider=max(1, advanced.provider_workers * 2),
-            top_k_to_relevance=max(1, advanced.top_k_to_relevance),
-            provider_workers=max(1, advanced.provider_workers),
-            provider_queue_size=max(1, advanced.provider_queue_size),
-            bounded_downloads=max(1, advanced.download_queue_size),
-            download_workers=max(1, advanced.download_workers),
-            bounded_relevance_queue=max(1, advanced.relevance_queue_size),
-            relevance_workers=max(1, advanced.relevance_workers),
+            max_candidates_per_provider=max(1, resolved_profile.provider_workers * 2),
+            top_k_to_relevance=max(1, resolved_profile.top_k_to_relevance),
+            provider_workers=max(1, resolved_profile.provider_workers),
+            provider_queue_size=max(1, resolved_profile.provider_queue_size),
+            bounded_downloads=max(1, resolved_profile.download_queue_size),
+            download_workers=max(1, resolved_profile.download_workers),
+            bounded_relevance_queue=max(1, resolved_profile.relevance_queue_size),
+            relevance_workers=max(1, resolved_profile.relevance_workers),
             early_stop_when_satisfied=True,
-            no_match_budget_seconds=max(0.0, float(advanced.no_match_budget_seconds)),
-            search_timeout_seconds=max(0.0, float(advanced.search_timeout_seconds)),
-            download_timeout_seconds=max(1.0, float(advanced.downloads_timeout_seconds)),
-            relevance_timeout_seconds=max(
-                0.0, float(advanced.relevance_timeout_seconds)
+            no_match_budget_seconds=max(
+                0.0, float(resolved_profile.no_match_budget_seconds)
             ),
-            retry_budget=max(0, int(advanced.retry_budget)),
-            early_stop_quality_threshold=float(advanced.early_stop_quality_threshold),
-            fail_fast_storyblocks_errors=bool(advanced.fail_fast_storyblocks_errors),
+            search_timeout_seconds=max(
+                0.0, float(resolved_profile.search_timeout_seconds)
+            ),
+            download_timeout_seconds=max(
+                1.0, float(resolved_profile.downloads_timeout_seconds)
+            ),
+            relevance_timeout_seconds=max(
+                0.0, float(resolved_profile.relevance_timeout_seconds)
+            ),
+            retry_budget=max(0, int(resolved_profile.retry_budget)),
+            early_stop_quality_threshold=float(
+                resolved_profile.early_stop_quality_threshold
+            ),
+            fail_fast_storyblocks_errors=bool(
+                resolved_profile.fail_fast_storyblocks_errors
+            ),
             output_root=quick.output_dir.strip(),
         )
 
     def _selected_provider_ids(
         self,
         quick: UiQuickLaunchSettingsViewModel,
-        *,
-        allow_generic_web_image: bool | None = None,
     ) -> list[str]:
-        allow_generic = (
-            self.application.container.settings.providers.allow_generic_web_image
-            if allow_generic_web_image is None
-            else allow_generic_web_image
-        )
         return provider_ids_for_mode(
             quick.mode_id,
             free_image_provider_ids=quick.provider_ids,
-            allow_generic_web_image=allow_generic,
         )
 
     def build_event_journal(
@@ -1717,7 +1851,11 @@ class DesktopGuiController:
                 and run.checkpoint.selected_paragraphs
             ):
                 total = len(set(run.checkpoint.selected_paragraphs))
-            if total <= 0 and project is not None and project.script_document is not None:
+            if (
+                total <= 0
+                and project is not None
+                and project.script_document is not None
+            ):
                 paragraphs = project.script_document.paragraphs
                 selected = (
                     set(run.selected_paragraphs) if run.selected_paragraphs else None
@@ -1779,7 +1917,8 @@ class DesktopGuiController:
             can_resume=effective_status == RunStatus.PAUSED,
             can_cancel=effective_status == RunStatus.RUNNING,
             can_retry_failed=bool(run.failed_paragraphs),
-            can_rerun_selected=project is not None or bool(active_project_id or run.project_id),
+            can_rerun_selected=project is not None
+            or bool(active_project_id or run.project_id),
             checkpoint_message=self._checkpoint_message(
                 run,
                 status=effective_status,
@@ -2105,9 +2244,7 @@ class DesktopGuiController:
                 "Для выбранного режима нужна готовая сессия Storyblocks.",
                 {"mode": mode.mode_id, "session_health": self.session_panel().health},
             )
-        selected_providers = self._selected_provider_ids(
-            resolved_quick, allow_generic_web_image=advanced.allow_generic_web_image
-        )
+        selected_providers = self._selected_provider_ids(resolved_quick)
         if not selected_providers:
             raise AppError(
                 "provider_selection_empty",
@@ -2117,17 +2254,20 @@ class DesktopGuiController:
         mode_resolution = self._resolve_concurrency_mode_for_request(
             resolved_quick, advanced
         )
+        resolved_profile = self._resolve_runtime_launch_profile(
+            resolved_quick, advanced
+        )
         selected_providers = list(mode_resolution.selected_provider_ids)
         if (
-            advanced.paragraph_workers > 1
+            resolved_profile.paragraph_workers > 1
             and mode_resolution.requires_serial_paragraph_workers
         ):
             raise AppError(
                 "storyblocks_parallelism_guard",
-                "Для режимов Storyblocks параллелизм абзацев больше 1 небезопасен. Рекомендуем автокоррекцию: установите 'Потоки абзацев' = 1.",
+                "Для режимов Storyblocks нужен последовательный запуск абзацев. Выберите безопасный профиль запуска или режим без Storyblocks.",
                 {
                     "mode": mode.mode_id,
-                    "paragraph_workers": advanced.paragraph_workers,
+                    "paragraph_workers": resolved_profile.paragraph_workers,
                     "recommended_paragraph_workers": 1,
                     "concurrency_mode": mode_resolution.mode.value,
                     "selected_provider_ids": selected_providers,
@@ -2136,7 +2276,7 @@ class DesktopGuiController:
         free_provider_ids = [
             provider_id
             for provider_id in selected_providers
-            if provider_id in set(DEFAULT_FREE_IMAGE_PROVIDER_IDS) | {"bing"}
+            if provider_id in DEFAULT_FREE_IMAGE_PROVIDER_IDS
         ]
         if mode.free_images_enabled and not free_provider_ids:
             raise AppError(
@@ -2154,7 +2294,7 @@ class DesktopGuiController:
         ):
             raise AppError(
                 "free_image_provider_unavailable",
-                "Для выбранных бесплатных изображений нет ни одного доступного провайдера. Добавьте API key для Pexels/Pixabay или включите Openverse/Wikimedia Commons.",
+                "Для выбранных бесплатных изображений нет ни одного доступного провайдера. Добавьте API key для Pexels/Pixabay или оставьте включенным Openverse.",
                 {"mode": mode.mode_id, "providers": list(free_provider_ids)},
             )
         return resolved_quick
@@ -2175,6 +2315,9 @@ class DesktopGuiController:
             quick,
             selected_paragraphs=resolved_paragraphs,
             paragraph_selection_text=normalized_text,
+            mode_id=normalize_project_mode(quick.mode_id),
+            launch_profile_id=normalize_launch_profile_id(quick.launch_profile_id),
+            provider_ids=normalize_free_image_provider_ids(quick.provider_ids),
             supporting_image_limit=max(0, int(quick.supporting_image_limit)),
             fallback_image_limit=max(0, int(quick.fallback_image_limit)),
             manual_prompt=quick.manual_prompt.strip(),
@@ -2305,27 +2448,7 @@ class DesktopGuiController:
         quick: UiQuickLaunchSettingsViewModel,
         advanced: UiAdvancedSettingsViewModel,
     ):
-        mode = get_project_mode(quick.mode_id)
-        settings = self.application.container.settings_manager.load()
-        settings.providers.enabled_providers = list(
-            dict.fromkeys(
-                self._selected_provider_ids(
-                    quick, allow_generic_web_image=advanced.allow_generic_web_image
-                )
-            )
-        )
-        settings.providers.allow_generic_web_image = advanced.allow_generic_web_image
-        settings.providers.free_images_only = mode.mode_id == "free_images_only"
-        settings.providers.mixed_image_fallback = mode.mode_id in {
-            "sb_video_plus_free_images",
-            "sb_images_plus_free_images",
-        }
-        return self.application.container.provider_registry.resolve_concurrency_mode(
-            settings.providers,
-            video_enabled=mode.video_enabled,
-            storyblocks_images_enabled=mode.storyblocks_images_enabled,
-            free_images_enabled=mode.free_images_enabled,
-        )
+        return self._concurrency_mode_for_quick(quick)
 
     def _asset_preview(
         self, asset: AssetCandidate, *, role: str = "candidate", locked: bool = False
@@ -2376,7 +2499,9 @@ class DesktopGuiController:
 
     def _safe_snapshot_manifest(self, run_id: str) -> RunManifest | None:
         try:
-            return self.application.container.media_run_service.snapshot_manifest(run_id)
+            return self.application.container.media_run_service.snapshot_manifest(
+                run_id
+            )
         except (JSONDecodeError, ValueError):
             return None
 

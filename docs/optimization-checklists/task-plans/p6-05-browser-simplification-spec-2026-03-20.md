@@ -1,0 +1,452 @@
+# P6-05. ТЗ на упрощение работы с браузером
+
+Исходный пункт плана: [phase-6-simplification-checklist.md](./phase-6-simplification-checklist.md)
+
+Предварительное условие: [p6-00-qt-only-ui-layer-spec-2026-03-21.md](./p6-00-qt-only-ui-layer-spec-2026-03-21.md) уже выполнен, Tk-слой удален.
+
+## Цель
+
+Свести browser/session subsystem к одной постоянной managed Storyblocks-сессии и убрать код, который существует только ради multi-profile UX.
+
+Целевое поведение после P6-05:
+
+- в приложении существует один managed Storyblocks profile;
+- UI и controller не дают выбирать, переключать или чистить несколько managed profile;
+- browser/session runtime не работает со списком профилей и active-profile semantics;
+- импорт внешней Chrome/Edge-сессии, если он остается, всегда импортирует данные в один и тот же managed Storyblocks profile;
+- авторизация, ручной login, attach к native browser, manual override и Storyblocks automation работают как раньше или проще.
+
+Что должно исчезнуть из основного runtime-path:
+
+- `list_profiles()` / `set_active()` / `select_profile()` как часть обычного app flow;
+- сценарии `switch_storyblocks_account()` и `clear_storyblocks_profile()`;
+- UI-логика, которая объясняет пользователю модель нескольких Storyblocks-профилей;
+- startup/smoke snapshot, который отчитывается списком browser profiles.
+
+Важно: задача не про полную замену browser automation stack и не про rewrite `Playwright`/`native browser` интеграции. Упрощать нужно именно profile/session management слой.
+
+## Границы задачи
+
+Входит в P6-05:
+
+- singleton contract для managed Storyblocks profile;
+- упрощение `BrowserProfileRegistry`, `BrowserSessionManager` и `ChromiumProfileImportService`;
+- удаление multi-profile методов из controller и UI;
+- правка startup/shutdown lifecycle;
+- обновление smoke output, тестов и пользовательской документации;
+- сохранение backward-compatible поведения для уже существующего workspace, где managed profile уже создан.
+
+Не входит в P6-05:
+
+- переписывание `browser/automation.py` и `browser/native_browser.py`, если там достаточно оставить внутренний `profile_id` как технический идентификатор;
+- миграция persisted schema с агрессивным удалением старых json-файлов профилей;
+- изменение Storyblocks search/download adapters;
+- изменение project modes, provider selection и media pipeline, не связанное с session/profile management.
+
+Практическое решение по scope:
+
+- в runtime оставить ровно один managed profile, но не делать destructive cleanup всех старых профилей в workspace автоматически;
+- fields persisted schema, которые сейчас не мешают runtime, можно оставить как legacy until cleanup;
+- главное упрощение должно произойти в public API и в пользовательском UX, а не в косметическом переименовании.
+
+## Где сейчас сидит лишняя логика
+
+- Managed profile model: [domain/models.py](../../domain/models.py)
+- Browser profile repository: [storage/repositories.py](../../storage/repositories.py)
+- Managed profile registry: [browser/profiles.py](../../browser/profiles.py)
+- Импорт внешних Chromium profiles: [browser/profile_import.py](../../browser/profile_import.py)
+- Storyblocks session source of truth: [browser/session.py](../../browser/session.py)
+- Bootstrap и wiring контейнера: [app/bootstrap.py](../../app/bootstrap.py)
+- Runtime snapshot и startup smoke: [app/runtime.py](../../app/runtime.py), [app/__main__.py](../../app/__main__.py)
+- UI session contracts: [ui/contracts.py](../../ui/contracts.py)
+- UI-facing session logic: [ui/controller.py](../../ui/controller.py)
+- Qt session tab: [ui/qt_app.py](../../ui/qt_app.py)
+
+Основные места, где multi-profile semantics сейчас видны напрямую:
+
+- `BrowserProfileRegistry.list_profiles()`, `set_active()`, `get_active()`, `delete_profile()` в [browser/profiles.py](../../browser/profiles.py);
+- `BrowserSessionManager` public methods с `profile_id` параметром почти на каждом действии в [browser/session.py](../../browser/session.py);
+- import target profile / reimport semantics в [browser/profile_import.py](../../browser/profile_import.py);
+- `ensure_active_profile()`, `switch_storyblocks_account()`, `clear_storyblocks_profile()`, `discover_storyblocks_sessions()` в [ui/controller.py](../../ui/controller.py);
+- session summary с `profile_name` / `profile_id` и кнопка `Сменить аккаунт` в [ui/qt_app.py](../../ui/qt_app.py);
+- `ApplicationSnapshot.browser_profiles` в [app/runtime.py](../../app/runtime.py).
+
+Основные тесты, которые задача точно заденет:
+
+- [tests/test_phase2_architecture.py](../../tests/test_phase2_architecture.py)
+- [tests/test_ui_controller.py](../../tests/test_ui_controller.py)
+- [tests/test_storyblocks_browser_core.py](../../tests/test_storyblocks_browser_core.py)
+- [tests/test_phase9_reliability.py](../../tests/test_phase9_reliability.py)
+
+## Definition of Done
+
+- В runtime существует один managed Storyblocks profile без выбора активного профиля.
+- `ui/controller.py` больше не содержит сценариев `switch_storyblocks_account`, `clear_storyblocks_profile`, `ensure_active_profile`, `reimport_storyblocks_session`, если для них больше нет product-смысла.
+- `BrowserSessionManager` app-facing API не требует `profile_id` для обычных действий.
+- Startup и shutdown корректно работают с одним managed profile и закрывают browser resources без висящего native login browser.
+- `python -m app --smoke --no-gui` больше не возвращает список browser profiles.
+- Текущие Storyblocks flows не деградировали:
+  - открыть окно входа;
+  - войти в Storyblocks;
+  - проверить сессию;
+  - выполнить automation в том же профиле;
+  - вручную пометить сессию ready;
+  - сбросить сессию и повторно войти.
+- Документация больше не обещает multi-profile UX там, где его уже нет.
+
+## Пошаговый план
+
+### Шаг 1. Зафиксировать целевой singleton-контракт для managed Storyblocks profile
+
+Что сделать:
+
+- В явном виде принять, что managed Storyblocks profile в приложении один.
+- Зафиксировать, что все browser/session действия работают против одного profile instance, даже если persisted workspace исторически содержит несколько profile json.
+- Определить правило выбора legacy profile:
+  - если профиля нет, создается новый singleton profile;
+  - если профиль один, используется он;
+  - если профилей несколько, runtime выбирает один предсказуемо и дальше работает только с ним.
+- Зафиксировать, что multi-profile UX больше не поддерживается.
+
+Файлы:
+
+- [browser/README.md](../../browser/README.md)
+- [docs/optimization-checklists/phase-6-simplification-checklist.md](./phase-6-simplification-checklist.md)
+- [docs/project-analysis.md](../../docs/project-analysis.md)
+
+Что должно получиться:
+
+- У команды есть один contract, относительно которого можно безопасно упрощать registry, session manager и UI.
+- Не остается двусмысленности, нужно ли сохранять `active` semantics.
+
+Как проверить:
+
+- В новой спецификации и в комментариях к PR везде используется формулировка "один managed Storyblocks profile".
+- Любое упоминание "active profile", "switch profile", "list of managed profiles" рассматривается как legacy и кандидат на удаление из app flow.
+
+Практический совет:
+
+- Не начинайте с удаления методов. Сначала зафиксируйте целевую семантику, иначе легко сломать compatibility со старым workspace и затем случайно вернуть старую модель через test fixes.
+
+### Шаг 2. Упростить модель данных managed profile и storage-контракт
+
+Что сделать:
+
+- Пересмотреть [domain/models.py](../../domain/models.py) и выделить, какие поля нужны singleton-режиму обязательно:
+  - `storage_path`
+  - `storyblocks_account`
+  - `launch_profile_dir_name`
+  - `import_source_*`
+  - `session_health`
+- Убрать из runtime-логики зависимость от `is_active`.
+- Проверить `BrowserProfileRepository` в [storage/repositories.py](../../storage/repositories.py):
+  - если repository продолжает хранить `browser_profiles/<id>.json`, это допустимо как transitional storage;
+  - но верхние слои не должны опираться на наличие нескольких json-файлов.
+- Отдельно оценить поле `active_browser_profile_id` в `Project`: не удалять его в этой задаче, если оно сейчас не участвует в runtime, чтобы не открывать лишнюю schema-migration тему.
+
+Файлы:
+
+- [domain/models.py](../../domain/models.py)
+- [storage/repositories.py](../../storage/repositories.py)
+
+Что должно получиться:
+
+- Runtime больше не использует `is_active` как основной механизм выбора профиля.
+- Persisted schema остается безопасной для старых данных, но перестает диктовать multi-profile поведение приложению.
+
+Как проверить:
+
+- В коде app flow больше нет зависимости от `BrowserProfile.is_active`.
+- После загрузки старого profile json приложение не требует explicit `set_active()`.
+
+Практический совет:
+
+- Не смешивайте runtime simplification и schema cleanup. Если persisted field никому не мешает и не участвует в flow, его можно оставить как legacy до отдельной cleanup-задачи.
+
+### Шаг 3. Превратить `BrowserProfileRegistry` в singleton facade
+
+Что сделать:
+
+- В [browser/profiles.py](../../browser/profiles.py) добавить один явный entrypoint:
+  - `get_or_create_singleton()`
+  - или `get_or_create_storyblocks_profile()`.
+- Перевести обычный app flow на новый entrypoint вместо комбинации `get_active()` + `create_profile()` + `set_active()`.
+- Убрать из верхних слоев использование:
+  - `list_profiles()`
+  - `set_active()`
+  - `select_profile()`
+  - `rename_profile()`
+  - `delete_profile()`
+- Если эти методы остаются временно внутри registry для compatibility или тестов, они не должны использоваться controller/runtime/UI.
+- Сохранить `paths_for()`, `update_session_health()`, `update_storyblocks_account()` как необходимые singleton-операции.
+
+Файлы:
+
+- [browser/profiles.py](../../browser/profiles.py)
+- [app/bootstrap.py](../../app/bootstrap.py)
+- [app/runtime.py](../../app/runtime.py)
+- [ui/controller.py](../../ui/controller.py)
+
+Что должно получиться:
+
+- Любой код выше registry получает один и тот же managed profile без явного выбора активного профиля.
+- Singleton path становится стандартным способом доступа к Storyblocks profile.
+
+Как проверить:
+
+- В `app`, `ui` и `browser/session.py` больше нет вызовов `set_active()` и `list_profiles()`.
+- Новый workspace поднимается без ручного создания профиля пользователем.
+- Старый workspace с одним profile json продолжает работать без дополнительных действий.
+
+Практический совет:
+
+- На этом шаге не пытайтесь сразу удалить все legacy-методы из registry. Сначала выведите их из production flow, затем уже смотрите, можно ли безопасно зачистить API.
+
+### Шаг 4. Упростить `BrowserSessionManager` до single-profile public API
+
+Что сделать:
+
+- В [browser/session.py](../../browser/session.py) перевести public app-facing методы на singleton-семантику:
+  - `current_state()`
+  - `open_browser()`
+  - `open_native_login_browser()`
+  - `close_native_browser()`
+  - `close_browser()`
+  - `check_authorization()`
+  - `reset_session_state()`
+  - `restore_session()`
+  - `set_manual_ready_override()`
+  - `clear_manual_ready_override()`
+- Убрать необходимость передавать `profile_id` из controller/UI.
+- После перевода вызовов пересмотреть внутренние структуры:
+  - `_states`
+  - `_active_sessions`
+  - `_native_browser_sessions`
+- Если dict-ключи нужны только из-за multi-profile design, заменить их на одиночные поля состояния.
+- Оставить thread-safety и owner-thread checks для browser handle, потому что это отдельный риск и он не связан с multi-profile UX.
+
+Файлы:
+
+- [browser/session.py](../../browser/session.py)
+
+Что должно получиться:
+
+- Session manager становится проще для чтения: один profile, одна session state model, один native login flow.
+- Controller больше не знает про `profile_id`.
+
+Как проверить:
+
+- Методы controller и UI вызывают session manager без `profile_id`.
+- Тесты на manual override, native login attach, lock detection и reset state проходят на singleton API.
+
+Практический совет:
+
+- Не переписывайте всё за один проход. Безопасный порядок такой:
+  1. сначала сделать private resolver singleton-profile;
+  2. потом перевести public методы на пустой параметр;
+  3. только потом убирать dict-based state.
+
+### Шаг 5. Упростить import flow под один managed target
+
+Что сделать:
+
+- В [browser/profile_import.py](../../browser/profile_import.py) убрать target-profile semantics из app-facing flow.
+- Импорт внешнего Chrome/Edge profile должен всегда идти в один managed Storyblocks profile.
+- Пересмотреть необходимость методов:
+  - `discover_profiles()`
+  - `reimport_profile()`
+  - `_resolve_target_profile()`
+- Если product-смысла в discovery/reimport больше нет, убрать их полностью.
+- Если import discovery остается как UX-ускоритель, он все равно не должен вести к выбору target managed profile.
+- Упростить diagnostics и user messages: речь должна идти об одном managed profile, а не о "selected target profile".
+
+Файлы:
+
+- [browser/profile_import.py](../../browser/profile_import.py)
+- [ui/contracts.py](../../ui/contracts.py)
+- [ui/controller.py](../../ui/controller.py)
+- [ui/qt_app.py](../../ui/qt_app.py)
+
+Что должно получиться:
+
+- Import flow становится линейным: выбрать внешний browser profile -> импортировать в managed Storyblocks profile -> проверить сессию.
+- Исчезают лишние сценарии `reimport` и `target_profile_id`, если они не нужны в реальном использовании.
+
+Как проверить:
+
+- Импорт существующего Chrome/Edge profile по-прежнему может восстановить рабочую Storyblocks-сессию.
+- В controller/import service больше нет логики выбора target managed profile.
+
+Практический совет:
+
+- Если сомневаетесь, оставлять ли discovery списка внешних Chrome/Edge profiles, ориентируйтесь на реальный UX. Discovery можно сохранить, multi-target import нельзя.
+
+### Шаг 6. Упростить controller до single-session UX
+
+Что сделать:
+
+- В [ui/controller.py](../../ui/controller.py) удалить или заменить методы, завязанные на multi-profile модель:
+  - `ensure_active_profile()`
+  - `discover_storyblocks_sessions()` если discovery удаляется;
+  - `switch_storyblocks_account()`
+  - `clear_storyblocks_profile()`
+  - `reimport_storyblocks_session()` если reimport удаляется.
+- Перевести `session_panel()` на представление одной managed Storyblocks-сессии.
+- Упростить `UiSessionPanelViewModel` в [ui/contracts.py](../../ui/contracts.py):
+  - убрать или сделать необязательными `profile_id`, `profile_name`, если они больше не нужны пользователю;
+  - сохранить `health`, `account`, `manual_prompt`, `last_error`, `manual_ready_override`, `reason_code`, diagnostics.
+- Сценарий "сменить аккаунт" после упрощения должен быть очевидным:
+  - `Выйти`
+  - `Войти в браузере`
+  - `Проверить сессию`
+
+Файлы:
+
+- [ui/controller.py](../../ui/controller.py)
+- [ui/contracts.py](../../ui/contracts.py)
+
+Что должно получиться:
+
+- Controller работает с одной Storyblocks-сессией, а не с managed profile lifecycle.
+- Публичный UI-facing API становится короче и понятнее.
+
+Как проверить:
+
+- В controller больше нет методов с семантикой "переключить/очистить managed profile".
+- Session panel по-прежнему показывает всё важное для оператора: состояние, аккаунт, URL, prompt, diagnostics, errors.
+
+Практический совет:
+
+- Не оставляйте "пустые" legacy-методы, которые просто оборачивают новый singleton flow без product-смысла. Это сохранит старую ментальную модель и ухудшит читабельность кода.
+
+### Шаг 7. Упростить Qt session UI
+
+Что сделать:
+
+- В [ui/qt_app.py](../../ui/qt_app.py) пересобрать вкладку `Сессия` под новый UX.
+- Убрать кнопки и обработчики, которые нужны только multi-profile модели:
+  - `Сменить аккаунт`
+  - `Очистить профиль`
+  - `Переимпорт`, если он больше не нужен
+  - browser-specific import shortcuts, если остается один прямой import path.
+- Упростить session summary:
+  - не показывать `profile_id` пользователю;
+  - не акцентировать `profile_name`, если он технический;
+  - оставить только то, что важно операционно.
+- Проверить, что session-action locking во время активного run остается на месте.
+
+Файлы:
+
+- [ui/qt_app.py](../../ui/qt_app.py)
+- [ui/presentation.py](../../ui/presentation.py)
+
+Что должно получиться:
+
+- Session tab объясняет одну вещь: готова ли Storyblocks-сессия и что пользователю делать дальше.
+- В UI больше нет иллюзии, что приложение умеет безопасно управлять несколькими managed профилями.
+
+Как проверить:
+
+- Во вкладке `Сессия` нет действий, связанных с managed profile switching/cleanup.
+- Во время активного запуска session buttons по-прежнему заблокированы.
+- После `Выйти` пользователь может заново пройти login flow без дополнительных profile-management шагов.
+
+Практический совет:
+
+- Не перегружайте новый session tab. Если какой-то элемент показывал только технический identity профиля, а не помогал оператору понять следующее действие, его лучше удалить.
+
+### Шаг 8. Упростить startup, smoke snapshot и shutdown lifecycle
+
+Что сделать:
+
+- В [app/runtime.py](../../app/runtime.py) убрать `ApplicationSnapshot.browser_profiles` как список.
+- Заменить его на более простой контракт:
+  - либо одно поле `storyblocks_profile_present: bool`;
+  - либо `storyblocks_profile_id: str | None`, если действительно нужен идентификатор;
+  - либо вообще убрать его из smoke output, если пользы нет.
+- В [app/__main__.py](../../app/__main__.py) синхронизировать `--smoke` output с новым snapshot.
+- В [app/bootstrap.py](../../app/bootstrap.py) поправить `ApplicationContainer.close()`:
+  - сейчас закрывается только `close_browsers_owned_by_current_thread()`;
+  - нужно гарантированно закрывать и native login browser, если он запущен.
+- Лучше ввести один явный lifecycle method в session manager, например `shutdown()`, и вызывать его из container close.
+
+Файлы:
+
+- [app/runtime.py](../../app/runtime.py)
+- [app/__main__.py](../../app/__main__.py)
+- [app/bootstrap.py](../../app/bootstrap.py)
+- [browser/session.py](../../browser/session.py)
+
+Что должно получиться:
+
+- Startup contract перестает сообщать о multi-profile состоянии.
+- Shutdown не оставляет висящих browser processes и lock-файлов, если открыто окно login browser.
+
+Как проверить:
+
+- Выполнить `python -m app --smoke --no-gui` и убедиться, что вывод больше не содержит `browser_profiles` как список.
+- Открыть native login browser, закрыть приложение, убедиться, что процесс браузера завершается и managed profile не остается заблокированным.
+
+Практический совет:
+
+- Это не косметика. Пока lifecycle не закрывает native login browser, задача считается незавершенной, даже если UI уже упрощен.
+
+### Шаг 9. Переписать регрессии и обновить документацию
+
+Что сделать:
+
+- Переписать тесты, которые сейчас закрепляют multi-profile lifecycle:
+  - lifecycle registry в [tests/test_phase2_architecture.py](../../tests/test_phase2_architecture.py);
+  - session panel / import / reset flows в [tests/test_ui_controller.py](../../tests/test_ui_controller.py);
+  - browser core и import service в [tests/test_storyblocks_browser_core.py](../../tests/test_storyblocks_browser_core.py);
+  - browser channel reliability в [tests/test_phase9_reliability.py](../../tests/test_phase9_reliability.py).
+- Добавить явную регрессию на shutdown native login browser.
+- Обновить пользовательскую документацию:
+  - [docs/user-manual-ru.md](../../docs/user-manual-ru.md)
+  - [docs/implementation-verification-checklist.md](../../docs/implementation-verification-checklist.md)
+  - [docs/project-analysis.md](../../docs/project-analysis.md)
+- Удалить обещания:
+  - "можно сменить аккаунт" как отдельный managed profile flow;
+  - "можно очистить профиль", если такого действия больше нет;
+  - "управляемые браузерные профили Storyblocks" во множественном числе.
+
+Файлы:
+
+- [tests/test_phase2_architecture.py](../../tests/test_phase2_architecture.py)
+- [tests/test_ui_controller.py](../../tests/test_ui_controller.py)
+- [tests/test_storyblocks_browser_core.py](../../tests/test_storyblocks_browser_core.py)
+- [tests/test_phase9_reliability.py](../../tests/test_phase9_reliability.py)
+- [docs/user-manual-ru.md](../../docs/user-manual-ru.md)
+- [docs/implementation-verification-checklist.md](../../docs/implementation-verification-checklist.md)
+- [docs/project-analysis.md](../../docs/project-analysis.md)
+
+Что должно получиться:
+
+- Тесты проверяют singleton flow, а не старую модель active profile.
+- Документация описывает ровно тот UX, который пользователь реально видит после P6-05.
+
+Как проверить:
+
+- Прогнать минимум:
+  - `python -m unittest tests.test_phase2_architecture`
+  - `python -m unittest tests.test_ui_controller`
+  - `python -m unittest tests.test_storyblocks_browser_core`
+  - `python -m unittest tests.test_phase9_reliability`
+- Затем прогнать:
+  - `python -m unittest discover -s tests`
+  - `ruff check .`
+
+Практический совет:
+
+- Не ограничивайтесь green unit tests. Обязательно руками пройти session flow в desktop app, потому что именно UI-сценарий здесь был главным источником лишней сложности.
+
+## Финальная проверка задачи
+
+Перед закрытием P6-05 должны быть подтверждены все пункты:
+
+- В приложении используется один managed Storyblocks profile.
+- Controller и UI не дают управлять несколькими managed profile.
+- Session manager больше не требует `profile_id` для обычных действий.
+- Startup/shutdown lifecycle не оставляет висящий browser state.
+- Import и login flow не стали хуже для оператора.
+- Код browser/session/profile управления заметно проще и короче по публичному API.

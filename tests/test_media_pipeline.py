@@ -206,6 +206,19 @@ class MediaPipelineTests(unittest.TestCase):
             )
             self.assertEqual(first.slots[0].slot_id, "primary_video")
             self.assertEqual(manifest.summary["primary_videos"], 2)
+            self.assertEqual(
+                manifest.sourcing_strategy["image_primary_providers"],
+                ["storyblocks_image"],
+            )
+            self.assertEqual(
+                manifest.sourcing_strategy["image_fallback_providers"],
+                ["openverse"],
+            )
+            self.assertEqual(
+                manifest.sourcing_strategy["image_selection_contract"],
+                "storyblocks_then_free_fallback",
+            )
+            self.assertNotIn("mixed_image_fallback", manifest.sourcing_strategy)
 
     def test_pipeline_downloads_storyblocks_primary_video_to_output_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -329,6 +342,19 @@ class MediaPipelineTests(unittest.TestCase):
             image = entry.selection.supporting_assets[0]
             assert image.local_path is not None
             self.assertTrue(image.local_path.exists())
+            self.assertEqual(
+                manifest.sourcing_strategy["image_primary_providers"],
+                ["openverse"],
+            )
+            self.assertEqual(
+                manifest.sourcing_strategy["image_fallback_providers"],
+                [],
+            )
+            self.assertEqual(
+                manifest.sourcing_strategy["image_selection_contract"],
+                "free_images_only",
+            )
+            self.assertEqual(manifest.sourcing_strategy["video_providers"], [])
             self.assertIn(
                 str(output_root / "media-project" / "downloads" / "images"),
                 str(image.local_path),
@@ -1162,7 +1188,9 @@ class MediaPipelineTests(unittest.TestCase):
             self.assertEqual(sorted(resumed_run.completed_paragraphs), [1, 2, 3, 4])
             self.assertEqual(resumed_manifest.summary["paragraphs_completed"], 4)
 
-    def test_parallel_cancel_drains_inflight_and_cancels_queued_paragraphs(self) -> None:
+    def test_parallel_cancel_drains_inflight_and_cancels_queued_paragraphs(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container, project = self._create_project(temp_dir, paragraph_count=4)
             descriptor = container.provider_registry.get("openverse")
@@ -1288,7 +1316,9 @@ class MediaPipelineTests(unittest.TestCase):
             )
 
             self.assertEqual(run.status, RunStatus.COMPLETED)
-            self.assertEqual(run.metadata.get("concurrency_mode"), "free_images_parallel")
+            self.assertEqual(
+                run.metadata.get("concurrency_mode"), "free_images_parallel"
+            )
             self.assertEqual(manifest.summary["paragraphs_completed"], 1)
 
     def test_free_image_mode_keeps_run_level_dedupe_consistent_across_parallel_paragraphs(
@@ -1373,12 +1403,12 @@ class MediaPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             container, project = self._create_project(temp_dir, paragraph_count=1)
             openverse_descriptor = container.provider_registry.get("openverse")
-            wikimedia_descriptor = container.provider_registry.get("wikimedia")
+            pixabay_descriptor = container.provider_registry.get("pixabay")
             assert openverse_descriptor is not None
-            assert wikimedia_descriptor is not None
+            assert pixabay_descriptor is not None
             container.media_pipeline._provider_settings.enabled_providers = [
                 "openverse",
-                "wikimedia",
+                "pixabay",
             ]
 
             active_calls = 0
@@ -1419,9 +1449,9 @@ class MediaPipelineTests(unittest.TestCase):
             )
             container.media_pipeline.register_backend(
                 CallbackCandidateSearchBackend(
-                    provider_id="wikimedia",
+                    provider_id="pixabay",
                     capability=ProviderCapability.IMAGE,
-                    descriptor=wikimedia_descriptor,
+                    descriptor=pixabay_descriptor,
                     search_fn=slow_search,
                 )
             )
@@ -1442,7 +1472,9 @@ class MediaPipelineTests(unittest.TestCase):
 
             self.assertEqual(run.status, RunStatus.COMPLETED)
             self.assertGreaterEqual(max_active_calls, 2)
-            self.assertEqual(run.metadata.get("concurrency_mode"), "free_images_parallel")
+            self.assertEqual(
+                run.metadata.get("concurrency_mode"), "free_images_parallel"
+            )
             self.assertEqual(
                 manifest.sourcing_strategy.get("concurrency_mode"),
                 "free_images_parallel",
@@ -1453,7 +1485,9 @@ class MediaPipelineTests(unittest.TestCase):
             container, project = self._create_project(temp_dir, paragraph_count=1)
             descriptor = container.provider_registry.get("openverse")
             assert descriptor is not None
-            container.media_pipeline._provider_settings.enabled_providers = ["openverse"]
+            container.media_pipeline._provider_settings.enabled_providers = [
+                "openverse"
+            ]
 
             class OrderedDownloadingBackend(CallbackCandidateSearchBackend):
                 def download_asset(
@@ -1521,12 +1555,12 @@ class MediaPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             container, project = self._create_project(temp_dir, paragraph_count=1)
             openverse_descriptor = container.provider_registry.get("openverse")
-            wikimedia_descriptor = container.provider_registry.get("wikimedia")
+            pixabay_descriptor = container.provider_registry.get("pixabay")
             assert openverse_descriptor is not None
-            assert wikimedia_descriptor is not None
+            assert pixabay_descriptor is not None
             container.media_pipeline._provider_settings.enabled_providers = [
                 "openverse",
-                "wikimedia",
+                "pixabay",
             ]
 
             container.media_pipeline.register_backend(
@@ -1547,13 +1581,13 @@ class MediaPipelineTests(unittest.TestCase):
             )
             container.media_pipeline.register_backend(
                 CallbackCandidateSearchBackend(
-                    provider_id="wikimedia",
+                    provider_id="pixabay",
                     capability=ProviderCapability.IMAGE,
-                    descriptor=wikimedia_descriptor,
+                    descriptor=pixabay_descriptor,
                     search_fn=lambda paragraph, query, limit: [
                         _candidate(
                             "fallback-b",
-                            "wikimedia",
+                            "pixabay",
                             AssetKind.IMAGE,
                             rank_hint=8.5,
                             title="Fallback B",
@@ -1745,8 +1779,7 @@ class MediaPipelineTests(unittest.TestCase):
                             raise TimeoutError("storyblocks search timed out")
                         if self.session_manager.reset_calls < 1:
                             raise AssertionError(
-                                "Storyblocks timeout cleanup "
-                                "did not run before retry"
+                                "Storyblocks timeout cleanup did not run before retry"
                             )
                         return ProviderResult(
                             provider_name=self.provider_id,
@@ -1803,7 +1836,9 @@ class MediaPipelineTests(unittest.TestCase):
             container, project = self._create_project(temp_dir, paragraph_count=1)
             descriptor = container.provider_registry.get("openverse")
             assert descriptor is not None
-            container.media_pipeline._provider_settings.enabled_providers = ["openverse"]
+            container.media_pipeline._provider_settings.enabled_providers = [
+                "openverse"
+            ]
 
             class TimeoutAwareImageBackend(CallbackCandidateSearchBackend):
                 def __init__(self) -> None:
@@ -1879,7 +1914,9 @@ class MediaPipelineTests(unittest.TestCase):
             container, project = self._create_project(temp_dir, paragraph_count=1)
             descriptor = container.provider_registry.get("openverse")
             assert descriptor is not None
-            container.media_pipeline._provider_settings.enabled_providers = ["openverse"]
+            container.media_pipeline._provider_settings.enabled_providers = [
+                "openverse"
+            ]
             container.media_pipeline.register_backend(
                 CallbackCandidateSearchBackend(
                     provider_id="openverse",
@@ -1923,7 +1960,9 @@ class MediaPipelineTests(unittest.TestCase):
                 return float(asset.metadata["rank_hint"])
 
             started_at = time.perf_counter()
-            with patch.object(container.media_pipeline, "_asset_rank", side_effect=slow_rank):
+            with patch.object(
+                container.media_pipeline, "_asset_rank", side_effect=slow_rank
+            ):
                 run, manifest = container.media_run_service.create_and_execute(
                     project.project_id,
                     config=MediaSelectionConfig(
@@ -2017,7 +2056,9 @@ class MediaPipelineTests(unittest.TestCase):
             self.assertIsInstance(perf_context, dict)
             assert isinstance(perf_context, dict)
             counters = dict(perf_context.get("counters") or {})
-            reason_keys = [key for key in counters if key.startswith("no_match_reason_")]
+            reason_keys = [
+                key for key in counters if key.startswith("no_match_reason_")
+            ]
             self.assertIn("no_match_reason_download_failed", reason_keys)
             self.assertFalse(any("video_a" in key for key in reason_keys))
 

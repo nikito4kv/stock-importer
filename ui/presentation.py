@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .launch_profiles import LAUNCH_PROFILE_LABELS, list_launch_profile_ids
+
 
 @dataclass(frozen=True, slots=True)
 class UiThemeSpec:
@@ -92,12 +94,9 @@ PROVIDER_LABELS: dict[str, str] = {
     "storyblocks_video": "Storyblocks видео",
     "storyblocks_image": "Storyblocks изображения",
     "free_image": "Бесплатные изображения",
-    "generic_web_image": "Веб-изображения",
     "pexels": "Pexels",
     "pixabay": "Pixabay",
     "openverse": "Openverse",
-    "wikimedia": "Wikimedia Commons",
-    "bing": "Bing",
 }
 
 ASSET_KIND_LABELS: dict[str, str] = {
@@ -182,6 +181,19 @@ def label_for_theme(theme_id: str) -> str:
 
 def label_for_strictness(value: str) -> str:
     return STRICTNESS_LABELS.get(value, value)
+
+
+def label_for_launch_profile(value: str) -> str:
+    return LAUNCH_PROFILE_LABELS.get(value, value)
+
+
+def launch_profile_value_from_label(label: str) -> str:
+    target = (label or "").strip()
+    for value in list_launch_profile_ids():
+        translated = LAUNCH_PROFILE_LABELS[value]
+        if translated == target:
+            return value
+    return "normal"
 
 
 def strictness_value_from_label(label: str) -> str:

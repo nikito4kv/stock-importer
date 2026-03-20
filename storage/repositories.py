@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Generic, TypeVar
 
 from config.settings import (
+    SUPPORTED_DESKTOP_STACK,
     AiSettings,
     ApplicationSettings,
     BrowserSettings,
@@ -15,12 +16,58 @@ from config.settings import (
     default_settings,
 )
 from domain.models import BrowserProfile, Preset, Project, Run, RunManifest
-from domain.project_modes import infer_project_mode, normalize_project_mode
+from domain.project_modes import (
+    DEFAULT_FREE_IMAGE_PROVIDER_IDS,
+    infer_project_mode,
+    normalize_free_image_provider_ids,
+    normalize_project_mode,
+    provider_ids_for_mode,
+)
 
 from .serialization import read_json, write_json
 from .workspace import WorkspacePaths
 
 T = TypeVar("T")
+SUPPORTED_PROVIDER_IDS = frozenset(
+    {
+        "storyblocks_video",
+        "storyblocks_image",
+        "pexels",
+        "pixabay",
+        "openverse",
+    }
+)
+SUPPORTED_IMAGE_PROVIDER_IDS = frozenset(
+    {
+        "storyblocks_image",
+        "pexels",
+        "pixabay",
+        "openverse",
+    }
+)
+SUPPORTED_VIDEO_PROVIDER_IDS = frozenset({"storyblocks_video"})
+
+
+def _normalize_provider_ids(
+    raw_provider_ids: object,
+    *,
+    allowed_provider_ids: frozenset[str],
+) -> list[str]:
+    if not isinstance(raw_provider_ids, (list, tuple)):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_provider_ids:
+        provider_id = str(item).strip().casefold()
+        if (
+            not provider_id
+            or provider_id not in allowed_provider_ids
+            or provider_id in seen
+        ):
+            continue
+        seen.add(provider_id)
+        normalized.append(provider_id)
+    return normalized
 
 
 class JsonModelRepository(Generic[T]):
@@ -52,33 +99,67 @@ class SettingsRepository:
         storage = data.get("storage", {})
         browser = data.get("browser", {})
         providers = data.get("providers", {})
+        normalized_enabled_providers = _normalize_provider_ids(
+            providers.get("enabled_providers"),
+            allowed_provider_ids=SUPPORTED_PROVIDER_IDS,
+        )
+        normalized_default_video_providers = _normalize_provider_ids(
+            providers.get("default_video_providers"),
+            allowed_provider_ids=SUPPORTED_VIDEO_PROVIDER_IDS,
+        )
+        normalized_default_image_providers = _normalize_provider_ids(
+            providers.get("default_image_providers"),
+            allowed_provider_ids=SUPPORTED_IMAGE_PROVIDER_IDS,
+        )
+        normalized_free_providers = normalize_free_image_provider_ids(
+            [
+                provider_id
+                for provider_id in normalized_enabled_providers
+                if provider_id in DEFAULT_FREE_IMAGE_PROVIDER_IDS
+            ]
+        )
+        if not normalized_free_providers:
+            normalized_free_providers = normalize_free_image_provider_ids(
+                [
+                    provider_id
+                    for provider_id in normalized_default_image_providers
+                    if provider_id in DEFAULT_FREE_IMAGE_PROVIDER_IDS
+                ]
+            )
         project_mode = providers.get("project_mode")
         if not project_mode:
             project_mode = infer_project_mode(
                 video_enabled=bool(
-                    providers.get("default_video_providers", ["storyblocks_video"])
+                    normalized_default_video_providers
+                    or ("storyblocks_video" in normalized_enabled_providers)
                 ),
                 storyblocks_images_enabled=(
-                    "storyblocks_image" in providers.get("enabled_providers", [])
+                    "storyblocks_image" in normalized_enabled_providers
                     and not bool(providers.get("free_images_only", False))
                 ),
-                free_images_enabled=any(
-                    provider_id in providers.get("enabled_providers", [])
-                    for provider_id in (
-                        "pexels",
-                        "pixabay",
-                        "openverse",
-                        "wikimedia",
-                        "bing",
-                    )
-                ),
+                free_images_enabled=bool(normalized_free_providers),
                 mixed_image_fallback=bool(providers.get("mixed_image_fallback", True)),
             )
+        resolved_project_mode = normalize_project_mode(project_mode)
+        resolved_enabled_providers = provider_ids_for_mode(
+            resolved_project_mode,
+            free_image_provider_ids=normalized_free_providers,
+        )
+        resolved_default_video_providers = [
+            provider_id
+            for provider_id in resolved_enabled_providers
+            if provider_id == "storyblocks_video"
+        ]
+        resolved_default_image_providers = [
+            provider_id
+            for provider_id in resolved_enabled_providers
+            if provider_id != "storyblocks_video"
+        ]
         concurrency = data.get("concurrency", {})
         ai = data.get("ai", {})
         security = data.get("security", {})
         return ApplicationSettings(
-            desktop_stack=str(data.get("desktop_stack", "pyside6")),
+            desktop_stack=SUPPORTED_DESKTOP_STACK,
             ui_theme=str(data.get("ui_theme", "dark")),
             workspace_name=str(data.get("workspace_name", "vid-img-downloader")),
             storage=StorageSettings(
@@ -107,60 +188,17 @@ class SettingsRepository:
                 ),
             ),
             providers=ProviderSettings(
-                project_mode=normalize_project_mode(project_mode),
-                default_video_providers=list(
-                    providers.get("default_video_providers", ["storyblocks_video"])
-                ),
-                default_image_providers=list(
-                    providers.get(
-                        "default_image_providers",
-                        [
-                            "storyblocks_image",
-                            "pexels",
-                            "pixabay",
-                            "openverse",
-                            "wikimedia",
-                        ],
-                    )
-                ),
-                enabled_providers=list(
-                    providers.get(
-                        "enabled_providers",
-                        [
-                            "storyblocks_video",
-                            "storyblocks_image",
-                            "pexels",
-                            "pixabay",
-                            "openverse",
-                            "wikimedia",
-                            "bing",
-                        ],
-                    )
-                ),
-                image_provider_priority=list(
-                    providers.get(
-                        "image_provider_priority",
-                        [
-                            "storyblocks_image",
-                            "pexels",
-                            "pixabay",
-                            "openverse",
-                            "wikimedia",
-                            "bing",
-                        ],
-                    )
-                ),
-                allow_generic_web_image=bool(
-                    providers.get("allow_generic_web_image", False)
-                ),
+                project_mode=resolved_project_mode,
+                default_video_providers=resolved_default_video_providers,
+                default_image_providers=resolved_default_image_providers,
+                enabled_providers=resolved_enabled_providers,
                 commercial_only_images=bool(
                     providers.get("commercial_only_images", True)
                 ),
                 allow_attribution_licenses=bool(
                     providers.get("allow_attribution_licenses", False)
                 ),
-                free_images_only=bool(providers.get("free_images_only", False)),
-                mixed_image_fallback=bool(providers.get("mixed_image_fallback", True)),
+                free_images_only=resolved_project_mode == "free_images_only",
                 supporting_image_limit=max(
                     0, int(providers.get("supporting_image_limit", 1))
                 ),
@@ -203,7 +241,7 @@ class SettingsRepository:
                 fail_fast_storyblocks_errors=bool(
                     concurrency.get("fail_fast_storyblocks_errors", True)
                 ),
-                queue_size=int(concurrency.get("queue_size", 8)),
+                queue_size=int(concurrency.get("queue_size", 1)),
             ),
             security=SecuritySettings(
                 secret_backend=str(security.get("secret_backend", "dpapi")),
@@ -225,8 +263,20 @@ class SettingsRepository:
         )
 
     def save(self, settings: ApplicationSettings) -> ApplicationSettings:
+        default_video_providers = _normalize_provider_ids(
+            settings.providers.default_video_providers,
+            allowed_provider_ids=SUPPORTED_VIDEO_PROVIDER_IDS,
+        )
+        default_image_providers = _normalize_provider_ids(
+            settings.providers.default_image_providers,
+            allowed_provider_ids=SUPPORTED_IMAGE_PROVIDER_IDS,
+        )
+        enabled_providers = _normalize_provider_ids(
+            settings.providers.enabled_providers,
+            allowed_provider_ids=SUPPORTED_PROVIDER_IDS,
+        )
         payload = {
-            "desktop_stack": settings.desktop_stack,
+            "desktop_stack": SUPPORTED_DESKTOP_STACK,
             "ui_theme": settings.ui_theme,
             "workspace_name": settings.workspace_name,
             "storage": {
@@ -248,21 +298,12 @@ class SettingsRepository:
             },
             "providers": {
                 "project_mode": settings.providers.project_mode,
-                "default_video_providers": list(
-                    settings.providers.default_video_providers
-                ),
-                "default_image_providers": list(
-                    settings.providers.default_image_providers
-                ),
-                "enabled_providers": list(settings.providers.enabled_providers),
-                "image_provider_priority": list(
-                    settings.providers.image_provider_priority
-                ),
-                "allow_generic_web_image": settings.providers.allow_generic_web_image,
+                "default_video_providers": default_video_providers,
+                "default_image_providers": default_image_providers,
+                "enabled_providers": enabled_providers,
                 "commercial_only_images": settings.providers.commercial_only_images,
                 "allow_attribution_licenses": settings.providers.allow_attribution_licenses,
                 "free_images_only": settings.providers.free_images_only,
-                "mixed_image_fallback": settings.providers.mixed_image_fallback,
                 "supporting_image_limit": settings.providers.supporting_image_limit,
                 "fallback_image_limit": settings.providers.fallback_image_limit,
                 "no_match_budget_seconds": settings.providers.no_match_budget_seconds,

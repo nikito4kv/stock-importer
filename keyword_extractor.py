@@ -63,7 +63,6 @@ def extract_intents_for_script(
     fail_fast: bool = False,
     max_workers: int = 10,
     start_jitter_seconds: float = 0.15,
-    include_generic_web_image: bool = False,
 ):
     return _INTENT_SERVICE.extract_document(
         model,
@@ -73,7 +72,6 @@ def extract_intents_for_script(
         fail_fast=fail_fast,
         max_workers=max_workers,
         start_jitter_seconds=start_jitter_seconds,
-        include_generic_web_image=include_generic_web_image,
     )
 
 
@@ -84,7 +82,6 @@ def save_paragraph_intents_json(
     output_path: str | Path = DEFAULT_OUTPUT_JSON,
     model_name: str = DEFAULT_MODEL,
     strictness: str = DEFAULT_STRICTNESS,
-    include_generic_web_image: bool = False,
 ) -> Path:
     return _INTENT_SERVICE.save_intents_json(
         document,
@@ -92,7 +89,6 @@ def save_paragraph_intents_json(
         output_path=output_path,
         model_name=model_name,
         strictness=strictness,
-        include_generic_web_image=include_generic_web_image,
     )
 
 
@@ -105,7 +101,6 @@ def run_intent_extraction(
     max_workers: int = 10,
     max_paragraphs: int | None = None,
     fail_fast: bool = False,
-    include_generic_web_image: bool = False,
 ):
     document = _INGESTION_SERVICE.ingest(input_file)
     if document.numbering_issues:
@@ -124,7 +119,6 @@ def run_intent_extraction(
         delay_seconds=delay_seconds,
         fail_fast=fail_fast,
         max_workers=max_workers,
-        include_generic_web_image=include_generic_web_image,
     )
     out_file = save_paragraph_intents_json(
         updated_document,
@@ -132,7 +126,6 @@ def run_intent_extraction(
         output_path=output_path,
         model_name=model_name,
         strictness=strictness,
-        include_generic_web_image=include_generic_web_image,
     )
     return intents_by_paragraph, items, out_file
 
@@ -199,11 +192,6 @@ def parse_arguments() -> argparse.Namespace:
         help="Optional limit of paragraphs to process",
     )
     parser.add_argument(
-        "--include-generic-web-image",
-        action="store_true",
-        help="Also generate opt-in generic web image queries",
-    )
-    parser.add_argument(
         "--fail-fast",
         action="store_true",
         help="Stop on first paragraph error",
@@ -222,7 +210,6 @@ def main() -> None:
         max_workers=args.workers,
         max_paragraphs=args.max_paragraphs,
         fail_fast=args.fail_fast,
-        include_generic_web_image=args.include_generic_web_image,
     )
     logger.info(
         "Done. Extracted intents for %s paragraph(s). Saved to: %s",

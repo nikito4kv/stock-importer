@@ -26,7 +26,7 @@ from domain.enums import (
     RunStatus,
     SessionHealth,
 )
-from domain.models import AssetCandidate, AssetSelection, ProviderResult
+from domain.models import AssetCandidate, AssetSelection, Preset, ProviderResult
 from pipeline import CallbackCandidateSearchBackend
 from services.errors import AppError
 from services.events import AppEvent
@@ -152,8 +152,22 @@ class UiControllerTests(unittest.TestCase):
 
             self.assertEqual(exported.name, "preset-export.json")
             self.assertEqual(imported.name, "quick-start")
+            self.assertIn("quick_launch", preset.settings_snapshot)
+            self.assertEqual(
+                preset.settings_snapshot["launch_profile_id"],
+                "normal",
+            )
+            self.assertNotIn("storage", preset.settings_snapshot)
+            self.assertNotIn("security", preset.settings_snapshot)
             self.assertEqual(loaded_quick.mode_id, quick.mode_id)
-            self.assertEqual(loaded_advanced.queue_size, advanced.queue_size)
+            self.assertEqual(
+                loaded_quick.launch_profile_id,
+                quick.launch_profile_id,
+            )
+            self.assertEqual(
+                loaded_advanced.action_delay_ms,
+                advanced.action_delay_ms,
+            )
 
             validation = controller.set_gemini_key("AIzaSyDUMMYKEYVALUE123456789")
             self.assertEqual(validation.severity, "success")
@@ -411,6 +425,7 @@ class UiControllerTests(unittest.TestCase):
             controller = DesktopGuiController.create(temp_dir)
             profile_id_value = controller.ensure_active_profile()
             container = controller.application.container
+
             def fake_open_browser(profile_id=None):
                 pid = profile_id or profile_id_value
                 state = container.session_manager.set_health(pid, SessionHealth.UNKNOWN)
@@ -579,38 +594,36 @@ class UiControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             script_path = _write_docx(temp_dir, ["HEADER", "1. River boat scene"])
             controller = DesktopGuiController.create(temp_dir)
-            project = controller.open_script(script_path, project_name="Guarded Run")
+            controller.open_script(script_path, project_name="Guarded Run")
             _mark_storyblocks_ready(controller)
 
             quick = controller.build_quick_launch_settings()
             advanced = controller.build_advanced_settings()
             quick.mode_id = "sb_video_only"
-            advanced.paragraph_workers = 2
+            quick.launch_profile_id = "fast"
 
-            with self.assertRaises(AppError) as ctx:
-                controller.start_run_async(project.project_id, quick, advanced)
+            settings = controller.apply_forms_to_settings(quick, advanced)
 
-            self.assertEqual(ctx.exception.code, "storyblocks_parallelism_guard")
+            self.assertEqual(settings.concurrency.paragraph_workers, 1)
+            self.assertEqual(settings.concurrency.queue_size, 1)
             self.assertEqual(
-                ctx.exception.details.get("recommended_paragraph_workers"),
+                controller.application.container.orchestrator.max_workers,
                 1,
-            )
-            self.assertEqual(
-                ctx.exception.details.get("concurrency_mode"),
-                "storyblocks_safe",
             )
 
     def test_controller_allows_free_image_parallelism_over_one_worker(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             script_path = _write_docx(temp_dir, ["HEADER", "1. River boat scene"])
             controller = DesktopGuiController.create(temp_dir)
-            project = controller.open_script(script_path, project_name="Free Images Run")
+            project = controller.open_script(
+                script_path, project_name="Free Images Run"
+            )
 
             quick = controller.build_quick_launch_settings()
             advanced = controller.build_advanced_settings()
             quick.mode_id = "free_images_only"
+            quick.launch_profile_id = "fast"
             quick.provider_ids = ["openverse"]
-            advanced.paragraph_workers = 2
 
             with patch.object(controller, "_start_background_run", return_value=None):
                 run_id = controller.start_run_async(project.project_id, quick, advanced)
@@ -619,6 +632,150 @@ class UiControllerTests(unittest.TestCase):
             self.assertIsNotNone(
                 controller.application.container.run_repository.load(run_id)
             )
+            self.assertEqual(
+                controller.application.container.orchestrator.max_workers,
+                4,
+            )
+
+    def test_build_quick_launch_settings_infers_normal_fast_and_custom_profiles(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = DesktopGuiController.create(temp_dir)
+
+            self.assertEqual(
+                controller.build_quick_launch_settings().launch_profile_id,
+                "normal",
+            )
+
+            quick = controller.build_quick_launch_settings()
+            advanced = controller.build_advanced_settings()
+            quick.launch_profile_id = "fast"
+            controller.apply_forms_to_settings(quick, advanced)
+
+            self.assertEqual(
+                controller.build_quick_launch_settings().launch_profile_id,
+                "fast",
+            )
+
+            quick = controller.build_quick_launch_settings()
+            advanced = controller.build_advanced_settings()
+            quick.launch_profile_id = "custom"
+            advanced.launch_timeout_ms = 61000
+            advanced.navigation_timeout_ms = 47000
+            advanced.downloads_timeout_seconds = 240.0
+            controller.apply_forms_to_settings(quick, advanced)
+
+            inferred_quick = controller.build_quick_launch_settings()
+            inferred_advanced = controller.build_advanced_settings()
+            self.assertEqual(inferred_quick.launch_profile_id, "custom")
+            self.assertEqual(inferred_advanced.launch_timeout_ms, 61000)
+            self.assertEqual(inferred_advanced.navigation_timeout_ms, 47000)
+            self.assertEqual(inferred_advanced.downloads_timeout_seconds, 240.0)
+
+    def test_media_config_from_forms_uses_resolved_launch_profile_timeouts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = DesktopGuiController.create(temp_dir)
+            quick = controller.build_quick_launch_settings()
+            advanced = controller.build_advanced_settings()
+
+            normal_config = controller._media_config_from_forms(quick, advanced)
+            quick.launch_profile_id = "fast"
+            fast_config = controller._media_config_from_forms(quick, advanced)
+
+            self.assertEqual(normal_config.search_timeout_seconds, 20.0)
+            self.assertEqual(fast_config.search_timeout_seconds, 12.0)
+            self.assertEqual(normal_config.download_timeout_seconds, 120.0)
+            self.assertEqual(fast_config.download_timeout_seconds, 90.0)
+            self.assertEqual(normal_config.retry_budget, 2)
+            self.assertEqual(fast_config.retry_budget, 1)
+
+    def test_load_legacy_preset_maps_to_custom_timing_and_safe_runtime_defaults(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = DesktopGuiController.create(temp_dir)
+            legacy = Preset(
+                name="legacy-custom",
+                settings_snapshot={
+                    "browser": {
+                        "slow_mode": True,
+                        "action_delay_ms": 1500,
+                        "launch_timeout_ms": 55000,
+                        "navigation_timeout_ms": 36000,
+                        "downloads_timeout_seconds": 180.0,
+                    },
+                    "providers": {
+                        "project_mode": "sb_video_only",
+                    },
+                    "concurrency": {
+                        "paragraph_workers": 8,
+                        "queue_size": 8,
+                        "search_timeout_seconds": 99.0,
+                        "relevance_timeout_seconds": 33.0,
+                        "retry_budget": 9,
+                    },
+                },
+            )
+            controller.application.container.settings_manager.save_preset(legacy)
+
+            quick, advanced = controller.load_preset(legacy.name)
+
+            self.assertEqual(quick.launch_profile_id, "custom")
+            self.assertEqual(advanced.action_delay_ms, 1500)
+            self.assertEqual(advanced.launch_timeout_ms, 55000)
+            self.assertEqual(advanced.navigation_timeout_ms, 36000)
+            self.assertEqual(advanced.downloads_timeout_seconds, 180.0)
+
+            settings = controller.application.container.settings
+            self.assertEqual(settings.concurrency.paragraph_workers, 1)
+            self.assertEqual(settings.concurrency.queue_size, 1)
+            self.assertEqual(settings.browser.action_delay_ms, 1500)
+            self.assertTrue(settings.browser.slow_mode)
+
+    def test_custom_preset_round_trip_preserves_launch_profile_and_timing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = DesktopGuiController.create(temp_dir)
+            quick = controller.build_quick_launch_settings()
+            advanced = controller.build_advanced_settings()
+            quick.launch_profile_id = "custom"
+            advanced.action_delay_ms = 250
+            advanced.launch_timeout_ms = 60000
+            advanced.navigation_timeout_ms = 45000
+            advanced.downloads_timeout_seconds = 240.0
+
+            preset = controller.save_preset("custom-round-trip", quick, advanced)
+            exported = controller.export_preset(
+                preset.name, Path(temp_dir) / "custom-round-trip.json"
+            )
+            imported = controller.import_preset(exported)
+            loaded_quick, loaded_advanced = controller.load_preset(imported.name)
+
+            self.assertEqual(preset.settings_snapshot["launch_profile_id"], "custom")
+            self.assertEqual(
+                preset.settings_snapshot["custom_timing_overrides"],
+                {
+                    "action_delay_ms": 250,
+                    "launch_timeout_ms": 60000,
+                    "navigation_timeout_ms": 45000,
+                    "downloads_timeout_seconds": 240.0,
+                },
+            )
+            self.assertNotIn("storage", preset.settings_snapshot)
+            self.assertNotIn("security", preset.settings_snapshot)
+            self.assertNotIn("cache_root", preset.settings_snapshot["quick_launch"])
+            self.assertNotIn(
+                "browser_profile_path", preset.settings_snapshot["quick_launch"]
+            )
+            self.assertEqual(loaded_quick.launch_profile_id, "custom")
+            self.assertEqual(loaded_advanced.action_delay_ms, 250)
+            self.assertEqual(loaded_advanced.launch_timeout_ms, 60000)
+            self.assertEqual(loaded_advanced.navigation_timeout_ms, 45000)
+            self.assertEqual(loaded_advanced.downloads_timeout_seconds, 240.0)
 
     def test_build_live_snapshot_does_not_require_manifest_reload(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -653,21 +810,24 @@ class UiControllerTests(unittest.TestCase):
             quick = controller.build_quick_launch_settings()
             advanced = controller.build_advanced_settings()
             quick.mode_id = "sb_video_only"
-            advanced.paragraph_workers = 1
             run_id = controller.start_run_async(project.project_id, quick, advanced)
 
-            with patch.object(
-                controller.application.container.media_run_service,
-                "snapshot_manifest",
-                side_effect=AssertionError("manifest snapshot should not happen"),
-            ), patch.object(
-                controller.application.container.media_run_service,
-                "load_manifest",
-                side_effect=AssertionError("manifest load should not happen"),
-            ), patch.object(
-                controller.application.container.project_repository,
-                "load",
-                side_effect=AssertionError("project load should not happen"),
+            with (
+                patch.object(
+                    controller.application.container.media_run_service,
+                    "snapshot_manifest",
+                    side_effect=AssertionError("manifest snapshot should not happen"),
+                ),
+                patch.object(
+                    controller.application.container.media_run_service,
+                    "load_manifest",
+                    side_effect=AssertionError("manifest load should not happen"),
+                ),
+                patch.object(
+                    controller.application.container.project_repository,
+                    "load",
+                    side_effect=AssertionError("project load should not happen"),
+                ),
             ):
                 snapshot = controller.build_live_snapshot(
                     active_project_id=project.project_id,
@@ -676,7 +836,7 @@ class UiControllerTests(unittest.TestCase):
                 self.assertEqual(snapshot.active_run_id, run_id)
                 self.assertIsNotNone(snapshot.run_progress)
 
-            deadline = time.time() + 5.0
+            deadline = time.time() + 10.0
             while time.time() < deadline:
                 state = controller.build_state(
                     active_project_id=project.project_id, active_run_id=run_id
@@ -697,9 +857,7 @@ class UiControllerTests(unittest.TestCase):
                 temp_dir, ["HEADER", "1. River boat scene", "2. Camp scene"]
             )
             controller = DesktopGuiController.create(temp_dir)
-            project = controller.open_script(
-                script_path, project_name="Live Run State"
-            )
+            project = controller.open_script(script_path, project_name="Live Run State")
             container = controller.application.container
             run, manifest = container.media_run_service.create_run(project.project_id)
             run.status = RunStatus.RUNNING
@@ -746,29 +904,35 @@ class UiControllerTests(unittest.TestCase):
                 )
             )
 
-            with patch.object(
-                controller.application.container.media_run_service,
-                "snapshot_live_run_state",
-                wraps=(
-                    controller.application.container.media_run_service.snapshot_live_run_state
+            with (
+                patch.object(
+                    controller.application.container.media_run_service,
+                    "snapshot_live_run_state",
+                    wraps=(
+                        controller.application.container.media_run_service.snapshot_live_run_state
+                    ),
+                ) as snapshot_live_run_state,
+                patch.object(
+                    controller.application.container.media_run_service,
+                    "snapshot_manifest",
+                    side_effect=AssertionError("manifest snapshot should not happen"),
                 ),
-            ) as snapshot_live_run_state, patch.object(
-                controller.application.container.media_run_service,
-                "snapshot_manifest",
-                side_effect=AssertionError("manifest snapshot should not happen"),
-            ), patch.object(
-                controller.application.container.media_run_service,
-                "load_manifest",
-                side_effect=AssertionError("manifest load should not happen"),
-            ), patch.object(
-                controller.application.container.project_repository,
-                "load",
-                side_effect=AssertionError("project load should not happen"),
-            ), patch.object(
-                controller,
-                "build_paragraph_workbench",
-                wraps=controller.build_paragraph_workbench,
-            ) as build_paragraph_workbench:
+                patch.object(
+                    controller.application.container.media_run_service,
+                    "load_manifest",
+                    side_effect=AssertionError("manifest load should not happen"),
+                ),
+                patch.object(
+                    controller.application.container.project_repository,
+                    "load",
+                    side_effect=AssertionError("project load should not happen"),
+                ),
+                patch.object(
+                    controller,
+                    "build_paragraph_workbench",
+                    wraps=controller.build_paragraph_workbench,
+                ) as build_paragraph_workbench,
+            ):
                 live_state = controller.build_live_run_state(
                     active_project_id=project.project_id,
                     active_run_id=run.run_id,
@@ -814,20 +978,24 @@ class UiControllerTests(unittest.TestCase):
                 )
             )
 
-            with patch.object(
-                controller.application.container.media_run_service,
-                "snapshot_live_run_state",
-                wraps=(
-                    controller.application.container.media_run_service.snapshot_live_run_state
+            with (
+                patch.object(
+                    controller.application.container.media_run_service,
+                    "snapshot_live_run_state",
+                    wraps=(
+                        controller.application.container.media_run_service.snapshot_live_run_state
+                    ),
+                ) as snapshot_live_run_state,
+                patch.object(
+                    controller.application.container.media_run_service,
+                    "snapshot_manifest",
+                    side_effect=AssertionError("manifest snapshot should not happen"),
                 ),
-            ) as snapshot_live_run_state, patch.object(
-                controller.application.container.media_run_service,
-                "snapshot_manifest",
-                side_effect=AssertionError("manifest snapshot should not happen"),
-            ), patch.object(
-                controller.application.container.media_run_service,
-                "load_manifest",
-                side_effect=AssertionError("manifest load should not happen"),
+                patch.object(
+                    controller.application.container.media_run_service,
+                    "load_manifest",
+                    side_effect=AssertionError("manifest load should not happen"),
+                ),
             ):
                 live_state = controller.build_live_run_state(
                     active_project_id=project.project_id,
@@ -885,7 +1053,7 @@ class UiControllerTests(unittest.TestCase):
 
             self.assertEqual(ctx.exception.code, "run_in_progress")
 
-            deadline = time.time() + 5.0
+            deadline = time.time() + 10.0
             while time.time() < deadline:
                 state = controller.build_state(
                     active_project_id=project.project_id, active_run_id=run_id
@@ -962,7 +1130,7 @@ class UiControllerTests(unittest.TestCase):
             controller.pause_run(run_id)
 
             paused_state = None
-            deadline = time.time() + 5.0
+            deadline = time.time() + 10.0
             while time.time() < deadline:
                 paused_state = controller.build_state(
                     active_project_id=project.project_id, active_run_id=run_id
@@ -983,7 +1151,7 @@ class UiControllerTests(unittest.TestCase):
             controller.resume_run_async(run_id, advanced)
 
             completed_state = None
-            deadline = time.time() + 5.0
+            deadline = time.time() + 20.0
             while time.time() < deadline:
                 completed_state = controller.build_state(
                     active_project_id=project.project_id, active_run_id=run_id

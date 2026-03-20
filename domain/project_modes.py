@@ -6,12 +6,8 @@ DEFAULT_FREE_IMAGE_PROVIDER_IDS: tuple[str, ...] = (
     "pexels",
     "pixabay",
     "openverse",
-    "wikimedia",
 )
-OPT_IN_FREE_IMAGE_PROVIDER_IDS: tuple[str, ...] = ("bing",)
-ALL_FREE_IMAGE_PROVIDER_IDS: tuple[str, ...] = (
-    DEFAULT_FREE_IMAGE_PROVIDER_IDS + OPT_IN_FREE_IMAGE_PROVIDER_IDS
-)
+ALL_FREE_IMAGE_PROVIDER_IDS: tuple[str, ...] = DEFAULT_FREE_IMAGE_PROVIDER_IDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +138,6 @@ def provider_ids_for_mode(
     mode_id: str,
     *,
     free_image_provider_ids: list[str] | tuple[str, ...] | None = None,
-    allow_generic_web_image: bool = False,
 ) -> list[str]:
     definition = get_project_mode(mode_id)
     provider_ids: list[str] = []
@@ -155,7 +150,5 @@ def provider_ids_for_mode(
             free_image_provider_ids
         ) or list(DEFAULT_FREE_IMAGE_PROVIDER_IDS)
         for provider_id in selected_free:
-            if provider_id == "bing" and not allow_generic_web_image:
-                continue
             provider_ids.append(provider_id)
     return list(dict.fromkeys(provider_ids))

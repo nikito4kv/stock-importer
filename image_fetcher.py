@@ -1,16 +1,13 @@
 import argparse
 import hashlib
-import importlib
 import io
 import json
 import logging
 import os
 import random
 import re
-import sys
 import threading
 import time
-import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,12 +26,10 @@ from legacy_core.files import build_run_dir as shared_build_run_dir
 from legacy_core.files import (
     resolve_output_json_path as shared_resolve_output_json_path,
 )
-from legacy_core.image_providers import BingProvider as SharedBingProvider
 from legacy_core.image_providers import OpenverseProvider as SharedOpenverseProvider
 from legacy_core.image_providers import PexelsProvider as SharedPexelsProvider
 from legacy_core.image_providers import PixabayProvider as SharedPixabayProvider
 from legacy_core.image_providers import SearchCandidate as SharedSearchCandidate
-from legacy_core.image_providers import WikimediaProvider as SharedWikimediaProvider
 from legacy_core.keyword_payload import (
     extract_paragraph_tasks as shared_extract_paragraph_tasks,
 )
@@ -95,7 +90,7 @@ DEFAULT_KEYWORDS_JSON = "output/paragraph_intents.json"
 DEFAULT_OUTPUT_JSON = "output/keyword_images.json"
 DEFAULT_IMAGES_DIR = "output/images"
 DEFAULT_RUN_PREFIX = "run"
-DEFAULT_SOURCES = "pexels,pixabay,openverse,wikimedia"
+DEFAULT_SOURCES = "pexels,pixabay,openverse"
 
 DEFAULT_IMAGES_PER_KEYWORD = 2
 DEFAULT_MAX_CANDIDATES_PER_KEYWORD = 90
@@ -165,83 +160,6 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _install_imghdr_compat() -> None:
-    if "imghdr" in sys.modules:
-        return
-
-    module = types.ModuleType("imghdr")
-
-    def what(file: Any = None, h: bytes | None = None) -> str | None:
-        data = h
-        if data is None and file is not None:
-            try:
-                reader = getattr(file, "read", None)
-                if callable(reader):
-                    teller = getattr(file, "tell", None)
-                    seeker = getattr(file, "seek", None)
-                    cursor = teller() if callable(teller) else None
-                    data = reader(64)
-                    if cursor is not None and callable(seeker):
-                        seeker(cursor)
-                else:
-                    with open(str(file), "rb") as fp:
-                        data = fp.read(64)
-            except OSError:
-                return None
-
-        if isinstance(data, bytearray):
-            data = bytes(data)
-        if not isinstance(data, bytes) or not data:
-            return None
-
-        if data.startswith(b"\xff\xd8\xff"):
-            return "jpeg"
-        if data.startswith(b"\x89PNG\r\n\x1a\n"):
-            return "png"
-        if data[:6] in {b"GIF87a", b"GIF89a"}:
-            return "gif"
-        if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
-            return "webp"
-        if data.startswith(b"BM"):
-            return "bmp"
-        if data[:4] in {b"II*\x00", b"MM\x00*"}:
-            return "tiff"
-
-        return None
-
-    module.what = what
-    sys.modules["imghdr"] = module
-
-
-def _load_bing_search_func() -> tuple[Any | None, Exception | None]:
-    try:
-        module = importlib.import_module("bing_image_urls")
-        func = getattr(module, "bing_image_urls", None)
-        if callable(func):
-            return func, None
-        return None, RuntimeError("bing_image_urls.bing_image_urls is not callable")
-    except ModuleNotFoundError as exc:
-        if exc.name == "imghdr":
-            _install_imghdr_compat()
-            try:
-                module = importlib.import_module("bing_image_urls")
-                func = getattr(module, "bing_image_urls", None)
-                if callable(func):
-                    return func, None
-                return (
-                    None,
-                    RuntimeError("bing_image_urls.bing_image_urls is not callable"),
-                )
-            except Exception as inner_exc:
-                return None, inner_exc
-        return None, exc
-    except Exception as exc:
-        return None, exc
-
-
-BING_SEARCH_FUNC, BING_IMPORT_ERROR = _load_bing_search_func()
-
-
 def get_env_path() -> Path:
     return shared_get_env_path(__file__, env_filename=ENV_FILENAME)
 
@@ -255,10 +173,6 @@ def _ensure_runtime_dependencies() -> None:
         raise RuntimeError(
             "Pillow is required for image validation. Install it with: pip install pillow"
         )
-    if not callable(BING_SEARCH_FUNC):
-        raise RuntimeError(
-            "bing-image-urls is required. Install it with: pip install bing-image-urls"
-        ) from BING_IMPORT_ERROR
     ensure_gemini_sdk_available()
 
 
@@ -347,17 +261,8 @@ class OpenverseProvider(SharedOpenverseProvider):
         super().__init__(timeout_seconds=timeout_seconds, user_agent=USER_AGENT)
 
 
-class WikimediaProvider(SharedWikimediaProvider):
-    def __init__(self, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS):
-        super().__init__(timeout_seconds=timeout_seconds, user_agent=USER_AGENT)
-
-
-class BingProvider(SharedBingProvider):
-    pass
-
-
 def _parse_sources(value: str) -> list[str]:
-    return shared_parse_sources(value, default_sources=["openverse", "wikimedia"])
+    return shared_parse_sources(value, default_sources=["openverse"])
 
 
 def _configure_image_provider_search_service(cache_root: str | Path) -> ImageProviderSearchService:
@@ -395,8 +300,6 @@ def _build_providers(
             pexels_api_key=os.getenv(ENV_PEXELS_API_KEY, "").strip(),
             pixabay_api_key=os.getenv(ENV_PIXABAY_API_KEY, "").strip(),
             logger=logger,
-            allow_generic_web_image=("bing" in source_names),
-            free_images_only=True,
         ),
     )
     if not providers:
@@ -1363,7 +1266,6 @@ def run_image_fetch(
             "provider_strategy": {
                 "free_images_only": True,
                 "mixed_mode_fallback_ready": True,
-                "generic_web_image_opt_in": "bing" in provider_chain,
             },
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "summary": {

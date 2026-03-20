@@ -3,13 +3,19 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from docx import Document
 
 from app.bootstrap import bootstrap_application
 from app.runtime import DesktopApplication
+from config.settings import SUPPORTED_DESKTOP_STACK
 from domain.enums import RunStatus, SessionHealth
 from domain.models import AssetSelection, ParagraphUnit, Preset
+from storage.repositories import SettingsRepository
+from storage.serialization import read_json, write_json
+from storage.workspace import WorkspaceStorage
 
 
 def _write_docx(directory: str, paragraphs: list[str]) -> Path:
@@ -60,6 +66,7 @@ class Phase2ArchitectureTests(unittest.TestCase):
             preset = Preset(
                 name="fast-lane",
                 settings_snapshot={
+                    "desktop_stack": "tk",
                     "concurrency": {"paragraph_workers": 5, "queue_size": 3},
                     "browser": {"slow_mode": False, "action_delay_ms": 250},
                 },
@@ -73,12 +80,50 @@ class Phase2ArchitectureTests(unittest.TestCase):
             self.assertEqual(applied.concurrency.queue_size, 3)
             self.assertFalse(applied.browser.slow_mode)
             self.assertEqual(applied.browser.action_delay_ms, 250)
-            self.assertEqual(applied.desktop_stack, container.settings.desktop_stack)
+            self.assertEqual(applied.desktop_stack, SUPPORTED_DESKTOP_STACK)
 
             container.settings_manager.set_secret("gemini_test", "secret-value")
             self.assertEqual(
                 container.settings_manager.get_secret("gemini_test"), "secret-value"
             )
+
+    def test_settings_repository_normalizes_legacy_desktop_stack(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = WorkspaceStorage(temp_dir).initialize()
+            repository = SettingsRepository(paths)
+            settings_path = paths.config_dir / "settings.json"
+            write_json(settings_path, {"desktop_stack": "tk"})
+
+            settings = repository.load()
+            repository.save(settings)
+            persisted = read_json(settings_path)
+
+            self.assertEqual(settings.desktop_stack, SUPPORTED_DESKTOP_STACK)
+            self.assertEqual(persisted.get("desktop_stack"), SUPPORTED_DESKTOP_STACK)
+
+    def test_desktop_launch_uses_qt_only_path(self) -> None:
+        import ui
+
+        launched: list[object] = []
+        controller = object()
+        with patch(
+            "ui.import_module",
+            return_value=SimpleNamespace(launch_pyside_app=launched.append),
+        ) as import_module_mock:
+            ui.launch_desktop_app(controller)
+
+        import_module_mock.assert_called_once_with("ui.qt_app")
+        self.assertEqual(launched, [controller])
+
+    def test_desktop_launch_raises_clear_error_when_pyside6_missing(self) -> None:
+        import ui
+
+        missing_qt = ModuleNotFoundError("No module named 'PySide6'")
+        missing_qt.name = "PySide6"
+
+        with patch("ui.import_module", side_effect=missing_qt):
+            with self.assertRaisesRegex(RuntimeError, "PySide6 is required"):
+                ui.launch_desktop_app(object())
 
     def test_browser_profile_registry_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

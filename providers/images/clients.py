@@ -5,9 +5,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from legacy_core.image_providers import (
-    BingProvider as LegacyBingProvider,
-)
-from legacy_core.image_providers import (
     OpenverseProvider as LegacyOpenverseProvider,
 )
 from legacy_core.image_providers import (
@@ -18,9 +15,6 @@ from legacy_core.image_providers import (
 )
 from legacy_core.image_providers import (
     SearchCandidate,
-)
-from legacy_core.image_providers import (
-    WikimediaProvider as LegacyWikimediaProvider,
 )
 
 from ..base import ProviderDescriptor
@@ -48,8 +42,6 @@ class ImageProviderBuildContext:
     pexels_api_key: str = ""
     pixabay_api_key: str = ""
     logger: Any | None = None
-    allow_generic_web_image: bool = False
-    free_images_only: bool = False
 
 
 @dataclass(slots=True)
@@ -91,15 +83,15 @@ def build_image_provider_clients(
             if context.logger is not None:
                 context.logger.warning("Unknown image provider '%s' skipped", provider_id)
             continue
-        if descriptor.provider_group == "storyblocks_images" and context.free_images_only:
-            continue
-        if descriptor.provider_group == "generic_web_image" and not context.allow_generic_web_image:
-            continue
         client = _build_single_provider(descriptor, context)
         if client is not None:
-            providers.append(WrappedImageSearchProvider(provider_id=provider_id, descriptor=descriptor, client=client))
-
-    providers.sort(key=lambda item: (-item.descriptor.priority, item.provider_id))
+            providers.append(
+                WrappedImageSearchProvider(
+                    provider_id=provider_id,
+                    descriptor=descriptor,
+                    client=client,
+                )
+            )
     return providers
 
 
@@ -133,20 +125,20 @@ def _build_single_provider(
                 timeout_seconds=context.timeout_seconds,
                 user_agent=context.user_agent,
             )
-        if descriptor.provider_id == "wikimedia":
-            return LegacyWikimediaProvider(
-                timeout_seconds=context.timeout_seconds,
-                user_agent=context.user_agent,
-            )
-        if descriptor.provider_id == "bing":
-            return LegacyBingProvider(adult_filter_off=context.adult_filter_off)
     except Exception as exc:
         if context.logger is not None:
-            context.logger.warning("Image provider '%s' unavailable: %s", descriptor.provider_id, exc)
+            context.logger.warning(
+                "Image provider '%s' unavailable: %s",
+                descriptor.provider_id,
+                exc,
+            )
         return None
 
     if context.logger is not None:
-        context.logger.warning("Image provider '%s' is not supported by the legacy free-image pipeline", descriptor.provider_id)
+        context.logger.warning(
+            "Image provider '%s' is not supported by the legacy free-image pipeline",
+            descriptor.provider_id,
+        )
     return None
 
 

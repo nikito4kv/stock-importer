@@ -45,7 +45,7 @@ def _extract_queries_from_item(raw_item: dict[str, object], *, query_kind: str) 
         raw_provider_queries = query_bundle.get("provider_queries")
         if isinstance(raw_provider_queries, dict):
             preferred_provider_keys = (
-                ["storyblocks_image", "free_image", "generic_web_image"]
+                ["storyblocks_image", "free_image"]
                 if query_kind == "image"
                 else ["storyblocks_video"]
             )

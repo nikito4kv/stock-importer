@@ -924,21 +924,11 @@ class ParagraphIntentService:
             queries.extend(intent.translated_queries)
         return _unique_strings(queries)[: QUERY_LIMITS[strictness]]
 
-    def _build_generic_web_image_queries(
-        self, intent: ParagraphIntent, *, strictness: str
-    ) -> list[str]:
-        queries = self._build_free_image_queries(intent, strictness=strictness)
-        if intent.translated_queries:
-            queries.extend(intent.translated_queries)
-        queries = [_append_photo_hint(query) for query in queries]
-        return _unique_strings(queries)[: QUERY_LIMITS[strictness]]
-
     def build_query_bundle(
         self,
         intent: ParagraphIntent,
         *,
         strictness: str,
-        include_generic_web_image: bool = False,
     ) -> QueryBundle:
         strictness_value = self._validate_strictness(strictness)
         storyblocks_video = self._build_storyblocks_video_queries(
@@ -954,13 +944,6 @@ class ParagraphIntentService:
             "storyblocks_image": storyblocks_image,
             "free_image": free_image,
         }
-        if include_generic_web_image:
-            provider_queries["generic_web_image"] = (
-                self._build_generic_web_image_queries(
-                    intent,
-                    strictness=strictness_value,
-                )
-            )
 
         image_queries = _unique_strings(storyblocks_image + free_image)
         return QueryBundle(
@@ -975,7 +958,6 @@ class ParagraphIntentService:
         paragraph_no: int,
         paragraph_text: str,
         strictness: str = DEFAULT_STRICTNESS,
-        include_generic_web_image: bool = False,
     ) -> tuple[ParagraphIntent, QueryBundle]:
         strictness_value = self._validate_strictness(strictness)
         subject, action, setting = _derive_subject_action_setting(paragraph_text)
@@ -1006,7 +988,6 @@ class ParagraphIntentService:
         query_bundle = self.build_query_bundle(
             intent,
             strictness=strictness_value,
-            include_generic_web_image=include_generic_web_image,
         )
         return self._limit_intent_and_bundle_query_words(intent, query_bundle)
 
@@ -1015,7 +996,6 @@ class ParagraphIntentService:
         document: ScriptDocument,
         *,
         strictness: str = DEFAULT_STRICTNESS,
-        include_generic_web_image: bool = False,
     ) -> ScriptDocument:
         strictness_value = self._validate_strictness(strictness)
         for paragraph in document.paragraphs:
@@ -1025,7 +1005,6 @@ class ParagraphIntentService:
                 paragraph_no=paragraph.paragraph_no,
                 paragraph_text=paragraph.text,
                 strictness=strictness_value,
-                include_generic_web_image=include_generic_web_image,
             )
             paragraph.intent = intent
             paragraph.query_bundle = query_bundle
@@ -1039,7 +1018,6 @@ class ParagraphIntentService:
         paragraph_text: str,
         strictness: str = DEFAULT_STRICTNESS,
         format_retries: int = 2,
-        include_generic_web_image: bool = False,
         manual_prompt: str = "",
         full_script_context: str = "",
     ) -> tuple[ParagraphIntent, QueryBundle]:
@@ -1049,7 +1027,6 @@ class ParagraphIntentService:
             paragraph_text=paragraph_text,
             strictness=strictness,
             format_retries=format_retries,
-            include_generic_web_image=include_generic_web_image,
             manual_prompt=manual_prompt,
             full_script_context=full_script_context,
         )
@@ -1063,7 +1040,6 @@ class ParagraphIntentService:
         paragraph_text: str,
         strictness: str = DEFAULT_STRICTNESS,
         format_retries: int = 2,
-        include_generic_web_image: bool = False,
         manual_prompt: str = "",
         full_script_context: str = "",
     ) -> tuple[ParagraphIntent, QueryBundle, dict[str, int]]:
@@ -1097,7 +1073,6 @@ class ParagraphIntentService:
                 query_bundle = self.build_query_bundle(
                     intent,
                     strictness=strictness_value,
-                    include_generic_web_image=include_generic_web_image,
                 )
                 parse_normalize_ms += _elapsed_ms(parse_started_at)
                 intent, query_bundle = self._limit_intent_and_bundle_query_words(
@@ -1168,7 +1143,6 @@ class ParagraphIntentService:
         fail_fast: bool = False,
         max_workers: int = 4,
         start_jitter_seconds: float = 0.15,
-        include_generic_web_image: bool = False,
         manual_prompt: str = "",
         full_script_context: str = "",
     ) -> tuple[dict[int, ParagraphIntent], list[dict[str, object]], ScriptDocument]:
@@ -1200,7 +1174,6 @@ class ParagraphIntentService:
                         paragraph_no=current.paragraph_no,
                         paragraph_text=current.text,
                         strictness=strictness_value,
-                        include_generic_web_image=include_generic_web_image,
                         manual_prompt=manual_prompt,
                         full_script_context=full_script_context,
                     )
@@ -1334,7 +1307,6 @@ class ParagraphIntentService:
         *,
         model_name: str,
         strictness: str,
-        include_generic_web_image: bool,
     ) -> dict[str, object]:
         strictness_value = self._validate_strictness(strictness)
         intents_by_paragraph: dict[str, dict[str, object]] = {}
@@ -1356,7 +1328,6 @@ class ParagraphIntentService:
             "paragraphs_total": len(items),
             "model_name": model_name,
             "strictness": strictness_value,
-            "include_generic_web_image": include_generic_web_image,
             "generated_at_utc": utc_now().isoformat(),
             "validation": {
                 "is_valid": not bool(document.numbering_issues),
@@ -1375,7 +1346,6 @@ class ParagraphIntentService:
         output_path: str | Path = DEFAULT_OUTPUT_JSON,
         model_name: str,
         strictness: str = DEFAULT_STRICTNESS,
-        include_generic_web_image: bool = False,
     ) -> Path:
         out = Path(output_path)
         if str(out.parent) in ("", "."):
@@ -1389,7 +1359,6 @@ class ParagraphIntentService:
             items,
             model_name=model_name,
             strictness=strictness,
-            include_generic_web_image=include_generic_web_image,
         )
         out.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1404,7 +1373,6 @@ class ParagraphIntentService:
         intent: ParagraphIntent | None = None,
         query_bundle: QueryBundle | None = None,
         strictness: str = DEFAULT_STRICTNESS,
-        include_generic_web_image: bool = False,
     ) -> ParagraphUnit:
         strictness_value = self._validate_strictness(strictness)
         if text is not None:
@@ -1421,6 +1389,5 @@ class ParagraphIntentService:
             paragraph.query_bundle = self.build_query_bundle(
                 paragraph.intent,
                 strictness=strictness_value,
-                include_generic_web_image=include_generic_web_image,
             )
         return paragraph

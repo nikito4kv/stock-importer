@@ -193,8 +193,8 @@ class UiQuickLaunchSettingsViewModel:
     paragraph_selection_text: str = ""
     selected_paragraphs: list[int] = field(default_factory=list)
     mode_id: str = "sb_video_only"
+    launch_profile_id: str = "normal"
     strictness: str = "balanced"
-    slow_mode: bool = True
     provider_ids: list[str] = field(default_factory=list)
     supporting_image_limit: int = 1
     fallback_image_limit: int = 1
@@ -204,28 +204,10 @@ class UiQuickLaunchSettingsViewModel:
 
 @dataclass(slots=True)
 class UiAdvancedSettingsViewModel:
-    paragraph_workers: int = 1
-    provider_workers: int = 4
-    provider_queue_size: int = 8
-    download_workers: int = 4
-    download_queue_size: int = 8
-    relevance_workers: int = 2
-    relevance_queue_size: int = 8
-    queue_size: int = 8
-    search_timeout_seconds: float = 20.0
-    relevance_timeout_seconds: float = 10.0
+    action_delay_ms: int = 900
     launch_timeout_ms: int = 45000
     navigation_timeout_ms: int = 30000
     downloads_timeout_seconds: float = 120.0
-    top_k_to_relevance: int = 24
-    retry_budget: int = 2
-    early_stop_quality_threshold: float = 8.0
-    fail_fast_storyblocks_errors: bool = True
-    cache_root: str = ""
-    browser_profile_path: str = ""
-    allow_generic_web_image: bool = False
-    no_match_budget_seconds: float = 20.0
-    full_script_context_char_budget: int = 12000
 
 
 @dataclass(slots=True)

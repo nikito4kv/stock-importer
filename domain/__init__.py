@@ -27,7 +27,6 @@ from .models import (
 from .project_modes import (
     ALL_FREE_IMAGE_PROVIDER_IDS,
     DEFAULT_FREE_IMAGE_PROVIDER_IDS,
-    OPT_IN_FREE_IMAGE_PROVIDER_IDS,
     ProjectModeDefinition,
     get_project_mode,
     infer_project_mode,
@@ -63,7 +62,6 @@ __all__ = [
     "SessionHealth",
     "ALL_FREE_IMAGE_PROVIDER_IDS",
     "DEFAULT_FREE_IMAGE_PROVIDER_IDS",
-    "OPT_IN_FREE_IMAGE_PROVIDER_IDS",
     "get_project_mode",
     "infer_project_mode",
     "list_project_modes",

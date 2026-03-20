@@ -25,16 +25,16 @@ class ImageQueryPlanner:
         paragraph_text: str,
     ) -> ProviderQueryPlan:
         normalized = self.normalize(query)
-        suffixes = self._suffixes_for(descriptor)
-        variants = shared_build_query_variants(normalized, paragraph_text, short_suffixes=suffixes)
-        if descriptor.provider_group == "storyblocks_images":
+        suffixes = self._suffixes_for(descriptor.provider_id)
+        variants = shared_build_query_variants(
+            normalized,
+            paragraph_text,
+            short_suffixes=suffixes,
+        )
+        if descriptor.provider_id == "storyblocks_image":
             variants = [normalized, f"{normalized} cinematic"] + variants
-        elif descriptor.provider_group == "free_stock_api":
+        else:
             variants = [normalized, f"{normalized} photo"] + variants
-        elif descriptor.provider_group == "open_license_repository":
-            variants = [normalized, f"{normalized} photograph"] + variants
-        elif descriptor.provider_group == "generic_web_image":
-            variants = [f"{normalized} photo", f"{normalized} realistic"] + variants
 
         unique: list[str] = []
         seen: set[str] = set()
@@ -49,16 +49,10 @@ class ImageQueryPlanner:
             unique.append(current)
         return ProviderQueryPlan(provider_id=descriptor.provider_id, queries=unique)
 
-    def _suffixes_for(self, descriptor: ProviderDescriptor) -> tuple[str, ...]:
-        if descriptor.provider_group == "storyblocks_images":
+    def _suffixes_for(self, provider_id: str) -> tuple[str, ...]:
+        if provider_id == "storyblocks_image":
             return ("cinematic", "stock")
-        if descriptor.provider_group == "free_stock_api":
-            return ("photo", "realistic")
-        if descriptor.provider_group == "open_license_repository":
-            return ("photo", "documentary")
-        if descriptor.provider_group == "generic_web_image":
-            return ("photo", "reference")
-        return ("photo",)
+        return ("photo", "realistic")
 
 
 __all__ = ["ImageQueryPlanner", "ProviderQueryPlan"]

@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Callable
+
 from .contracts import (
     UiAdvancedSettingsViewModel,
     UiAssetPreview,
@@ -13,23 +18,35 @@ from .contracts import (
     UiStateViewModel,
 )
 from .controller import DesktopGuiController, handle_ui_error
-from .tk_app import DesktopTkApp, launch_tk_app
+from .launch_profiles import (
+    LaunchProfileCustomTiming,
+    LaunchProfileId,
+    ResolvedLaunchProfile,
+)
+
+
+def _load_qt_launcher() -> Callable[[DesktopGuiController], None]:
+    try:
+        module = import_module("ui.qt_app")
+    except ModuleNotFoundError as exc:
+        missing_name = str(getattr(exc, "name", "") or "")
+        if missing_name == "PySide6" or missing_name.startswith("PySide6."):
+            raise RuntimeError(
+                "PySide6 is required to launch the desktop UI. "
+                "Install PySide6 and retry."
+            ) from exc
+        raise
+    return module.launch_pyside_app
 
 
 def launch_desktop_app(controller: DesktopGuiController) -> None:
-    try:
-        from .qt_app import launch_pyside_app
-    except ModuleNotFoundError as exc:
-        if not str(getattr(exc, "name", "")).startswith("PySide6"):
-            raise
-        launch_tk_app(controller)
-        return
-    launch_pyside_app(controller)
+    _load_qt_launcher()(controller)
 
 
 __all__ = [
     "DesktopGuiController",
-    "DesktopTkApp",
+    "LaunchProfileCustomTiming",
+    "LaunchProfileId",
     "UiAdvancedSettingsViewModel",
     "UiAssetPreview",
     "UiErrorPayload",
@@ -42,7 +59,7 @@ __all__ = [
     "UiRunPreviewViewModel",
     "UiSessionPanelViewModel",
     "UiStateViewModel",
+    "ResolvedLaunchProfile",
     "handle_ui_error",
     "launch_desktop_app",
-    "launch_tk_app",
 ]

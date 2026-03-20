@@ -9,13 +9,16 @@ from services.errors import AppError
 
 from .contracts import UiAdvancedSettingsViewModel, UiQuickLaunchSettingsViewModel
 from .controller import DesktopGuiController, handle_ui_error
+from .launch_profiles import list_launch_profile_ids
 from .polling import TERMINAL_RUN_STATUSES, plan_poll_refresh
 from .presentation import (
     STRICTNESS_LABELS,
     THEME_LABELS,
     get_ui_theme,
+    label_for_launch_profile,
     label_for_strictness,
     label_for_theme,
+    launch_profile_value_from_label,
     normalize_ui_theme,
     translate_asset_role,
     translate_paragraph_status,
@@ -41,6 +44,14 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         }
         self._strictness_ids_by_label = {
             label_for_strictness(value): value for value in STRICTNESS_LABELS
+        }
+        self._launch_profile_ids_by_label = {
+            label_for_launch_profile(value): value
+            for value in list_launch_profile_ids()
+        }
+        self._launch_profile_labels = {
+            value: label_for_launch_profile(value)
+            for value in list_launch_profile_ids()
         }
         self._theme_ids_by_label = {
             label_for_theme(value): value for value in THEME_LABELS
@@ -130,12 +141,20 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         self.script_path_edit = QtWidgets.QLineEdit()
         self.output_dir_edit = QtWidgets.QLineEdit()
         self.mode_combo = QtWidgets.QComboBox()
+        self.launch_profile_combo = QtWidgets.QComboBox()
         self.script_path_edit.setMinimumWidth(620)
         self.output_dir_edit.setMinimumWidth(620)
         self.mode_combo.setMinimumWidth(420)
+        self.launch_profile_combo.setMinimumWidth(220)
         self.mode_combo.addItems([item.label for item in self._mode_definitions])
         self.mode_combo.currentTextChanged.connect(
             lambda _value: self.refresh_preview()
+        )
+        self.launch_profile_combo.addItems(
+            [self._launch_profile_labels[item] for item in list_launch_profile_ids()]
+        )
+        self.launch_profile_combo.currentTextChanged.connect(
+            lambda _value: self._sync_custom_timing_visibility()
         )
         self.mode_combo.setMinimumContentsLength(28)
         self.project_name_edit.setPlaceholderText("Необязательно")
@@ -165,6 +184,9 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         row_index += 1
         launch_layout.addWidget(QtWidgets.QLabel("Режим проекта"), row_index, 0)
         launch_layout.addWidget(self.mode_combo, row_index, 1)
+        row_index += 1
+        launch_layout.addWidget(QtWidgets.QLabel("Профиль запуска"), row_index, 0)
+        launch_layout.addWidget(self.launch_profile_combo, row_index, 1)
         row_index += 1
         self.paragraph_selection_edit = QtWidgets.QLineEdit()
         self.paragraph_selection_edit.setPlaceholderText("Например: 5..end, 8-12")
@@ -278,30 +300,12 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         tabs.addTab(tab, "Эксперт")
         layout = QtWidgets.QVBoxLayout(tab)
 
-        self.paragraph_workers_spin = _spin_box(1, 64, 1)
-        self.provider_workers_spin = _spin_box(1, 64, 4)
-        self.download_workers_spin = _spin_box(1, 64, 4)
-        self.relevance_workers_spin = _spin_box(1, 64, 2)
-        self.queue_size_spin = _spin_box(1, 128, 8)
+        self.action_delay_spin = _spin_box(0, 60000, 900)
         self.launch_timeout_spin = _spin_box(1000, 300000, 45000)
         self.navigation_timeout_spin = _spin_box(1000, 300000, 30000)
         self.download_timeout_spin = QtWidgets.QDoubleSpinBox()
         self.download_timeout_spin.setRange(1.0, 3600.0)
         self.download_timeout_spin.setValue(120.0)
-        self.no_match_budget_spin = QtWidgets.QDoubleSpinBox()
-        self.no_match_budget_spin.setRange(0.0, 3600.0)
-        self.no_match_budget_spin.setValue(20.0)
-        self.top_k_spin = _spin_box(1, 256, 24)
-        self.retry_budget_spin = _spin_box(0, 32, 2)
-        self.full_script_context_budget_spin = _spin_box(1000, 50000, 12000)
-        self.cache_root_edit = QtWidgets.QLineEdit()
-        self.browser_profile_edit = QtWidgets.QLineEdit()
-        self.allow_generic_checkbox = QtWidgets.QCheckBox(
-            "Разрешить обычный веб-поиск изображений"
-        )
-        self.allow_generic_checkbox.toggled.connect(
-            lambda _checked: self.refresh_preview()
-        )
         self.strictness_combo = QtWidgets.QComboBox()
         self.strictness_combo.addItems(
             [label_for_strictness(item) for item in STRICTNESS_LABELS]
@@ -309,15 +313,23 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         self.strictness_combo.currentTextChanged.connect(
             lambda _value: self.refresh_preview()
         )
-        self.slow_mode_checkbox = QtWidgets.QCheckBox("Медленный режим браузера")
-        self.slow_mode_checkbox.toggled.connect(lambda _checked: self.refresh_preview())
         self.free_provider_checks: dict[str, QtWidgets.QCheckBox] = {}
+        self.action_delay_spin.valueChanged.connect(
+            lambda _value: self.refresh_preview()
+        )
+        self.launch_timeout_spin.valueChanged.connect(
+            lambda _value: self.refresh_preview()
+        )
+        self.navigation_timeout_spin.valueChanged.connect(
+            lambda _value: self.refresh_preview()
+        )
+        self.download_timeout_spin.valueChanged.connect(
+            lambda _value: self.refresh_preview()
+        )
 
         behavior_box = QtWidgets.QGroupBox("Поведение запуска")
         behavior_form = QtWidgets.QFormLayout(behavior_box)
-        behavior_form.addRow("Строгость", self.strictness_combo)
-        behavior_form.addRow(self.slow_mode_checkbox)
-        behavior_form.addRow(self.allow_generic_checkbox)
+        behavior_form.addRow("Строгость AI-анализа", self.strictness_combo)
         layout.addWidget(behavior_box)
 
         provider_box = QtWidgets.QGroupBox("Источники бесплатных изображений")
@@ -331,8 +343,6 @@ class DesktopQtApp(QtWidgets.QMainWindow):
             ("pexels", "Pexels"),
             ("pixabay", "Pixabay"),
             ("openverse", "Openverse"),
-            ("wikimedia", "Wikimedia Commons"),
-            ("bing", "Bing (обычные веб-изображения)"),
         ):
             checkbox = QtWidgets.QCheckBox(label)
             checkbox.toggled.connect(lambda _checked, self=self: self.refresh_preview())
@@ -361,27 +371,15 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         presets_layout.addLayout(preset_buttons)
         layout.addWidget(presets_box)
 
-        technical_box = QtWidgets.QGroupBox("Технические параметры")
-        technical_form = QtWidgets.QFormLayout(technical_box)
-        technical_form.addRow("Потоки абзацев", self.paragraph_workers_spin)
-        technical_form.addRow("Потоки провайдеров", self.provider_workers_spin)
-        technical_form.addRow("Потоки скачивания", self.download_workers_spin)
-        technical_form.addRow("Потоки релевантности", self.relevance_workers_spin)
-        technical_form.addRow("Размер очереди", self.queue_size_spin)
-        technical_form.addRow("Таймаут запуска, мс", self.launch_timeout_spin)
-        technical_form.addRow("Таймаут навигации, мс", self.navigation_timeout_spin)
-        technical_form.addRow("Таймаут скачивания, с", self.download_timeout_spin)
-        technical_form.addRow("Лимит no-match, с", self.no_match_budget_spin)
-        technical_form.addRow("Top-K релевантности", self.top_k_spin)
-        technical_form.addRow("Лимит повторов", self.retry_budget_spin)
-        technical_form.addRow(
-            "Бюджет full-script context",
-            self.full_script_context_budget_spin,
-        )
-        technical_form.addRow("Папка кэша", self.cache_root_edit)
-        technical_form.addRow("Путь к профилю браузера", self.browser_profile_edit)
-        layout.addWidget(technical_box)
+        self.custom_timing_box = QtWidgets.QGroupBox("Custom: задержки и таймауты")
+        custom_form = QtWidgets.QFormLayout(self.custom_timing_box)
+        custom_form.addRow("Задержка действий, мс", self.action_delay_spin)
+        custom_form.addRow("Таймаут запуска, мс", self.launch_timeout_spin)
+        custom_form.addRow("Таймаут навигации, мс", self.navigation_timeout_spin)
+        custom_form.addRow("Таймаут скачивания, с", self.download_timeout_spin)
+        layout.addWidget(self.custom_timing_box)
         layout.addStretch(1)
+        self._sync_custom_timing_visibility()
 
     def _build_session_tab(self, tabs: QtWidgets.QTabWidget) -> None:
         tab = QtWidgets.QWidget()
@@ -475,10 +473,15 @@ class DesktopQtApp(QtWidgets.QMainWindow):
             paragraph_selection_text=self.paragraph_selection_edit.text().strip(),
             selected_paragraphs=[],
             mode_id=selected_mode,
+            launch_profile_id=self._launch_profile_ids_by_label.get(
+                self.launch_profile_combo.currentText().strip(),
+                launch_profile_value_from_label(
+                    self.launch_profile_combo.currentText().strip()
+                ),
+            ),
             strictness=self._strictness_ids_by_label.get(
                 self.strictness_combo.currentText().strip(), "balanced"
             ),
-            slow_mode=self.slow_mode_checkbox.isChecked(),
             provider_ids=provider_ids,
             supporting_image_limit=self.supporting_image_spin.value(),
             fallback_image_limit=self.fallback_image_spin.value(),
@@ -488,32 +491,10 @@ class DesktopQtApp(QtWidgets.QMainWindow):
 
     def _advanced_form(self) -> UiAdvancedSettingsViewModel:
         return UiAdvancedSettingsViewModel(
-            paragraph_workers=self.paragraph_workers_spin.value(),
-            provider_workers=self.provider_workers_spin.value(),
-            provider_queue_size=self.queue_size_spin.value(),
-            download_workers=self.download_workers_spin.value(),
-            download_queue_size=self.queue_size_spin.value(),
-            relevance_workers=self.relevance_workers_spin.value(),
-            relevance_queue_size=self.queue_size_spin.value(),
-            queue_size=self.queue_size_spin.value(),
-            search_timeout_seconds=max(
-                1.0, float(self.navigation_timeout_spin.value()) / 1000.0
-            ),
-            relevance_timeout_seconds=max(
-                1.0, float(self.download_timeout_spin.value()) / 2.0
-            ),
+            action_delay_ms=self.action_delay_spin.value(),
             launch_timeout_ms=self.launch_timeout_spin.value(),
             navigation_timeout_ms=self.navigation_timeout_spin.value(),
             downloads_timeout_seconds=self.download_timeout_spin.value(),
-            top_k_to_relevance=self.top_k_spin.value(),
-            retry_budget=self.retry_budget_spin.value(),
-            early_stop_quality_threshold=float(self.top_k_spin.value()) / 3.0,
-            fail_fast_storyblocks_errors=True,
-            cache_root=self.cache_root_edit.text().strip(),
-            browser_profile_path=self.browser_profile_edit.text().strip(),
-            allow_generic_web_image=self.allow_generic_checkbox.isChecked(),
-            no_match_budget_seconds=self.no_match_budget_spin.value(),
-            full_script_context_char_budget=self.full_script_context_budget_spin.value(),
         )
 
     def refresh(self, *, preserve_forms: bool = False) -> None:
@@ -595,6 +576,18 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         self._fill_paragraph_list(paragraph_items)
         self._render_current_paragraph_detail(paragraph_items)
 
+    def _sync_custom_timing_visibility(self) -> None:
+        if not hasattr(self, "custom_timing_box"):
+            return
+        launch_profile_id = self._launch_profile_ids_by_label.get(
+            self.launch_profile_combo.currentText().strip(),
+            launch_profile_value_from_label(
+                self.launch_profile_combo.currentText().strip()
+            ),
+        )
+        self.custom_timing_box.setVisible(launch_profile_id == "custom")
+        self.refresh_preview()
+
     def refresh_preview(self) -> None:
         if self.active_project_id is None:
             self.preview_text.setPlainText(
@@ -622,10 +615,15 @@ class DesktopQtApp(QtWidgets.QMainWindow):
                     state.quick_launch.mode_id, self._mode_labels["sb_video_only"]
                 )
             )
+            self.launch_profile_combo.setCurrentText(
+                self._launch_profile_labels.get(
+                    state.quick_launch.launch_profile_id,
+                    self._launch_profile_labels["normal"],
+                )
+            )
             self.strictness_combo.setCurrentText(
                 label_for_strictness(state.quick_launch.strictness)
             )
-            self.slow_mode_checkbox.setChecked(state.quick_launch.slow_mode)
             self.paragraph_selection_edit.setText(
                 state.quick_launch.paragraph_selection_text
             )
@@ -640,26 +638,11 @@ class DesktopQtApp(QtWidgets.QMainWindow):
             selected_free = set(state.quick_launch.provider_ids)
             for provider_id, checkbox in self.free_provider_checks.items():
                 checkbox.setChecked(provider_id in selected_free)
-            self.paragraph_workers_spin.setValue(state.advanced.paragraph_workers)
-            self.provider_workers_spin.setValue(state.advanced.provider_workers)
-            self.download_workers_spin.setValue(state.advanced.download_workers)
-            self.relevance_workers_spin.setValue(state.advanced.relevance_workers)
-            self.queue_size_spin.setValue(state.advanced.queue_size)
+            self.action_delay_spin.setValue(state.advanced.action_delay_ms)
             self.launch_timeout_spin.setValue(state.advanced.launch_timeout_ms)
             self.navigation_timeout_spin.setValue(state.advanced.navigation_timeout_ms)
             self.download_timeout_spin.setValue(
                 state.advanced.downloads_timeout_seconds
-            )
-            self.top_k_spin.setValue(state.advanced.top_k_to_relevance)
-            self.retry_budget_spin.setValue(state.advanced.retry_budget)
-            self.no_match_budget_spin.setValue(state.advanced.no_match_budget_seconds)
-            self.full_script_context_budget_spin.setValue(
-                state.advanced.full_script_context_char_budget
-            )
-            self.cache_root_edit.setText(state.advanced.cache_root)
-            self.browser_profile_edit.setText(state.advanced.browser_profile_path)
-            self.allow_generic_checkbox.setChecked(
-                state.advanced.allow_generic_web_image
             )
             if not self.gemini_key_edit.text().strip():
                 self.gemini_key_edit.setText(self.controller.get_gemini_key() or "")
@@ -668,6 +651,7 @@ class DesktopQtApp(QtWidgets.QMainWindow):
                     edit.setText(
                         self.controller.get_provider_api_key(provider_id) or ""
                     )
+            self._sync_custom_timing_visibility()
 
         self._fill_history_list(state.run_history)
         self._fill_paragraph_list(state.paragraph_items)
@@ -952,7 +936,7 @@ class DesktopQtApp(QtWidgets.QMainWindow):
             return
         if exc.code != "storyblocks_parallelism_guard":
             return
-        self.paragraph_workers_spin.setValue(1)
+        self.launch_profile_combo.setCurrentText(self._launch_profile_labels["normal"])
 
     def on_resume_run(self) -> None:
         if self.active_run_id is None:
@@ -1300,8 +1284,13 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         self.mode_combo.setCurrentText(
             self._mode_labels.get(quick.mode_id, self._mode_labels["sb_video_only"])
         )
+        self.launch_profile_combo.setCurrentText(
+            self._launch_profile_labels.get(
+                quick.launch_profile_id,
+                self._launch_profile_labels["normal"],
+            )
+        )
         self.strictness_combo.setCurrentText(label_for_strictness(quick.strictness))
-        self.slow_mode_checkbox.setChecked(quick.slow_mode)
         self.supporting_image_spin.setValue(quick.supporting_image_limit)
         self.fallback_image_spin.setValue(quick.fallback_image_limit)
         self.manual_prompt_edit.setPlainText(quick.manual_prompt)
@@ -1313,23 +1302,11 @@ class DesktopQtApp(QtWidgets.QMainWindow):
             checkbox.setChecked(provider_id in selected_free)
 
     def _apply_advanced_form(self, advanced: UiAdvancedSettingsViewModel) -> None:
-        self.paragraph_workers_spin.setValue(advanced.paragraph_workers)
-        self.provider_workers_spin.setValue(advanced.provider_workers)
-        self.download_workers_spin.setValue(advanced.download_workers)
-        self.relevance_workers_spin.setValue(advanced.relevance_workers)
-        self.queue_size_spin.setValue(advanced.queue_size)
+        self.action_delay_spin.setValue(advanced.action_delay_ms)
         self.launch_timeout_spin.setValue(advanced.launch_timeout_ms)
         self.navigation_timeout_spin.setValue(advanced.navigation_timeout_ms)
         self.download_timeout_spin.setValue(advanced.downloads_timeout_seconds)
-        self.no_match_budget_spin.setValue(advanced.no_match_budget_seconds)
-        self.top_k_spin.setValue(advanced.top_k_to_relevance)
-        self.retry_budget_spin.setValue(advanced.retry_budget)
-        self.full_script_context_budget_spin.setValue(
-            advanced.full_script_context_char_budget
-        )
-        self.cache_root_edit.setText(advanced.cache_root)
-        self.browser_profile_edit.setText(advanced.browser_profile_path)
-        self.allow_generic_checkbox.setChecked(advanced.allow_generic_web_image)
+        self._sync_custom_timing_visibility()
 
     def _run_session_action(self, action) -> None:
         try:

@@ -48,7 +48,6 @@ class ParagraphIntentTests(unittest.TestCase):
                 "Ancient explorers paddle a damaged canoe through a foggy jungle river at dawn."
             ),
             strictness="balanced",
-            include_generic_web_image=True,
         )
 
         self.assertTrue(intent.primary_video_queries)
@@ -88,7 +87,6 @@ class ParagraphIntentTests(unittest.TestCase):
         query_bundle = service.build_query_bundle(
             intent,
             strictness="balanced",
-            include_generic_web_image=True,
         )
 
         self.assertEqual(intent.primary_video_queries[0], "Spanish soldiers")
@@ -104,7 +102,6 @@ class ParagraphIntentTests(unittest.TestCase):
                 for query in query_bundle.provider_queries["free_image"]
             )
         )
-        self.assertIn("generic_web_image", query_bundle.provider_queries)
         for queries in query_bundle.provider_queries.values():
             for query in queries:
                 self.assertLessEqual(self._word_count(query), 2)
@@ -255,7 +252,6 @@ class ParagraphIntentTests(unittest.TestCase):
                 document,
                 strictness="strict",
                 max_workers=1,
-                include_generic_web_image=True,
             )
 
             self.assertEqual(sorted(intents_by_paragraph.keys()), [1, 2])
@@ -282,10 +278,8 @@ class ParagraphIntentTests(unittest.TestCase):
                 updated_document.paragraphs[1].intent.estimated_duration_seconds, 18.0
             )
             self.assertEqual(
-                updated_document.paragraphs[1].query_bundle.provider_queries[
-                    "generic_web_image"
-                ][0],
-                "Francisco Orellana",
+                set(updated_document.paragraphs[1].query_bundle.provider_queries),
+                {"storyblocks_video", "storyblocks_image", "free_image"},
             )
 
     def test_extract_document_collects_intent_timing_aggregates_and_error_counters(
@@ -330,7 +324,6 @@ class ParagraphIntentTests(unittest.TestCase):
             document,
             strictness="balanced",
             max_workers=1,
-            include_generic_web_image=False,
         )
         metrics = service.last_extract_metrics()
 
@@ -375,7 +368,6 @@ class ParagraphIntentTests(unittest.TestCase):
                 document,
                 strictness="balanced",
                 max_workers=1,
-                include_generic_web_image=False,
             )
 
         metrics = service.last_extract_metrics()
@@ -412,7 +404,6 @@ class ParagraphIntentTests(unittest.TestCase):
                 image_queries=["damaged boat on jungle river"],
             ),
             strictness="balanced",
-            include_generic_web_image=True,
         )
         items = [service.build_item_payload(paragraph)]
 
@@ -423,7 +414,6 @@ class ParagraphIntentTests(unittest.TestCase):
                 output_path=Path(temp_dir) / "paragraph_intents.json",
                 model_name="fake-gemini",
                 strictness="balanced",
-                include_generic_web_image=True,
             )
             payload = json.loads(out_file.read_text(encoding="utf-8"))
 
@@ -437,8 +427,8 @@ class ParagraphIntentTests(unittest.TestCase):
             ][0],
             "damaged boat",
         )
-        self.assertIn(
-            "generic_web_image", payload["items"][0]["query_bundle"]["provider_queries"]
+        self.assertTrue(
+            all(not str(key).startswith("include_") for key in payload.keys())
         )
 
     def test_desktop_application_persists_manual_intent_edit(self) -> None:

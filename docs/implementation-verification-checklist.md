@@ -597,19 +597,16 @@
 - [ ] Есть настройка использования видео.
 - [ ] Есть настройка использования Storyblocks images.
 - [ ] Есть настройка использования free images.
+- [ ] Есть выбор `Профиль запуска`: `Обычный`, `Быстрый` или `Custom`.
 - [ ] Есть настройка strictness отбора результатов.
-- [ ] Есть настройка slow mode для браузера.
 - [ ] Есть выбор используемых источников.
 
 ### 7.5 Advanced pane
 
-- [ ] В advanced-pane настраивается concurrency.
-- [ ] В advanced-pane настраиваются таймауты.
-- [ ] В advanced-pane настраиваются Gemini thresholds.
-- [ ] В advanced-pane настраивается размер кэша.
-- [ ] В advanced-pane настраивается browser profile path.
-- [ ] В advanced-pane настраивается retry budget.
-- [ ] В advanced-pane настраивается top-K для relevance stage.
+- [ ] В advanced-pane не дублируются инженерные настройки concurrency, queue size и retry budget.
+- [ ] В advanced-pane есть только пользовательские редкие настройки.
+- [ ] `Custom` открывает только browser/download delay и timeout поля.
+- [ ] При выборе `Обычный` или `Быстрый` блок `Custom` скрыт.
 
 ### 7.6 Панель управления Storyblocks-сессией
 

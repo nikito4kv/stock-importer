@@ -30,7 +30,7 @@ DOCX -> legacy_core.ingestion -> pipeline.ingestion -> domain.ScriptDocument
         -> providers.images.service -> providers.images.clients -> legacy_core.image_providers
      -> storage.repositories -> run.json / manifest.json
      -> services.events -> EventRecorder / app.log
-     -> ui.controller -> ui.qt_app | ui.tk_app
+     -> ui.controller -> ui.qt_app
 ```
 
 ## Главные потоки вызовов
@@ -38,7 +38,7 @@ DOCX -> legacy_core.ingestion -> pipeline.ingestion -> domain.ScriptDocument
 ### 1. Запуск desktop-приложения
 - `app/__main__.py:main()` создает `DesktopApplication` и при обычном запуске передает его в `ui.launch_desktop_app()`.
 - `app/bootstrap.py:bootstrap_application()` поднимает workspace, настройки, репозитории, event bus, provider registry, Storyblocks session manager и media pipeline.
-- `ui/__init__.py:launch_desktop_app()` пытается запустить Qt UI и падает обратно на Tk UI при ошибке импорта.
+- `ui/__init__.py:launch_desktop_app()` загружает только Qt UI и явно сообщает об отсутствии `PySide6`.
 
 ### 2. Импорт сценария
 - `ui/controller.py:open_script()` -> `app/runtime.py:DesktopApplication.create_project()`.
@@ -556,8 +556,8 @@ DOCX -> legacy_core.ingestion -> pipeline.ingestion -> domain.ScriptDocument
 ### `ui/__init__.py`
 - Роль: пакетный entry point для desktop UI.
 - Функции:
-  - `launch_desktop_app(controller)`: сначала пробует Qt, затем fallback на Tk.
-- Реэкспортирует controller, contracts и launcher-и.
+  - `launch_desktop_app(controller)`: загружает `ui.qt_app` и запускает единственный поддерживаемый `Qt` path.
+- Реэкспортирует controller, contracts и Qt-only launcher.
 
 ### `ui/contracts.py`
 - Роль: view-model слой для UI.
@@ -594,7 +594,7 @@ DOCX -> legacy_core.ingestion -> pipeline.ingestion -> domain.ScriptDocument
 - Это главный hotspot для большинства будущих UI-правок.
 
 ### `ui/qt_app.py`
-- Роль: основная PySide6 GUI-реализация.
+- Роль: единственная поддерживаемая PySide6 GUI-реализация.
 - Типы:
   - `DesktopQtApp`.
 - Основные группы методов:
@@ -604,18 +604,6 @@ DOCX -> legacy_core.ingestion -> pipeline.ingestion -> domain.ScriptDocument
   - helpers: `_paragraph_signature()`, `_journal_signature()`, `_current_paragraph_number()`, `_current_candidate_asset_id()`, `_apply_quick_form()`, `_apply_advanced_form()`, `_run_session_action()`, `_import_existing_session()`, `_show_notification()`, `_apply_theme()`.
 - Функции:
   - `launch_pyside_app()`, `_wrap_layout()`, `_spin_box()`.
-
-### `ui/tk_app.py`
-- Роль: fallback GUI при отсутствии/ошибке Qt.
-- Типы:
-  - `DesktopTkApp`.
-- Основные группы методов практически зеркалят `DesktopQtApp`:
-  - построение layout/tab-ов;
-  - refresh/render;
-  - action handlers для run/preset/session/theme;
-  - selection helpers и background polling.
-- Функции:
-  - `launch_tk_app()`.
 
 ## `legacy_core`
 

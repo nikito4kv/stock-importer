@@ -277,7 +277,6 @@ def _extract_intent_samples(
         strictness="balanced",
         max_workers=1,
         start_jitter_seconds=0.0,
-        include_generic_web_image=False,
     )
     timings = []
     for item in items:

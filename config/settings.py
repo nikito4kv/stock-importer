@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+SUPPORTED_DESKTOP_STACK = "pyside6"
+
 
 @dataclass(slots=True)
 class ConcurrencySettings:
@@ -19,7 +21,7 @@ class ConcurrencySettings:
     retry_budget: int = 2
     early_stop_quality_threshold: float = 8.0
     fail_fast_storyblocks_errors: bool = True
-    queue_size: int = 8
+    queue_size: int = 1
 
 
 @dataclass(slots=True)
@@ -55,7 +57,6 @@ class ProviderSettings:
             "pexels",
             "pixabay",
             "openverse",
-            "wikimedia",
         ]
     )
     enabled_providers: list[str] = field(
@@ -65,25 +66,11 @@ class ProviderSettings:
             "pexels",
             "pixabay",
             "openverse",
-            "wikimedia",
-            "bing",
         ]
     )
-    image_provider_priority: list[str] = field(
-        default_factory=lambda: [
-            "storyblocks_image",
-            "pexels",
-            "pixabay",
-            "openverse",
-            "wikimedia",
-            "bing",
-        ]
-    )
-    allow_generic_web_image: bool = False
     commercial_only_images: bool = True
     allow_attribution_licenses: bool = False
     free_images_only: bool = False
-    mixed_image_fallback: bool = True
     supporting_image_limit: int = 1
     fallback_image_limit: int = 1
     no_match_budget_seconds: float = 20.0
@@ -106,7 +93,7 @@ class SecuritySettings:
 
 @dataclass(slots=True)
 class ApplicationSettings:
-    desktop_stack: str = "pyside6"
+    desktop_stack: str = SUPPORTED_DESKTOP_STACK
     ui_theme: str = "dark"
     workspace_name: str = "vid-img-downloader"
     storage: StorageSettings = field(default_factory=StorageSettings)
@@ -115,6 +102,9 @@ class ApplicationSettings:
     ai: AiSettings = field(default_factory=AiSettings)
     concurrency: ConcurrencySettings = field(default_factory=ConcurrencySettings)
     security: SecuritySettings = field(default_factory=SecuritySettings)
+
+    def __post_init__(self) -> None:
+        self.desktop_stack = SUPPORTED_DESKTOP_STACK
 
 
 def default_settings() -> ApplicationSettings:

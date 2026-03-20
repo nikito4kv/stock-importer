@@ -21,7 +21,6 @@ from legacy_core.image_providers import (
     OpenverseProvider,
     PexelsProvider,
     PixabayProvider,
-    WikimediaProvider,
 )
 from pipeline import MediaSelectionConfig
 from pipeline.media import FreeImageCandidateSearchBackend
@@ -275,8 +274,6 @@ class Phase3CacheNetworkTests(unittest.TestCase):
                 provider_id="openverse",
                 display_name="Openverse",
                 capability=ProviderCapability.IMAGE,
-                provider_group="open_license_repository",
-                priority=70,
             )
             provider = FakeProvider(
                 descriptor,
@@ -453,7 +450,6 @@ class Phase3CacheNetworkTests(unittest.TestCase):
             lambda client: PexelsProvider("key", 5.0, "UA", http_client=client),
             lambda client: PixabayProvider("key", 5.0, "UA", http_client=client),
             lambda client: OpenverseProvider(5.0, "UA", http_client=client),
-            lambda client: WikimediaProvider(5.0, "UA", http_client=client),
         ]
         for factory in provider_factories:
             provider = factory(

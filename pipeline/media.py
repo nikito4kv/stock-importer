@@ -33,6 +33,7 @@ from domain.models import (
     RunManifest,
     utc_now,
 )
+from domain.project_modes import DEFAULT_FREE_IMAGE_PROVIDER_IDS
 from legacy_core.network import (
     HttpClientConfig,
     SafeHttpClient,
@@ -588,6 +589,13 @@ class EffectiveConcurrencyLimits:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ImageSearchPathResolution:
+    primary_provider_ids: tuple[str, ...] = ()
+    fallback_provider_ids: tuple[str, ...] = ()
+    free_images_only: bool = False
+
+
 class ParagraphMediaPipeline:
     def __init__(
         self,
@@ -628,11 +636,11 @@ class ParagraphMediaPipeline:
             self.register_backend(backend)
 
     def available_free_image_provider_ids(self) -> list[str]:
-        return sorted(
+        return [
             provider_id
-            for provider_id in self._image_backends
-            if provider_id != "storyblocks_image"
-        )
+            for provider_id in self._ordered_enabled_free_image_provider_ids()
+            if provider_id in self._image_backends
+        ]
 
     def build_default_free_image_backends(
         self,
@@ -645,15 +653,7 @@ class ParagraphMediaPipeline:
         pixabay_api_key: str | None = None,
     ) -> list[FreeImageCandidateSearchBackend]:
         self._clear_free_image_backends()
-        provider_ids = [
-            item.provider_id
-            for item in self._provider_registry.resolve_enabled(
-                self._provider_settings,
-                capability=ProviderCapability.IMAGE,
-                include_opt_in=self._provider_settings.allow_generic_web_image,
-            )
-            if item.provider_group != "storyblocks_images"
-        ]
+        provider_ids = self._ordered_enabled_free_image_provider_ids()
         wrapped = build_image_provider_clients(
             self._provider_registry,
             provider_ids,
@@ -665,8 +665,6 @@ class ParagraphMediaPipeline:
                 or os.getenv("PEXELS_API_KEY", "").strip(),
                 pixabay_api_key=pixabay_api_key
                 or os.getenv("PIXABAY_API_KEY", "").strip(),
-                allow_generic_web_image=self._provider_settings.allow_generic_web_image,
-                free_images_only=self._provider_settings.free_images_only,
             ),
         )
         backends = [
@@ -689,19 +687,26 @@ class ParagraphMediaPipeline:
         return backends
 
     def _clear_free_image_backends(self) -> None:
-        removable_ids = {
-            item.provider_id
-            for item in self._provider_registry.list_by_capability(
-                ProviderCapability.IMAGE
-            )
-            if item.provider_group != "storyblocks_images"
-        }
+        removable_ids = set(DEFAULT_FREE_IMAGE_PROVIDER_IDS)
         for provider_id in removable_ids:
             backend = self._image_backends.pop(provider_id, None)
             self._download_backends.pop(provider_id, None)
             close = getattr(backend, "close", None)
             if callable(close):
                 close()
+
+    def _ordered_enabled_free_image_provider_ids(self) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for provider_id in self._provider_settings.enabled_providers:
+            if (
+                provider_id not in DEFAULT_FREE_IMAGE_PROVIDER_IDS
+                or provider_id in seen
+            ):
+                continue
+            seen.add(provider_id)
+            ordered.append(provider_id)
+        return ordered
 
     def close(self) -> None:
         closed_ids: set[int] = set()
@@ -1142,7 +1147,9 @@ class ParagraphMediaPipeline:
             entry.slots = list(selection.media_slots)
             self.flush_manifest(manifest)
         persist_ms = int(round((perf_counter() - persist_started_at) * 1000.0))
-        paragraph_total_ms = int(round((perf_counter() - paragraph_started_at) * 1000.0))
+        paragraph_total_ms = int(
+            round((perf_counter() - paragraph_started_at) * 1000.0)
+        )
         self._emit(
             manifest,
             "paragraph.persisted",
@@ -1325,25 +1332,26 @@ class ParagraphMediaPipeline:
                     timeout_error_code="download_timeout",
                     default_error_code="download_failed",
                 )
-                fatal_storyblocks_error = (
-                    decision.fatal
-                    or (
-                        isinstance(exc, DownloadError)
-                        and config.fail_fast_storyblocks_errors
-                        and self._is_fatal_storyblocks_error(
-                            asset.provider_name,
-                            ProviderError(
-                                code=exc.code,
-                                message=exc.message,
-                                details=dict(exc.details),
-                                retryable=exc.retryable,
-                                fatal=exc.fatal,
-                            ),
-                            config=config,
-                        )
+                fatal_storyblocks_error = decision.fatal or (
+                    isinstance(exc, DownloadError)
+                    and config.fail_fast_storyblocks_errors
+                    and self._is_fatal_storyblocks_error(
+                        asset.provider_name,
+                        ProviderError(
+                            code=exc.code,
+                            message=exc.message,
+                            details=dict(exc.details),
+                            retryable=exc.retryable,
+                            fatal=exc.fatal,
+                        ),
+                        config=config,
                     )
                 )
-                if attempt < attempts and decision.retryable and not fatal_storyblocks_error:
+                if (
+                    attempt < attempts
+                    and decision.retryable
+                    and not fatal_storyblocks_error
+                ):
                     backoff_seconds = sleep_for_retry_attempt(retry_profile, attempt)
                     self._emit(
                         manifest,
@@ -1442,10 +1450,7 @@ class ParagraphMediaPipeline:
         if not indexed_image_assets:
             return list(assets)
 
-        if (
-            concurrency_limits.download_workers <= 1
-            or len(indexed_image_assets) <= 1
-        ):
+        if concurrency_limits.download_workers <= 1 or len(indexed_image_assets) <= 1:
             downloaded = list(assets)
             for index, asset in indexed_image_assets:
                 downloaded[index] = self._download_image_asset(
@@ -1457,7 +1462,7 @@ class ParagraphMediaPipeline:
             return downloaded
 
         def download_one(
-            item: tuple[int, AssetCandidate]
+            item: tuple[int, AssetCandidate],
         ) -> tuple[int, AssetCandidate]:
             index, candidate = item
             return (
@@ -1477,7 +1482,9 @@ class ParagraphMediaPipeline:
             max_workers=concurrency_limits.download_workers,
             queue_size=concurrency_limits.download_queue_size,
         ) as executor:
-            pending: dict[Future[tuple[int, AssetCandidate]], tuple[int, AssetCandidate]] = {}
+            pending: dict[
+                Future[tuple[int, AssetCandidate]], tuple[int, AssetCandidate]
+            ] = {}
             assets_iter = iter(indexed_image_assets)
 
             def submit_next() -> bool:
@@ -1594,25 +1601,26 @@ class ParagraphMediaPipeline:
                     timeout_error_code="download_timeout",
                     default_error_code="download_failed",
                 )
-                fatal_storyblocks_error = (
-                    decision.fatal
-                    or (
-                        isinstance(exc, DownloadError)
-                        and config.fail_fast_storyblocks_errors
-                        and self._is_fatal_storyblocks_error(
-                            asset.provider_name,
-                            ProviderError(
-                                code=exc.code,
-                                message=exc.message,
-                                details=dict(exc.details),
-                                retryable=exc.retryable,
-                                fatal=exc.fatal,
-                            ),
-                            config=config,
-                        )
+                fatal_storyblocks_error = decision.fatal or (
+                    isinstance(exc, DownloadError)
+                    and config.fail_fast_storyblocks_errors
+                    and self._is_fatal_storyblocks_error(
+                        asset.provider_name,
+                        ProviderError(
+                            code=exc.code,
+                            message=exc.message,
+                            details=dict(exc.details),
+                            retryable=exc.retryable,
+                            fatal=exc.fatal,
+                        ),
+                        config=config,
                     )
                 )
-                if attempt < attempts and decision.retryable and not fatal_storyblocks_error:
+                if (
+                    attempt < attempts
+                    and decision.retryable
+                    and not fatal_storyblocks_error
+                ):
                     backoff_seconds = sleep_for_retry_attempt(retry_profile, attempt)
                     self._emit(
                         manifest,
@@ -1666,9 +1674,7 @@ class ParagraphMediaPipeline:
             break
         if downloaded is None:
             asset.metadata["download_status"] = "failed"
-            asset.metadata["download_error"] = (
-                last_error or "image download failed"
-            )
+            asset.metadata["download_error"] = last_error or "image download failed"
             asset.metadata.setdefault("download_attempts", attempts)
             return asset
         self._emit(
@@ -1976,10 +1982,7 @@ class ParagraphMediaPipeline:
                 queue_wait_total_ms += stats.wait_ms
                 queue_depth_max = max(queue_depth_max, stats.queue_depth)
 
-            while (
-                next_submit < len(tasks)
-                and len(pending) < submission_window
-            ):
+            while next_submit < len(tasks) and len(pending) < submission_window:
                 submit_one(next_submit)
                 next_submit += 1
 
@@ -2019,10 +2022,7 @@ class ParagraphMediaPipeline:
                     abandon_pending = bool(pending)
                     break
                 next_process += 1
-                while (
-                    next_submit < len(tasks)
-                    and len(pending) < submission_window
-                ):
+                while next_submit < len(tasks) and len(pending) < submission_window:
                     submit_one(next_submit)
                     next_submit += 1
         finally:
@@ -2059,33 +2059,13 @@ class ParagraphMediaPipeline:
         concurrency_limits: EffectiveConcurrencyLimits,
         search_started_at: float,
     ) -> tuple[list[ProviderResult], list[ProviderResult], bool]:
-        strategy = self._provider_registry.resolve_image_strategy(
-            self._provider_settings
+        image_paths = self._resolve_image_search_paths(config)
+        primary_backends = self._ordered_image_backends(
+            image_paths.primary_provider_ids
         )
-        primary_backends = [
-            self._image_backends[item.provider_id]
-            for item in strategy["primary"]
-            if item.provider_id in self._image_backends
-        ]
-        fallback_backends = [
-            self._image_backends[item.provider_id]
-            for item in strategy["fallback"]
-            if item.provider_id in self._image_backends
-        ]
-
-        if not config.storyblocks_images_enabled:
-            primary_backends = [
-                backend
-                for backend in primary_backends
-                if backend.provider_id != "storyblocks_image"
-            ]
-        if not config.free_images_enabled:
-            primary_backends = [
-                backend
-                for backend in primary_backends
-                if backend.provider_id == "storyblocks_image"
-            ]
-            fallback_backends = []
+        fallback_backends = self._ordered_image_backends(
+            image_paths.fallback_provider_ids
+        )
 
         primary_results = self._collect_image_result_list(
             manifest,
@@ -2104,8 +2084,7 @@ class ParagraphMediaPipeline:
         if (
             config.early_stop_when_satisfied
             and primary_limit > 0
-            and self._total_candidates(primary_results)
-            >= primary_limit
+            and self._total_candidates(primary_results) >= primary_limit
             and self._max_rank(primary_results) >= config.early_stop_quality_threshold
             and (not config.free_images_enabled or fallback_limit <= 0)
         ):
@@ -2118,7 +2097,7 @@ class ParagraphMediaPipeline:
             )
             return primary_results, [], True
 
-        if config.free_images_enabled and (not early_stop or primary_video is None):
+        if fallback_backends and (not early_stop or primary_video is None):
             fallback_results = self._collect_image_result_list(
                 manifest,
                 paragraph,
@@ -2131,8 +2110,7 @@ class ParagraphMediaPipeline:
             )
             if (
                 fallback_limit > 0
-                and self._total_candidates(fallback_results)
-                >= fallback_limit
+                and self._total_candidates(fallback_results) >= fallback_limit
                 and config.early_stop_when_satisfied
                 and self._max_rank(fallback_results)
                 >= config.early_stop_quality_threshold
@@ -2147,6 +2125,53 @@ class ParagraphMediaPipeline:
                 early_stop = True
 
         return primary_results, fallback_results, early_stop
+
+    def _resolve_image_search_paths(
+        self,
+        config: MediaSelectionConfig,
+    ) -> ImageSearchPathResolution:
+        free_provider_ids = tuple(
+            provider_id
+            for provider_id in self._ordered_enabled_free_image_provider_ids()
+            if config.free_images_enabled
+        )
+        storyblocks_enabled = (
+            config.storyblocks_images_enabled
+            and "storyblocks_image" in self._provider_settings.enabled_providers
+        )
+        free_images_only = (
+            bool(self._provider_settings.free_images_only)
+            or self._provider_settings.project_mode == "free_images_only"
+        )
+
+        # Image contract:
+        # 1. Storyblocks images are always the primary image path when enabled.
+        # 2. Free image providers run only as fallback after Storyblocks.
+        # 3. `free_images_only` is the explicit exception that promotes free providers
+        #    into the primary image path.
+        if free_images_only and not storyblocks_enabled:
+            return ImageSearchPathResolution(
+                primary_provider_ids=free_provider_ids,
+                fallback_provider_ids=(),
+                free_images_only=True,
+            )
+        return ImageSearchPathResolution(
+            primary_provider_ids=(
+                ("storyblocks_image",) if storyblocks_enabled else ()
+            ),
+            fallback_provider_ids=free_provider_ids,
+            free_images_only=False,
+        )
+
+    def _ordered_image_backends(
+        self,
+        provider_ids: Sequence[str],
+    ) -> list[CandidateSearchBackend]:
+        return [
+            self._image_backends[provider_id]
+            for provider_id in provider_ids
+            if provider_id in self._image_backends
+        ]
 
     def _collect_image_result_list(
         self,
@@ -2202,8 +2227,7 @@ class ParagraphMediaPipeline:
                 )
                 if (
                     should_early_stop
-                    and self._total_candidates(results)
-                    >= max(0, int(target_limit))
+                    and self._total_candidates(results) >= max(0, int(target_limit))
                     and self._max_rank(results) >= config.early_stop_quality_threshold
                 ):
                     return results
@@ -2254,10 +2278,7 @@ class ParagraphMediaPipeline:
                 queue_wait_total_ms += stats.wait_ms
                 queue_depth_max = max(queue_depth_max, stats.queue_depth)
 
-            while (
-                next_submit < len(tasks)
-                and len(pending) < submission_window
-            ):
+            while next_submit < len(tasks) and len(pending) < submission_window:
                 submit_one(next_submit)
                 next_submit += 1
 
@@ -2286,16 +2307,12 @@ class ParagraphMediaPipeline:
                     )
                 )
                 next_process += 1
-                while (
-                    next_submit < len(tasks)
-                    and len(pending) < submission_window
-                ):
+                while next_submit < len(tasks) and len(pending) < submission_window:
                     submit_one(next_submit)
                     next_submit += 1
                 if (
                     should_early_stop
-                    and self._total_candidates(results)
-                    >= max(0, int(target_limit))
+                    and self._total_candidates(results) >= max(0, int(target_limit))
                     and self._max_rank(results) >= config.early_stop_quality_threshold
                 ):
                     abandon_pending = bool(pending)
@@ -2330,7 +2347,10 @@ class ParagraphMediaPipeline:
     ) -> list[tuple[CandidateSearchBackend, str]]:
         tasks: list[tuple[CandidateSearchBackend, str]] = []
         for backend in backends:
-            tasks.extend((backend, query) for query in self._queries_for_backend(paragraph, backend))
+            tasks.extend(
+                (backend, query)
+                for query in self._queries_for_backend(paragraph, backend)
+            )
         return tasks
 
     def _prepare_provider_result(
@@ -2375,7 +2395,10 @@ class ParagraphMediaPipeline:
             return False
         if not result.candidates:
             return False
-        return self._asset_rank(result.candidates[0]) >= config.early_stop_quality_threshold
+        return (
+            self._asset_rank(result.candidates[0])
+            >= config.early_stop_quality_threshold
+        )
 
     def _emit_early_stop(
         self,
@@ -2439,7 +2462,9 @@ class ParagraphMediaPipeline:
             pending: dict[Future[tuple[int, float]], int] = {}
             for index, candidate in enumerate(candidates):
                 self._raise_if_cancelled(config)
-                maybe_submission = executor.try_submit(score_candidate, (index, candidate))
+                maybe_submission = executor.try_submit(
+                    score_candidate, (index, candidate)
+                )
                 if maybe_submission is None:
                     dropped_tasks += 1
                     scores[index] = self._raw_asset_rank(candidate)
@@ -2604,7 +2629,11 @@ class ParagraphMediaPipeline:
                             "attempt_count": attempt,
                         },
                     ) from exc
-                if attempt < attempts and decision.retryable and not fatal_storyblocks_error:
+                if (
+                    attempt < attempts
+                    and decision.retryable
+                    and not fatal_storyblocks_error
+                ):
                     backoff_seconds = sleep_for_retry_attempt(retry_profile, attempt)
                     self._emit(
                         manifest,
@@ -2731,7 +2760,9 @@ class ParagraphMediaPipeline:
                 "search_elapsed_ms": elapsed_ms,
                 "elapsed_ms": elapsed_ms,
                 "attempt_count": int(result.diagnostics.get("attempt_count", 1)),
-                "final_status": str(result.diagnostics.get("final_status", "completed")),
+                "final_status": str(
+                    result.diagnostics.get("final_status", "completed")
+                ),
                 "error_code": str(result.diagnostics.get("error_code", "")),
                 "current_asset_id": result.candidates[0].asset_id
                 if result.candidates
@@ -2757,7 +2788,9 @@ class ParagraphMediaPipeline:
         *,
         provider_id: str,
     ):
-        retry_budget = 0 if self._is_storyblocks_provider(provider_id) else config.retry_budget
+        retry_budget = (
+            0 if self._is_storyblocks_provider(provider_id) else config.retry_budget
+        )
         return build_retry_profile(
             retry_budget,
             base_delay_seconds=0.1,
@@ -3067,7 +3100,6 @@ class ParagraphMediaPipeline:
         ordered = self._provider_registry.resolve_enabled(
             self._provider_settings,
             capability=ProviderCapability.VIDEO,
-            include_opt_in=False,
         )
         return [
             self._video_backends[item.provider_id]
@@ -3376,7 +3408,8 @@ class ParagraphMediaPipeline:
             if selection.primary_asset is not None:
                 if not selection.supporting_assets and selection.fallback_assets:
                     selection.reason = (
-                        selection.reason or "Primary video selected with fallback images"
+                        selection.reason
+                        or "Primary video selected with fallback images"
                     )
             elif selection.supporting_assets:
                 selection.reason = "Image-only fallback satisfied the paragraph"
@@ -3387,7 +3420,9 @@ class ParagraphMediaPipeline:
             return
         selection.status = "no_match"
         if reserved_by_other_paragraph:
-            selection.reason = "Selected assets were already reserved by another paragraph"
+            selection.reason = (
+                "Selected assets were already reserved by another paragraph"
+            )
             return
         if not _normalize_text(selection.reason):
             selection.reason = "No acceptable media candidates found"
@@ -3409,11 +3444,7 @@ class ParagraphMediaPipeline:
             return "download_failed"
         if "no_results" in reason_blob:
             return "provider_no_results"
-        if (
-            "session" in reason_blob
-            or "login" in reason_blob
-            or "auth" in reason_blob
-        ):
+        if "session" in reason_blob or "login" in reason_blob or "auth" in reason_blob:
             return "session_or_auth"
         if "config" in reason_blob:
             return "config_error"
@@ -3449,7 +3480,9 @@ class ParagraphMediaPipeline:
 
     def _seed_run_deduper(self, manifest: RunManifest) -> AssetDeduper:
         deduper = AssetDeduper()
-        for entry in sorted(manifest.paragraph_entries, key=lambda item: item.paragraph_no):
+        for entry in sorted(
+            manifest.paragraph_entries, key=lambda item: item.paragraph_no
+        ):
             if entry.selection is None:
                 continue
             for asset in self._selection_assets(entry.selection):
@@ -3641,27 +3674,26 @@ class ParagraphMediaPipeline:
     def _sourcing_strategy_payload(
         self, config: MediaSelectionConfig
     ) -> dict[str, Any]:
-        strategy = self._provider_registry.resolve_image_strategy(
-            self._provider_settings
-        )
+        image_paths = self._resolve_image_search_paths(config)
         mode_resolution = self._resolve_concurrency_mode(config)
         limits = self._effective_concurrency_limits(config)
+        video_provider_ids = [
+            provider_id
+            for provider_id in mode_resolution.selected_provider_ids
+            if (descriptor := self._provider_registry.get(provider_id)) is not None
+            and descriptor.capability == ProviderCapability.VIDEO
+        ]
         return {
             "config": config.to_dict(),
-            "video_providers": [
-                item.provider_id
-                for item in self._provider_registry.resolve_enabled(
-                    self._provider_settings, capability=ProviderCapability.VIDEO
-                )
-            ],
-            "image_primary_providers": [
-                item.provider_id for item in strategy["primary"]
-            ],
-            "image_fallback_providers": [
-                item.provider_id for item in strategy["fallback"]
-            ],
-            "free_images_only": self._provider_settings.free_images_only,
-            "mixed_image_fallback": self._provider_settings.mixed_image_fallback,
+            "video_providers": video_provider_ids,
+            "image_primary_providers": [*image_paths.primary_provider_ids],
+            "image_fallback_providers": [*image_paths.fallback_provider_ids],
+            "image_selection_contract": (
+                "free_images_only"
+                if image_paths.free_images_only
+                else "storyblocks_then_free_fallback"
+            ),
+            "free_images_only": image_paths.free_images_only,
             "concurrency_mode": mode_resolution.mode.value,
             "selected_provider_ids": list(mode_resolution.selected_provider_ids),
             "effective_concurrency_limits": limits.to_payload(),
@@ -3998,22 +4030,16 @@ class ParagraphMediaRunService:
             bounded_relevance_queue=max(1, int(settings.relevance_queue_size)),
             relevance_workers=max(1, int(settings.relevance_workers)),
             search_timeout_seconds=max(0.0, float(settings.search_timeout_seconds)),
-            download_timeout_seconds=max(
-                1.0, float(settings.download_timeout_seconds)
-            ),
+            download_timeout_seconds=max(1.0, float(settings.download_timeout_seconds)),
             relevance_timeout_seconds=max(
                 0.0, float(settings.relevance_timeout_seconds)
             ),
             retry_budget=max(0, int(settings.retry_budget)),
             early_stop_quality_threshold=float(settings.early_stop_quality_threshold),
-            fail_fast_storyblocks_errors=bool(
-                settings.fail_fast_storyblocks_errors
-            ),
+            fail_fast_storyblocks_errors=bool(settings.fail_fast_storyblocks_errors),
         )
 
-    def _validate_storyblocks_concurrency(
-        self, config: MediaSelectionConfig
-    ) -> None:
+    def _validate_storyblocks_concurrency(self, config: MediaSelectionConfig) -> None:
         mode_resolution = self._pipeline._resolve_concurrency_mode(config)
         if (
             mode_resolution.requires_serial_paragraph_workers

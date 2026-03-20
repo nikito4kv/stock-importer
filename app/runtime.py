@@ -132,13 +132,9 @@ class DesktopApplication:
             raise
 
     def _bootstrap_document_intents(self, document: ScriptDocument) -> ScriptDocument:
-        include_generic_web_image = (
-            self.container.settings.providers.allow_generic_web_image
-        )
         return self.container.intent_service.bootstrap_document(
             document,
             strictness="balanced",
-            include_generic_web_image=include_generic_web_image,
         )
 
     def enrich_project_intents(
@@ -146,7 +142,6 @@ class DesktopApplication:
         project_id: str,
         *,
         strictness: str = "balanced",
-        include_generic_web_image: bool | None = None,
         manual_prompt: str = "",
         attach_full_script_context: bool = False,
     ) -> Project:
@@ -157,12 +152,6 @@ class DesktopApplication:
         gemini_key = self._gemini_api_key()
         if not gemini_key:
             raise RuntimeError("Gemini API key is not configured")
-
-        include_generic = (
-            self.container.settings.providers.allow_generic_web_image
-            if include_generic_web_image is None
-            else include_generic_web_image
-        )
         full_script_context = ""
         if (
             attach_full_script_context
@@ -184,7 +173,6 @@ class DesktopApplication:
                 project.script_document,
                 strictness=strictness,
                 max_workers=1,
-                include_generic_web_image=include_generic,
                 manual_prompt=manual_prompt,
                 full_script_context=full_script_context,
             )
@@ -244,7 +232,6 @@ class DesktopApplication:
         intent: ParagraphIntent,
         query_bundle: QueryBundle | None = None,
         strictness: str = "balanced",
-        include_generic_web_image: bool = False,
     ) -> Project:
         project = self.container.project_repository.load(project_id)
         if project is None or project.script_document is None:
@@ -258,7 +245,6 @@ class DesktopApplication:
                 intent=intent,
                 query_bundle=query_bundle,
                 strictness=strictness,
-                include_generic_web_image=include_generic_web_image,
             )
             project.updated_at = utc_now()
             return self.container.project_repository.save(project)

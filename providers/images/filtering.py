@@ -22,7 +22,7 @@ LOW_QUALITY_TOKENS = {
     "interface",
     "clipart",
 }
-METADATA_CACHE_KEY_VERSION = 3
+METADATA_CACHE_KEY_VERSION = 4
 
 
 @dataclass(slots=True)
@@ -52,8 +52,6 @@ def build_metadata_cache_key(
     author: str = "",
     license_name: str = "",
     attribution_required: bool = False,
-    provider_group: str = "",
-    provider_priority: int = 0,
     cache_key_version: int = METADATA_CACHE_KEY_VERSION,
 ) -> str:
     # Bump the cache key version whenever ranking, prefilter, or normalization changes.
@@ -67,8 +65,6 @@ def build_metadata_cache_key(
             "author_norm": normalize_metadata_keyword(author),
             "license_name_norm": normalize_metadata_keyword(license_name),
             "attribution_required": bool(attribution_required),
-            "provider_group": str(provider_group or "").strip(),
-            "provider_priority": int(provider_priority),
             "cache_key_version": int(cache_key_version),
         },
         ensure_ascii=True,
@@ -129,8 +125,6 @@ def cached_quality_assessment(
         author=candidate.author or "",
         license_name=candidate.license_name,
         attribution_required=candidate.attribution_required,
-        provider_group=descriptor.provider_group,
-        provider_priority=descriptor.priority,
     )
     cached = metadata_cache.get(cache_key) if metadata_cache is not None else None
     if isinstance(cached, dict):
@@ -155,15 +149,6 @@ def assess_candidate_quality(
         return {"reject": True, "reason": "low_quality_prefilter", "score": 0.0}
 
     score = candidate_hint_score(keyword, candidate)
-    score += descriptor.priority / 100.0
-    if descriptor.provider_group == "storyblocks_images":
-        score += 0.35
-    elif descriptor.provider_group == "free_stock_api":
-        score += 0.2
-    elif descriptor.provider_group == "open_license_repository":
-        score += 0.05
-    elif descriptor.provider_group == "generic_web_image":
-        score -= 0.3
 
     if candidate.license_name == "unknown":
         score -= 0.2
