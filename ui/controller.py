@@ -1,20 +1,14 @@
 from __future__ import annotations
 
+import re
+import threading
 from dataclasses import dataclass, fields, is_dataclass, replace
 from json import JSONDecodeError
 from pathlib import Path
-import re
-import threading
 from typing import Callable
 
+from app.runtime import DesktopApplication
 from config.settings import ApplicationSettings
-from domain.project_modes import (
-    DEFAULT_FREE_IMAGE_PROVIDER_IDS,
-    get_project_mode,
-    normalize_free_image_provider_ids,
-    normalize_project_mode,
-    provider_ids_for_mode,
-)
 from domain.enums import RunStage, RunStatus, SessionHealth
 from domain.models import (
     AssetCandidate,
@@ -27,11 +21,16 @@ from domain.models import (
     RunManifest,
     utc_now,
 )
+from domain.project_modes import (
+    DEFAULT_FREE_IMAGE_PROVIDER_IDS,
+    get_project_mode,
+    normalize_free_image_provider_ids,
+    normalize_project_mode,
+    provider_ids_for_mode,
+)
 from pipeline import MediaSelectionConfig
 from services.errors import AppError
 from services.events import AppEvent
-
-from app.runtime import DesktopApplication
 
 from .contracts import (
     UiAdvancedSettingsViewModel,
@@ -39,21 +38,21 @@ from .contracts import (
     UiEventJournalItem,
     UiImportableSessionOption,
     UiLiveRunStateViewModel,
+    UiLiveSnapshotViewModel,
     UiNotification,
     UiParagraphWorkbenchItem,
     UiPresetViewModel,
     UiProjectSummary,
     UiQuickLaunchSettingsViewModel,
     UiRunHistoryItem,
-    UiRunProgressViewModel,
     UiRunPreviewViewModel,
+    UiRunProgressViewModel,
     UiSessionPanelViewModel,
     UiStateViewModel,
 )
 from .presentation import (
     normalize_ui_theme,
     translate_error_text,
-    translate_provider,
 )
 
 
@@ -146,48 +145,26 @@ class DesktopGuiController:
         active_run_id: str | None = None,
         selected_paragraph_no: int | None = None,
     ) -> UiLiveRunStateViewModel:
-        self._finalize_background_run_if_needed()
-        resolved_run_id = self._resolve_active_run_id(active_project_id, active_run_id)
-        state = UiLiveRunStateViewModel(
-            active_run_id=resolved_run_id,
-            status_text="готово",
+        live = self.build_live_snapshot(
+            active_project_id=active_project_id,
+            active_run_id=active_run_id,
         )
+        state = UiLiveRunStateViewModel(
+            active_run_id=live.active_run_id,
+            status_text=live.status_text,
+            event_journal=list(live.event_journal),
+            run_progress=live.run_progress,
+        )
+        resolved_run_id = live.active_run_id
         if resolved_run_id is None:
             return state
 
-        run = self._safe_load_run(resolved_run_id)
         manifest = self._safe_load_manifest(resolved_run_id)
-        events = self.application.container.event_recorder.by_run(resolved_run_id)
-        latest_event = events[-1] if events else None
         latest_events = (
             self.application.container.event_recorder.latest_by_paragraph_for_run(
                 resolved_run_id
             )
         )
-        project_id = active_project_id or (run.project_id if run is not None else None)
-        project = (
-            self.application.container.project_repository.load(project_id)
-            if project_id is not None
-            else None
-        )
-        state.run_progress = self.build_run_progress(
-            resolved_run_id,
-            active_project_id=active_project_id,
-            run=run,
-            manifest=manifest,
-            latest_event=latest_event,
-            project=project,
-        )
-        if state.run_progress is not None:
-            current = (
-                f" абзац {state.run_progress.current_paragraph_no}"
-                if state.run_progress.current_paragraph_no is not None
-                else ""
-            )
-            state.status_text = (
-                f"{state.run_progress.status}: {state.run_progress.live_state}{current}"
-            )
-        state.event_journal = self.build_event_journal(resolved_run_id, events=events)
         if active_project_id is not None:
             state.paragraph_items = self.build_paragraph_workbench(
                 active_project_id,
@@ -210,6 +187,54 @@ class DesktopGuiController:
                     latest_events=latest_events,
                     detailed_paragraph_no=current,
                 )
+        return state
+
+    def build_live_snapshot(
+        self,
+        *,
+        active_project_id: str | None = None,
+        active_run_id: str | None = None,
+        journal_limit: int = 40,
+    ) -> UiLiveSnapshotViewModel:
+        self._finalize_background_run_if_needed()
+        resolved_run_id = self._resolve_active_run_id(active_project_id, active_run_id)
+        state = UiLiveSnapshotViewModel(
+            active_run_id=resolved_run_id,
+            status_text="готово",
+        )
+        if resolved_run_id is None:
+            return state
+
+        run = self._safe_load_run(resolved_run_id)
+        latest_event = self.application.container.event_recorder.latest_for_run(
+            resolved_run_id
+        )
+        state.run_progress = self.build_run_progress(
+            resolved_run_id,
+            active_project_id=active_project_id,
+            run=run,
+            manifest=None,
+            latest_event=latest_event,
+            project=None,
+            load_manifest=False,
+        )
+        if state.run_progress is not None:
+            current = (
+                f" абзац {state.run_progress.current_paragraph_no}"
+                if state.run_progress.current_paragraph_no is not None
+                else ""
+            )
+            state.status_text = (
+                f"{state.run_progress.status}: {state.run_progress.live_state}{current}"
+            )
+        events = self.application.container.event_recorder.tail_by_run(
+            resolved_run_id, limit=max(10, int(journal_limit))
+        )
+        state.event_journal = self.build_event_journal(
+            resolved_run_id,
+            limit=max(10, int(journal_limit)),
+            events=events,
+        )
         return state
 
     def _resolve_active_run_id(
@@ -310,14 +335,21 @@ class DesktopGuiController:
         return UiAdvancedSettingsViewModel(
             paragraph_workers=settings.concurrency.paragraph_workers,
             provider_workers=settings.concurrency.provider_workers,
+            provider_queue_size=settings.concurrency.provider_queue_size,
             download_workers=settings.concurrency.download_workers,
+            download_queue_size=settings.concurrency.download_queue_size,
             relevance_workers=settings.concurrency.relevance_workers,
+            relevance_queue_size=settings.concurrency.relevance_queue_size,
             queue_size=settings.concurrency.queue_size,
+            search_timeout_seconds=settings.concurrency.search_timeout_seconds,
+            relevance_timeout_seconds=settings.concurrency.relevance_timeout_seconds,
             launch_timeout_ms=settings.browser.launch_timeout_ms,
             navigation_timeout_ms=settings.browser.navigation_timeout_ms,
             downloads_timeout_seconds=settings.browser.downloads_timeout_seconds,
             top_k_to_relevance=24,
-            retry_budget=2,
+            retry_budget=settings.concurrency.retry_budget,
+            early_stop_quality_threshold=settings.concurrency.early_stop_quality_threshold,
+            fail_fast_storyblocks_errors=settings.concurrency.fail_fast_storyblocks_errors,
             cache_root=str(self.application.container.workspace.paths.cache_dir),
             browser_profile_path=str(
                 self.application.container.workspace.paths.browser_profiles_dir
@@ -1393,9 +1425,32 @@ class DesktopGuiController:
         settings.browser.downloads_timeout_seconds = advanced.downloads_timeout_seconds
         settings.concurrency.paragraph_workers = advanced.paragraph_workers
         settings.concurrency.provider_workers = advanced.provider_workers
+        settings.concurrency.provider_queue_size = advanced.provider_queue_size
         settings.concurrency.download_workers = advanced.download_workers
+        settings.concurrency.download_queue_size = advanced.download_queue_size
         settings.concurrency.relevance_workers = advanced.relevance_workers
+        settings.concurrency.relevance_queue_size = advanced.relevance_queue_size
+        settings.concurrency.search_timeout_seconds = max(
+            0.0, float(advanced.search_timeout_seconds)
+        )
+        settings.concurrency.download_timeout_seconds = max(
+            1.0, float(advanced.downloads_timeout_seconds)
+        )
+        settings.concurrency.relevance_timeout_seconds = max(
+            0.0, float(advanced.relevance_timeout_seconds)
+        )
+        settings.concurrency.retry_budget = max(0, int(advanced.retry_budget))
+        settings.concurrency.early_stop_quality_threshold = float(
+            advanced.early_stop_quality_threshold
+        )
+        settings.concurrency.fail_fast_storyblocks_errors = bool(
+            advanced.fail_fast_storyblocks_errors
+        )
         settings.concurrency.queue_size = advanced.queue_size
+        self.application.container.orchestrator.configure(
+            max_workers=settings.concurrency.paragraph_workers,
+            queue_size=settings.concurrency.queue_size,
+        )
         self._apply_settings_object(settings)
         return settings
 
@@ -1459,8 +1514,17 @@ class DesktopGuiController:
             "concurrency": {
                 "paragraph_workers": settings.concurrency.paragraph_workers,
                 "provider_workers": settings.concurrency.provider_workers,
+                "provider_queue_size": settings.concurrency.provider_queue_size,
                 "download_workers": settings.concurrency.download_workers,
+                "download_queue_size": settings.concurrency.download_queue_size,
                 "relevance_workers": settings.concurrency.relevance_workers,
+                "relevance_queue_size": settings.concurrency.relevance_queue_size,
+                "search_timeout_seconds": settings.concurrency.search_timeout_seconds,
+                "download_timeout_seconds": settings.concurrency.download_timeout_seconds,
+                "relevance_timeout_seconds": settings.concurrency.relevance_timeout_seconds,
+                "retry_budget": settings.concurrency.retry_budget,
+                "early_stop_quality_threshold": settings.concurrency.early_stop_quality_threshold,
+                "fail_fast_storyblocks_errors": settings.concurrency.fail_fast_storyblocks_errors,
                 "queue_size": settings.concurrency.queue_size,
             },
             "security": {
@@ -1486,10 +1550,22 @@ class DesktopGuiController:
             fallback_image_limit=max(0, int(quick.fallback_image_limit)),
             max_candidates_per_provider=max(1, advanced.provider_workers * 2),
             top_k_to_relevance=max(1, advanced.top_k_to_relevance),
-            bounded_downloads=max(1, advanced.download_workers),
-            bounded_relevance_queue=max(1, advanced.relevance_workers),
+            provider_workers=max(1, advanced.provider_workers),
+            provider_queue_size=max(1, advanced.provider_queue_size),
+            bounded_downloads=max(1, advanced.download_queue_size),
+            download_workers=max(1, advanced.download_workers),
+            bounded_relevance_queue=max(1, advanced.relevance_queue_size),
+            relevance_workers=max(1, advanced.relevance_workers),
             early_stop_when_satisfied=True,
             no_match_budget_seconds=max(0.0, float(advanced.no_match_budget_seconds)),
+            search_timeout_seconds=max(0.0, float(advanced.search_timeout_seconds)),
+            download_timeout_seconds=max(1.0, float(advanced.downloads_timeout_seconds)),
+            relevance_timeout_seconds=max(
+                0.0, float(advanced.relevance_timeout_seconds)
+            ),
+            retry_budget=max(0, int(advanced.retry_budget)),
+            early_stop_quality_threshold=float(advanced.early_stop_quality_threshold),
+            fail_fast_storyblocks_errors=bool(advanced.fail_fast_storyblocks_errors),
             output_root=quick.output_dir.strip(),
         )
 
@@ -1547,12 +1623,15 @@ class DesktopGuiController:
         manifest: RunManifest | None = None,
         latest_event: AppEvent | None = None,
         project: Project | None = None,
+        load_manifest: bool = True,
     ) -> UiRunProgressViewModel | None:
         run = run if run is not None else self._safe_load_run(run_id)
         if run is None:
             return None
         manifest = (
-            manifest if manifest is not None else self._safe_load_manifest(run_id)
+            manifest
+            if manifest is not None
+            else (self._safe_load_manifest(run_id) if load_manifest else None)
         )
         latest_event = (
             latest_event
@@ -1585,14 +1664,27 @@ class DesktopGuiController:
             failed = max(failed, int(manifest.summary.get("paragraphs_failed", failed)))
             matched = int(manifest.summary.get("paragraphs_matched", 0))
             no_match = int(manifest.summary.get("paragraphs_no_match", 0))
-        elif project is not None and project.script_document is not None:
-            paragraphs = project.script_document.paragraphs
-            selected = set(run.selected_paragraphs) if run.selected_paragraphs else None
-            total = sum(
-                1
-                for paragraph in paragraphs
-                if selected is None or paragraph.paragraph_no in selected
-            )
+        else:
+            stored_total = int(run.metadata.get("paragraphs_total", 0) or 0)
+            total = max(total, stored_total)
+            if total <= 0 and run.selected_paragraphs:
+                total = len(set(run.selected_paragraphs))
+            if (
+                total <= 0
+                and run.checkpoint is not None
+                and run.checkpoint.selected_paragraphs
+            ):
+                total = len(set(run.checkpoint.selected_paragraphs))
+            if total <= 0 and project is not None and project.script_document is not None:
+                paragraphs = project.script_document.paragraphs
+                selected = (
+                    set(run.selected_paragraphs) if run.selected_paragraphs else None
+                )
+                total = sum(
+                    1
+                    for paragraph in paragraphs
+                    if selected is None or paragraph.paragraph_no in selected
+                )
         stage = (
             latest_event.stage
             if latest_event is not None and latest_event.stage is not None
@@ -1944,6 +2036,19 @@ class DesktopGuiController:
                 "Для выбранного режима не включены нужные провайдеры. Включите их перед запуском.",
                 {"mode": mode.mode_id},
             )
+        if (
+            advanced.paragraph_workers > 1
+            and self._uses_storyblocks_provider(selected_providers)
+        ):
+            raise AppError(
+                "storyblocks_parallelism_guard",
+                "Для режимов Storyblocks параллелизм абзацев больше 1 небезопасен. Рекомендуем автокоррекцию: установите 'Потоки абзацев' = 1.",
+                {
+                    "mode": mode.mode_id,
+                    "paragraph_workers": advanced.paragraph_workers,
+                    "recommended_paragraph_workers": 1,
+                },
+            )
         free_provider_ids = [
             provider_id
             for provider_id in selected_providers
@@ -2092,6 +2197,12 @@ class DesktopGuiController:
                 seen.add(asset.asset_id)
                 previews.append(self._asset_preview(asset))
         return previews
+
+    def _uses_storyblocks_provider(self, provider_ids: list[str]) -> bool:
+        return any(
+            provider_id in {"storyblocks_video", "storyblocks_image"}
+            for provider_id in provider_ids
+        )
 
     def _asset_preview(
         self, asset: AssetCandidate, *, role: str = "candidate", locked: bool = False

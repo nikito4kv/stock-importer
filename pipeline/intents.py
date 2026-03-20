@@ -1,13 +1,21 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from time import perf_counter
 from typing import Any
+
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from domain.models import (
     ParagraphIntent,
@@ -18,13 +26,6 @@ from domain.models import (
 )
 from legacy_core.common import normalize_whitespace, safe_float
 from services.genai_client import get_transient_exceptions
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
-
 
 logger = logging.getLogger(__name__)
 
@@ -611,7 +612,34 @@ def _limit_query_list_words(queries: list[str], *, max_words: int) -> list[str]:
     return _unique_strings([query for query in limited if query])
 
 
+def _elapsed_ms(started_at: float) -> int:
+    return int(round((perf_counter() - started_at) * 1000.0))
+
+
+def _percentile(values: list[int], fraction: float) -> int:
+    if not values:
+        return 0
+    if len(values) == 1:
+        return int(values[0])
+    ordered = sorted(values)
+    clamped = min(1.0, max(0.0, float(fraction)))
+    position = clamped * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    if lower == upper:
+        return int(ordered[lower])
+    weight = position - lower
+    interpolated = (1.0 - weight) * ordered[lower] + weight * ordered[upper]
+    return int(round(interpolated))
+
+
 class ParagraphIntentService:
+    def __init__(self):
+        self._last_extract_metrics: dict[str, object] = {}
+
+    def last_extract_metrics(self) -> dict[str, object]:
+        return dict(self._last_extract_metrics)
+
     def _limit_intent_and_bundle_query_words(
         self,
         intent: ParagraphIntent,
@@ -1015,7 +1043,33 @@ class ParagraphIntentService:
         manual_prompt: str = "",
         full_script_context: str = "",
     ) -> tuple[ParagraphIntent, QueryBundle]:
+        intent, query_bundle, _metrics = self._extract_paragraph_intent_with_metrics(
+            model,
+            paragraph_no=paragraph_no,
+            paragraph_text=paragraph_text,
+            strictness=strictness,
+            format_retries=format_retries,
+            include_generic_web_image=include_generic_web_image,
+            manual_prompt=manual_prompt,
+            full_script_context=full_script_context,
+        )
+        return intent, query_bundle
+
+    def _extract_paragraph_intent_with_metrics(
+        self,
+        model: Any,
+        *,
+        paragraph_no: int,
+        paragraph_text: str,
+        strictness: str = DEFAULT_STRICTNESS,
+        format_retries: int = 2,
+        include_generic_web_image: bool = False,
+        manual_prompt: str = "",
+        full_script_context: str = "",
+    ) -> tuple[ParagraphIntent, QueryBundle, dict[str, int]]:
+        total_started_at = perf_counter()
         strictness_value = self._validate_strictness(strictness)
+        prompt_started_at = perf_counter()
         prompt = self.build_prompt(
             paragraph_no,
             paragraph_text,
@@ -1023,11 +1077,16 @@ class ParagraphIntentService:
             manual_prompt=manual_prompt,
             full_script_context=full_script_context,
         )
+        prompt_build_ms = _elapsed_ms(prompt_started_at)
 
         attempts = max(1, int(format_retries) + 1)
-        last_error: Exception | None = None
+        model_call_ms = 0
+        parse_normalize_ms = 0
         for attempt in range(1, attempts + 1):
+            model_started_at = perf_counter()
             raw = self._generate_intent_raw(model, prompt)
+            model_call_ms += _elapsed_ms(model_started_at)
+            parse_started_at = perf_counter()
             try:
                 intent = self.parse_intent_response(
                     raw,
@@ -1040,9 +1099,19 @@ class ParagraphIntentService:
                     strictness=strictness_value,
                     include_generic_web_image=include_generic_web_image,
                 )
-                return self._limit_intent_and_bundle_query_words(intent, query_bundle)
+                parse_normalize_ms += _elapsed_ms(parse_started_at)
+                intent, query_bundle = self._limit_intent_and_bundle_query_words(
+                    intent, query_bundle
+                )
+                metrics = {
+                    "prompt_build_ms": prompt_build_ms,
+                    "model_call_ms": model_call_ms,
+                    "parse_normalize_ms": parse_normalize_ms,
+                    "intent_total_ms": _elapsed_ms(total_started_at),
+                }
+                return intent, query_bundle, metrics
             except Exception as exc:
-                last_error = exc
+                parse_normalize_ms += _elapsed_ms(parse_started_at)
                 if attempt < attempts:
                     logger.warning(
                         "Paragraph %s: bad intent response (%s). Retrying %s/%s...",
@@ -1052,8 +1121,15 @@ class ParagraphIntentService:
                         attempts,
                     )
                     continue
-        raise ValueError(
-            f"Failed to parse paragraph intent for paragraph {paragraph_no}: {last_error}"
+                logger.error(
+                    "Paragraph %s intent extraction failed after %s attempts: %s",
+                    paragraph_no,
+                    attempts,
+                    exc,
+                )
+                raise
+        raise RuntimeError(
+            f"Intent extraction did not produce a result for paragraph {paragraph_no}"
         )
 
     def build_item_payload(
@@ -1061,6 +1137,7 @@ class ParagraphIntentService:
         paragraph: ParagraphUnit,
         *,
         error: str | None = None,
+        metrics: dict[str, object] | None = None,
     ) -> dict[str, object]:
         payload: dict[str, object] = {
             "paragraph_no": paragraph.paragraph_no,
@@ -1077,6 +1154,8 @@ class ParagraphIntentService:
         }
         if error:
             payload["error"] = error
+        if metrics:
+            payload["metrics"] = dict(metrics)
         return payload
 
     def extract_document(
@@ -1100,10 +1179,14 @@ class ParagraphIntentService:
         updated_paragraphs: dict[int, ParagraphUnit] = {}
         items_by_paragraph: dict[int, dict[str, object]] = {}
         intents_by_paragraph: dict[int, ParagraphIntent] = {}
+        paragraph_timings: list[int] = []
+        intent_error_types: dict[str, int] = {}
+        intent_errors_total = 0
 
         def process_one(
             paragraph: ParagraphUnit,
         ) -> tuple[int, ParagraphUnit, dict[str, object], Exception | None]:
+            total_started_at = perf_counter()
             if start_jitter_seconds > 0:
                 time.sleep(random.uniform(0.0, start_jitter_seconds))
             if delay_seconds > 0:
@@ -1111,28 +1194,38 @@ class ParagraphIntentService:
 
             current = ParagraphUnit.from_dict(paragraph.to_dict())
             try:
-                intent, query_bundle = self.extract_paragraph_intent(
-                    model,
-                    paragraph_no=current.paragraph_no,
-                    paragraph_text=current.text,
-                    strictness=strictness_value,
-                    include_generic_web_image=include_generic_web_image,
-                    manual_prompt=manual_prompt,
-                    full_script_context=full_script_context,
+                intent, query_bundle, metrics = (
+                    self._extract_paragraph_intent_with_metrics(
+                        model,
+                        paragraph_no=current.paragraph_no,
+                        paragraph_text=current.text,
+                        strictness=strictness_value,
+                        include_generic_web_image=include_generic_web_image,
+                        manual_prompt=manual_prompt,
+                        full_script_context=full_script_context,
+                    )
                 )
+                if "intent_total_ms" not in metrics:
+                    metrics["intent_total_ms"] = _elapsed_ms(total_started_at)
                 current.intent = intent
                 current.query_bundle = query_bundle
                 return (
                     current.paragraph_no,
                     current,
-                    self.build_item_payload(current),
+                    self.build_item_payload(current, metrics=metrics),
                     None,
                 )
             except Exception as exc:
+                metrics = {
+                    "prompt_build_ms": 0,
+                    "model_call_ms": 0,
+                    "parse_normalize_ms": 0,
+                    "intent_total_ms": _elapsed_ms(total_started_at),
+                }
                 return (
                     current.paragraph_no,
                     current,
-                    self.build_item_payload(current, error=str(exc)),
+                    self.build_item_payload(current, error=str(exc), metrics=metrics),
                     exc,
                 )
 
@@ -1162,16 +1255,37 @@ class ParagraphIntentService:
                             for paragraph in document.paragraphs
                             if paragraph.paragraph_no == paragraph_no
                         )
+                        metrics = {
+                            "prompt_build_ms": 0,
+                            "model_call_ms": 0,
+                            "parse_normalize_ms": 0,
+                            "intent_total_ms": 0,
+                        }
                         results.append(
                             (
                                 paragraph_no,
                                 current,
-                                self.build_item_payload(current, error=str(exc)),
+                                self.build_item_payload(
+                                    current, error=str(exc), metrics=metrics
+                                ),
                                 exc,
                             )
                         )
 
         for paragraph_no, paragraph, item, error in results:
+            metrics = item.get("metrics")
+            if isinstance(metrics, dict):
+                total_ms = int(metrics.get("intent_total_ms") or 0)
+                paragraph_timings.append(total_ms)
+                logger.info(
+                    "Paragraph %s intent timing: total=%sms prompt=%sms model=%sms parse=%sms",
+                    paragraph_no,
+                    total_ms,
+                    int(metrics.get("prompt_build_ms") or 0),
+                    int(metrics.get("model_call_ms") or 0),
+                    int(metrics.get("parse_normalize_ms") or 0),
+                )
+
             updated_paragraphs[paragraph_no] = paragraph
             items_by_paragraph[paragraph_no] = item
             if paragraph.intent is not None:
@@ -1184,6 +1298,9 @@ class ParagraphIntentService:
                     else paragraph.intent.primary_video_queries,
                 )
             elif error is not None:
+                intent_errors_total += 1
+                error_key = type(error).__name__
+                intent_error_types[error_key] = intent_error_types.get(error_key, 0) + 1
                 logger.error("Paragraph %s intent failed: %s", paragraph_no, error)
                 if fail_fast:
                     raise error
@@ -1196,6 +1313,18 @@ class ParagraphIntentService:
             items_by_paragraph[paragraph.paragraph_no]
             for paragraph in document.paragraphs
         ]
+        self._last_extract_metrics = {
+            "intent_p50_ms": _percentile(paragraph_timings, 0.50),
+            "intent_p95_ms": _percentile(paragraph_timings, 0.95),
+            "intent_errors_total": intent_errors_total,
+            "intent_error_types": dict(intent_error_types),
+        }
+        logger.info(
+            "Document intent metrics: p50=%sms p95=%sms errors=%s",
+            self._last_extract_metrics["intent_p50_ms"],
+            self._last_extract_metrics["intent_p95_ms"],
+            intent_errors_total,
+        )
         return intents_by_paragraph, items, document
 
     def build_output_payload(

@@ -178,6 +178,14 @@ class UiLiveRunStateViewModel:
 
 
 @dataclass(slots=True)
+class UiLiveSnapshotViewModel:
+    active_run_id: str | None = None
+    status_text: str = "готово"
+    event_journal: list[UiEventJournalItem] = field(default_factory=list)
+    run_progress: UiRunProgressViewModel | None = None
+
+
+@dataclass(slots=True)
 class UiQuickLaunchSettingsViewModel:
     project_name: str = ""
     script_path: str = ""
@@ -198,14 +206,21 @@ class UiQuickLaunchSettingsViewModel:
 class UiAdvancedSettingsViewModel:
     paragraph_workers: int = 1
     provider_workers: int = 4
+    provider_queue_size: int = 8
     download_workers: int = 4
+    download_queue_size: int = 8
     relevance_workers: int = 2
+    relevance_queue_size: int = 8
     queue_size: int = 8
+    search_timeout_seconds: float = 20.0
+    relevance_timeout_seconds: float = 10.0
     launch_timeout_ms: int = 45000
     navigation_timeout_ms: int = 30000
     downloads_timeout_seconds: float = 120.0
     top_k_to_relevance: int = 24
     retry_budget: int = 2
+    early_stop_quality_threshold: float = 8.0
+    fail_fast_storyblocks_errors: bool = True
     cache_root: str = ""
     browser_profile_path: str = ""
     allow_generic_web_image: bool = False

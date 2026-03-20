@@ -14,12 +14,11 @@ from config.settings import (
     StorageSettings,
     default_settings,
 )
-from domain.project_modes import infer_project_mode, normalize_project_mode
 from domain.models import BrowserProfile, Preset, Project, Run, RunManifest
+from domain.project_modes import infer_project_mode, normalize_project_mode
 
 from .serialization import read_json, write_json
 from .workspace import WorkspacePaths
-
 
 T = TypeVar("T")
 
@@ -183,8 +182,27 @@ class SettingsRepository:
             concurrency=ConcurrencySettings(
                 paragraph_workers=int(concurrency.get("paragraph_workers", 1)),
                 provider_workers=int(concurrency.get("provider_workers", 4)),
+                provider_queue_size=int(concurrency.get("provider_queue_size", 8)),
                 download_workers=int(concurrency.get("download_workers", 4)),
+                download_queue_size=int(concurrency.get("download_queue_size", 8)),
                 relevance_workers=int(concurrency.get("relevance_workers", 2)),
+                relevance_queue_size=int(concurrency.get("relevance_queue_size", 8)),
+                search_timeout_seconds=max(
+                    0.0, float(concurrency.get("search_timeout_seconds", 20.0))
+                ),
+                download_timeout_seconds=max(
+                    1.0, float(concurrency.get("download_timeout_seconds", 120.0))
+                ),
+                relevance_timeout_seconds=max(
+                    0.0, float(concurrency.get("relevance_timeout_seconds", 10.0))
+                ),
+                retry_budget=max(0, int(concurrency.get("retry_budget", 2))),
+                early_stop_quality_threshold=float(
+                    concurrency.get("early_stop_quality_threshold", 8.0)
+                ),
+                fail_fast_storyblocks_errors=bool(
+                    concurrency.get("fail_fast_storyblocks_errors", True)
+                ),
                 queue_size=int(concurrency.get("queue_size", 8)),
             ),
             security=SecuritySettings(
@@ -256,8 +274,17 @@ class SettingsRepository:
             "concurrency": {
                 "paragraph_workers": settings.concurrency.paragraph_workers,
                 "provider_workers": settings.concurrency.provider_workers,
+                "provider_queue_size": settings.concurrency.provider_queue_size,
                 "download_workers": settings.concurrency.download_workers,
+                "download_queue_size": settings.concurrency.download_queue_size,
                 "relevance_workers": settings.concurrency.relevance_workers,
+                "relevance_queue_size": settings.concurrency.relevance_queue_size,
+                "search_timeout_seconds": settings.concurrency.search_timeout_seconds,
+                "download_timeout_seconds": settings.concurrency.download_timeout_seconds,
+                "relevance_timeout_seconds": settings.concurrency.relevance_timeout_seconds,
+                "retry_budget": settings.concurrency.retry_budget,
+                "early_stop_quality_threshold": settings.concurrency.early_stop_quality_threshold,
+                "fail_fast_storyblocks_errors": settings.concurrency.fail_fast_storyblocks_errors,
                 "queue_size": settings.concurrency.queue_size,
             },
             "security": {

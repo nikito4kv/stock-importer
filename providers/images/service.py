@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
-from ..base import ProviderDescriptor
 from ..registry import ProviderRegistry
 from .caching import MetadataCache, SearchResultCache
 from .clients import (

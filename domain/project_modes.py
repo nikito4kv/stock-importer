@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 DEFAULT_FREE_IMAGE_PROVIDER_IDS: tuple[str, ...] = (
     "pexels",
     "pixabay",

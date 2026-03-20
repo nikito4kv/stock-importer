@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-import shutil
 from typing import Any, Protocol
 
 from services.errors import DownloadError

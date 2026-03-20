@@ -6,7 +6,11 @@ from .clients import (
     WrappedImageSearchProvider,
     build_image_provider_clients,
 )
-from .filtering import ImageLicensePolicy, assess_candidate_quality, filter_and_rank_candidates
+from .filtering import (
+    ImageLicensePolicy,
+    assess_candidate_quality,
+    filter_and_rank_candidates,
+)
 from .querying import ImageQueryPlanner, ProviderQueryPlan
 from .service import ImageProviderSearchService, ImageSearchDiagnostics
 

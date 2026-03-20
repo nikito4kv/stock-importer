@@ -6,10 +6,20 @@ from typing import Any, Protocol
 
 from legacy_core.image_providers import (
     BingProvider as LegacyBingProvider,
+)
+from legacy_core.image_providers import (
     OpenverseProvider as LegacyOpenverseProvider,
+)
+from legacy_core.image_providers import (
     PexelsProvider as LegacyPexelsProvider,
+)
+from legacy_core.image_providers import (
     PixabayProvider as LegacyPixabayProvider,
+)
+from legacy_core.image_providers import (
     SearchCandidate,
+)
+from legacy_core.image_providers import (
     WikimediaProvider as LegacyWikimediaProvider,
 )
 

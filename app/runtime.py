@@ -25,6 +25,11 @@ from .bootstrap import ApplicationContainer, bootstrap_application
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 
+def _elapsed_ms(started_at: float, *, minimum: int = 0) -> int:
+    elapsed = int(round((perf_counter() - started_at) * 1000.0))
+    return max(int(minimum), elapsed)
+
+
 @dataclass(slots=True)
 class ApplicationSnapshot:
     workspace_root: Path
@@ -56,33 +61,72 @@ class DesktopApplication:
         )
 
     def create_project(self, name: str, script_path: str | Path) -> Project:
-        started_at = perf_counter()
-        document = self.container.ingestion_service.ingest(script_path)
-        ingestion_ms = int(round((perf_counter() - started_at) * 1000.0))
-        bootstrap_started_at = perf_counter()
-        document = self._bootstrap_document_intents(document)
-        bootstrap_ms = int(round((perf_counter() - bootstrap_started_at) * 1000.0))
-        project = Project(
-            project_id=uuid4().hex[:12],
-            name=name,
-            workspace_path=self.container.workspace.paths.projects_dir,
-            script_document=document,
-        )
-        saved = self.container.project_repository.save(project)
-        self._emit_application_event(
-            "project.import.completed",
-            EventLevel.INFO,
-            f"Project {saved.project_id} imported",
-            project_id=saved.project_id,
-            payload={
-                "script_path": str(script_path),
-                "paragraphs_total": len(document.paragraphs),
-                "ingestion_ms": ingestion_ms,
-                "intent_bootstrap_ms": bootstrap_ms,
-                "time_to_import_project_ms": ingestion_ms + bootstrap_ms,
-            },
-        )
-        return saved
+        import_started_at = perf_counter()
+        ingestion_ms = 0
+        bootstrap_ms = 0
+        save_ms = 0
+        document: ScriptDocument | None = None
+        project_id = uuid4().hex[:12]
+        import_perf_id = uuid4().hex[:12]
+        failed_stage = "ingestion"
+        try:
+            ingestion_started_at = perf_counter()
+            document = self.container.ingestion_service.ingest(script_path)
+            ingestion_ms = _elapsed_ms(ingestion_started_at, minimum=1)
+
+            failed_stage = "intent_bootstrap"
+            bootstrap_started_at = perf_counter()
+            document = self._bootstrap_document_intents(document)
+            bootstrap_ms = _elapsed_ms(bootstrap_started_at, minimum=1)
+
+            failed_stage = "project_save"
+            save_started_at = perf_counter()
+            project = Project(
+                project_id=project_id,
+                name=name,
+                workspace_path=self.container.workspace.paths.projects_dir,
+                script_document=document,
+            )
+            saved = self.container.project_repository.save(project)
+            save_ms = _elapsed_ms(save_started_at, minimum=1)
+            total_ms = _elapsed_ms(import_started_at, minimum=1)
+            self._emit_application_event(
+                "project.import.completed",
+                EventLevel.INFO,
+                f"Project {saved.project_id} imported",
+                project_id=saved.project_id,
+                payload={
+                    "script_path": str(script_path),
+                    "paragraphs_total": len(document.paragraphs),
+                    "ingestion_ms": ingestion_ms,
+                    "intent_bootstrap_ms": bootstrap_ms,
+                    "project_save_ms": save_ms,
+                    "time_to_import_project_ms": total_ms,
+                    "perf_context_id": import_perf_id,
+                    "perf_run_id": f"import-{saved.project_id}",
+                },
+            )
+            return saved
+        except Exception as exc:
+            total_ms = _elapsed_ms(import_started_at, minimum=1)
+            self._emit_application_event(
+                "project.import.failed",
+                EventLevel.ERROR,
+                f"Project import failed at {failed_stage}: {exc}",
+                payload={
+                    "script_path": str(script_path),
+                    "paragraphs_total": len(document.paragraphs) if document else 0,
+                    "ingestion_ms": ingestion_ms,
+                    "intent_bootstrap_ms": bootstrap_ms,
+                    "project_save_ms": save_ms,
+                    "time_to_import_project_ms": total_ms,
+                    "failed_stage": failed_stage,
+                    "error": str(exc),
+                    "perf_context_id": import_perf_id,
+                    "perf_run_id": f"import-{project_id}",
+                },
+            )
+            raise
 
     def _bootstrap_document_intents(self, document: ScriptDocument) -> ScriptDocument:
         include_generic_web_image = (
@@ -157,6 +201,7 @@ class DesktopApplication:
                 "attach_full_script_context": attach_full_script_context,
                 "manual_prompt": bool(manual_prompt.strip()),
                 "intent_enrichment_ms": elapsed_ms,
+                **self.container.intent_service.last_extract_metrics(),
             },
         )
         return saved

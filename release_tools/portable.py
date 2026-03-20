@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
-
 INCLUDED_DIRS = (
     "app",
     "browser",

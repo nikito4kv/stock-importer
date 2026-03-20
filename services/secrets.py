@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import base64
 import ctypes
-from ctypes import POINTER, byref, c_char
-from ctypes import wintypes
 import sys
+from ctypes import POINTER, byref, c_char, wintypes
 from pathlib import Path
 
 

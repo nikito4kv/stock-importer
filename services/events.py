@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-import logging
 from typing import Any, Callable
 
 from domain.enums import EventLevel, RunStage
-
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +80,13 @@ class EventRecorder:
         if run_id is None:
             return list(self.events)
         return list(self._events_by_run.get(run_id, []))
+
+    def tail_by_run(self, run_id: str | None, *, limit: int = 50) -> list[AppEvent]:
+        window = max(1, int(limit))
+        if run_id is None:
+            return list(self.events[-window:])
+        events = self._events_by_run.get(run_id, [])
+        return list(events[-window:])
 
     def latest_for_run(self, run_id: str | None) -> AppEvent | None:
         if run_id is None:

@@ -8,7 +8,11 @@ from .errors import (
     SessionError,
 )
 from .events import AppEvent, EventBus, EventRecorder
-from .genai_client import create_gemini_model, ensure_gemini_sdk_available, get_transient_exceptions
+from .genai_client import (
+    create_gemini_model,
+    ensure_gemini_sdk_available,
+    get_transient_exceptions,
+)
 from .secrets import SecretStore
 from .settings_manager import SettingsManager
 

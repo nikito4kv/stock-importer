@@ -1,15 +1,11 @@
 import argparse
 import hashlib
-import ipaddress
 import json
 import logging
 import os
 import random
 import re
 import shutil
-import socket
-import sqlite3
-import subprocess
 import threading
 import time
 import urllib.error
@@ -18,28 +14,36 @@ import urllib.request
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
 from legacy_core.common import normalize_keywords as shared_normalize_keywords
 from legacy_core.common import safe_float as shared_safe_float
 from legacy_core.common import safe_int as shared_safe_int
-from legacy_core.diagnostics import build_provider_limit_summary
+from legacy_core.diagnostics import build_provider_limit_summary, init_provider_stats
 from legacy_core.diagnostics import bump_provider_stat as shared_bump_provider_stat
-from legacy_core.diagnostics import init_provider_stats
 from legacy_core.env import get_env_path as shared_get_env_path
 from legacy_core.env import load_dotenv as shared_load_dotenv
 from legacy_core.files import build_run_dir as shared_build_run_dir
-from legacy_core.files import resolve_output_json_path as shared_resolve_output_json_path
+from legacy_core.files import (
+    resolve_output_json_path as shared_resolve_output_json_path,
+)
 from legacy_core.files import write_hashed_temp_file
-from legacy_core.keyword_payload import extract_paragraph_tasks as shared_extract_paragraph_tasks
-from legacy_core.keyword_payload import load_keywords_payload as shared_load_keywords_payload
+from legacy_core.keyword_payload import (
+    extract_paragraph_tasks as shared_extract_paragraph_tasks,
+)
+from legacy_core.keyword_payload import (
+    load_keywords_payload as shared_load_keywords_payload,
+)
 from legacy_core.licenses import is_license_allowed as shared_is_license_allowed
 from legacy_core.licenses import normalize_license_info as shared_normalize_license_info
 from legacy_core.network import http_get_json as shared_http_get_json
 from legacy_core.network import is_public_host as shared_is_public_host
-from legacy_core.network import open_with_safe_redirects as shared_open_with_safe_redirects
+from legacy_core.network import (
+    open_with_safe_redirects as shared_open_with_safe_redirects,
+)
 from legacy_core.network import read_limited as shared_read_limited
 from legacy_core.network import validate_public_url as shared_validate_public_url
-from pathlib import Path
-from typing import Any
 from legacy_core.query_utils import build_query_variants as shared_build_query_variants
 from legacy_core.query_utils import candidate_hint_score as shared_candidate_hint_score
 from legacy_core.query_utils import parse_sources as shared_parse_sources
@@ -47,16 +51,25 @@ from legacy_core.query_utils import tokenize as shared_tokenize
 from legacy_core.relevance import SimpleRateLimiter as SharedSimpleRateLimiter
 from legacy_core.relevance import VideoRelevanceCache as SharedVideoRelevanceCache
 from legacy_core.relevance import clean_model_text as shared_clean_model_text
-from legacy_core.relevance import parse_relevance_response as shared_parse_relevance_response
+from legacy_core.relevance import (
+    parse_relevance_response as shared_parse_relevance_response,
+)
 from legacy_core.retry import retry_call
-from services.genai_client import create_gemini_model, ensure_gemini_sdk_available, get_transient_exceptions
 from legacy_core.video_tools import ensure_ffmpeg_tools_available
-from legacy_core.video_tools import guess_video_extension as shared_guess_video_extension
+from legacy_core.video_tools import (
+    guess_video_extension as shared_guess_video_extension,
+)
 from legacy_core.video_tools import parse_frame_rate as shared_parse_frame_rate
 from legacy_core.video_tools import probe_video as shared_probe_video
 from legacy_core.video_tools import run_command as shared_run_command
-from legacy_core.video_tools import validate_video_quality as shared_validate_video_quality
-
+from legacy_core.video_tools import (
+    validate_video_quality as shared_validate_video_quality,
+)
+from services.genai_client import (
+    create_gemini_model,
+    ensure_gemini_sdk_available,
+    get_transient_exceptions,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -500,8 +513,8 @@ class WikimediaVideoProvider:
                 metadata = {}
             metadata_map: dict[str, Any] = metadata
 
-            def meta_value(key: str) -> str:
-                raw = metadata_map.get(key)
+            def meta_value(key: str, _metadata_map: dict[str, Any] = metadata_map) -> str:
+                raw = _metadata_map.get(key)
                 if isinstance(raw, dict):
                     return _strip_html(str(raw.get("value") or ""))
                 return ""
@@ -899,7 +912,7 @@ class VideoRelevanceEvaluator:
                 api_key=_GEMINI_API_KEY,
                 model_name=self.model_name,
             )
-            setattr(self._local, "model", model)
+            self._local.model = model
         return model
 
     def _build_timestamps(self, duration_seconds: float) -> list[float]:

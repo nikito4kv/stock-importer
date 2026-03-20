@@ -4,7 +4,6 @@ import os
 import re
 from pathlib import Path
 
-
 ENV_FILENAME = ".env"
 
 

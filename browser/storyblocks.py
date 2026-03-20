@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from html.parser import HTMLParser
-from pathlib import Path
 import re
 import time
+from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import quote, urljoin
 

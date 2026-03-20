@@ -5,6 +5,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 
 from docx import Document
 
@@ -402,8 +403,6 @@ class UiControllerTests(unittest.TestCase):
             controller = DesktopGuiController.create(temp_dir)
             profile_id_value = controller.ensure_active_profile()
             container = controller.application.container
-            native_launcher = _FakeNativeBrowserLauncher()
-
             def fake_open_browser(profile_id=None):
                 pid = profile_id or profile_id_value
                 state = container.session_manager.set_health(pid, SessionHealth.UNKNOWN)
@@ -567,6 +566,180 @@ class UiControllerTests(unittest.TestCase):
                 )
 
             self.assertEqual(ctx.exception.code, "invalid_numbering")
+
+    def test_controller_blocks_storyblocks_parallelism_over_one_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = _write_docx(temp_dir, ["HEADER", "1. River boat scene"])
+            controller = DesktopGuiController.create(temp_dir)
+            project = controller.open_script(script_path, project_name="Guarded Run")
+            _mark_storyblocks_ready(controller)
+
+            quick = controller.build_quick_launch_settings()
+            advanced = controller.build_advanced_settings()
+            quick.mode_id = "sb_video_only"
+            advanced.paragraph_workers = 2
+
+            with self.assertRaises(AppError) as ctx:
+                controller.start_run_async(project.project_id, quick, advanced)
+
+            self.assertEqual(ctx.exception.code, "storyblocks_parallelism_guard")
+            self.assertEqual(
+                ctx.exception.details.get("recommended_paragraph_workers"),
+                1,
+            )
+
+    def test_controller_allows_free_image_parallelism_over_one_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = _write_docx(temp_dir, ["HEADER", "1. River boat scene"])
+            controller = DesktopGuiController.create(temp_dir)
+            project = controller.open_script(script_path, project_name="Free Images Run")
+
+            quick = controller.build_quick_launch_settings()
+            advanced = controller.build_advanced_settings()
+            quick.mode_id = "free_images_only"
+            quick.provider_ids = ["openverse"]
+            advanced.paragraph_workers = 2
+
+            with patch.object(controller, "_start_background_run", return_value=None):
+                run_id = controller.start_run_async(project.project_id, quick, advanced)
+
+            self.assertTrue(run_id)
+            self.assertIsNotNone(
+                controller.application.container.run_repository.load(run_id)
+            )
+
+    def test_build_live_snapshot_does_not_require_manifest_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = _write_docx(temp_dir, ["HEADER", "1. River boat scene"])
+            controller = DesktopGuiController.create(temp_dir)
+            project = controller.open_script(script_path, project_name="Live Snapshot")
+            _mark_storyblocks_ready(controller)
+            container = controller.application.container
+            descriptor = container.provider_registry.get("storyblocks_video")
+            assert descriptor is not None
+
+            def slow_video(paragraph, query, limit):
+                time.sleep(0.2)
+                return [
+                    _candidate(
+                        f"video-{paragraph.paragraph_no}",
+                        "storyblocks_video",
+                        AssetKind.VIDEO,
+                        10.0,
+                    )
+                ]
+
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="storyblocks_video",
+                    capability=ProviderCapability.VIDEO,
+                    descriptor=descriptor,
+                    search_fn=slow_video,
+                )
+            )
+
+            quick = controller.build_quick_launch_settings()
+            advanced = controller.build_advanced_settings()
+            quick.mode_id = "sb_video_only"
+            advanced.paragraph_workers = 1
+            run_id = controller.start_run_async(project.project_id, quick, advanced)
+
+            with patch.object(
+                controller.application.container.media_run_service,
+                "load_manifest",
+                side_effect=AssertionError("manifest load should not happen"),
+            ):
+                snapshot = controller.build_live_snapshot(
+                    active_project_id=project.project_id,
+                    active_run_id=run_id,
+                )
+                self.assertEqual(snapshot.active_run_id, run_id)
+                self.assertIsNotNone(snapshot.run_progress)
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                state = controller.build_state(
+                    active_project_id=project.project_id, active_run_id=run_id
+                )
+                if state.run_progress is not None and state.run_progress.status in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                }:
+                    break
+                time.sleep(0.05)
+
+    def test_build_live_run_state_keeps_paragraph_statuses_and_selected_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = _write_docx(
+                temp_dir, ["HEADER", "1. River boat scene", "2. Camp scene"]
+            )
+            controller = DesktopGuiController.create(temp_dir)
+            project = controller.open_script(script_path, project_name="Live Run State")
+            _mark_storyblocks_ready(controller)
+            container = controller.application.container
+            descriptor = container.provider_registry.get("storyblocks_video")
+            assert descriptor is not None
+
+            def slow_video(paragraph, query, limit):
+                time.sleep(0.25)
+                return [
+                    _candidate(
+                        f"video-{paragraph.paragraph_no}",
+                        "storyblocks_video",
+                        AssetKind.VIDEO,
+                        10.0,
+                    )
+                ]
+
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="storyblocks_video",
+                    capability=ProviderCapability.VIDEO,
+                    descriptor=descriptor,
+                    search_fn=slow_video,
+                )
+            )
+
+            quick = controller.build_quick_launch_settings()
+            advanced = controller.build_advanced_settings()
+            quick.mode_id = "sb_video_only"
+            advanced.paragraph_workers = 1
+            run_id = controller.start_run_async(project.project_id, quick, advanced)
+
+            live_state = None
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                live_state = controller.build_live_run_state(
+                    active_project_id=project.project_id,
+                    active_run_id=run_id,
+                    selected_paragraph_no=2,
+                )
+                if live_state.run_progress is not None and live_state.paragraph_items:
+                    break
+                time.sleep(0.05)
+
+            assert live_state is not None
+            assert live_state.run_progress is not None
+            self.assertEqual(len(live_state.paragraph_items), 2)
+            item_by_no = {
+                item.paragraph_no: item for item in live_state.paragraph_items
+            }
+            self.assertEqual(item_by_no[1].text, "")
+            self.assertTrue(item_by_no[2].text)
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                state = controller.build_state(
+                    active_project_id=project.project_id, active_run_id=run_id
+                )
+                if state.run_progress is not None and state.run_progress.status in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                }:
+                    break
+                time.sleep(0.05)
 
     def test_controller_blocks_session_changes_while_run_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

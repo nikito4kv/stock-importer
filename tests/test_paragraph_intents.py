@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from docx import Document
 
@@ -287,6 +287,100 @@ class ParagraphIntentTests(unittest.TestCase):
                 ][0],
                 "Francisco Orellana",
             )
+
+    def test_extract_document_collects_intent_timing_aggregates_and_error_counters(
+        self,
+    ) -> None:
+        service = ParagraphIntentService()
+        document = ScriptDocument(
+            source_path=Path("story.docx"),
+            header_text="HEADER",
+            paragraphs=[
+                ParagraphUnit(
+                    paragraph_no=1,
+                    original_index=1,
+                    text="Spanish soldiers row a damaged boat through a jungle river.",
+                ),
+                ParagraphUnit(
+                    paragraph_no=2,
+                    original_index=2,
+                    text="The exhausted crew drifts in silence near the shoreline.",
+                ),
+            ],
+        )
+        model = FakeModel(
+            [
+                json.dumps(
+                    {
+                        "subject": "Spanish soldiers",
+                        "action": "rowing",
+                        "setting": "jungle river",
+                        "primary_video_queries": ["Spanish soldiers", "jungle river"],
+                        "image_queries": ["jungle river", "damaged boat"],
+                    }
+                ),
+                "not json",
+                "still not json",
+                "nope",
+            ]
+        )
+
+        _intents, items, _updated_document = service.extract_document(
+            model,
+            document,
+            strictness="balanced",
+            max_workers=1,
+            include_generic_web_image=False,
+        )
+        metrics = service.last_extract_metrics()
+
+        self.assertEqual(len(items), 2)
+        self.assertIn("metrics", items[0])
+        self.assertIn("metrics", items[1])
+        self.assertIn("intent_total_ms", items[0]["metrics"])
+        self.assertIn("intent_total_ms", items[1]["metrics"])
+        self.assertEqual(metrics["intent_errors_total"], 1)
+        self.assertIn("intent_p50_ms", metrics)
+        self.assertIn("intent_p95_ms", metrics)
+        self.assertIn("intent_error_types", metrics)
+
+    def test_extract_document_preserves_original_error_type_in_metrics(self) -> None:
+        service = ParagraphIntentService()
+        document = ScriptDocument(
+            source_path=Path("story.docx"),
+            header_text="HEADER",
+            paragraphs=[
+                ParagraphUnit(
+                    paragraph_no=1,
+                    original_index=1,
+                    text="A crew rows through dense jungle fog.",
+                )
+            ],
+        )
+        model = FakeModel(
+            [
+                json.dumps({"subject": "crew", "action": "rowing", "setting": "river"}),
+                json.dumps({"subject": "crew", "action": "rowing", "setting": "river"}),
+                json.dumps({"subject": "crew", "action": "rowing", "setting": "river"}),
+            ]
+        )
+
+        with patch.object(
+            service,
+            "parse_intent_response",
+            side_effect=RuntimeError("synthetic parse failure"),
+        ):
+            _intents, _items, _updated_document = service.extract_document(
+                model,
+                document,
+                strictness="balanced",
+                max_workers=1,
+                include_generic_web_image=False,
+            )
+
+        metrics = service.last_extract_metrics()
+        self.assertEqual(metrics["intent_errors_total"], 1)
+        self.assertEqual(metrics["intent_error_types"].get("RuntimeError"), 1)
 
     def test_save_intents_json_writes_new_contract(self) -> None:
         service = ParagraphIntentService()

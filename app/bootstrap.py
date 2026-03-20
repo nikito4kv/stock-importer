@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,7 +16,6 @@ from browser import (
 )
 from config import ApplicationSettings, default_settings
 from pipeline import (
-    MediaSelectionConfig,
     ParagraphIntentService,
     ParagraphMediaPipeline,
     ParagraphMediaRunService,
@@ -28,7 +28,7 @@ from providers import (
     build_default_provider_registry,
 )
 from services import EventBus, EventRecorder, SecretStore, SettingsManager
-from services.logging import JsonLineEventLogger
+from services.logging import JsonLineEventLogger, JsonLinePerfLogger
 from storage import (
     BrowserProfileRepository,
     ManifestRepository,
@@ -87,8 +87,13 @@ def bootstrap_application(
 
     event_bus = EventBus()
     event_recorder = EventRecorder()
+    event_logger = JsonLineEventLogger(paths.logs_dir / "app.log")
+    perf_logger = JsonLinePerfLogger(paths.logs_dir / "perf.jsonl")
     event_bus.subscribe(event_recorder)
-    event_bus.subscribe(JsonLineEventLogger(paths.logs_dir / "app.log").write)
+    event_bus.subscribe(event_logger.write)
+    event_bus.subscribe(perf_logger.write)
+    atexit.register(event_logger.flush)
+    atexit.register(perf_logger.flush)
 
     project_repository = ProjectRepository(paths)
     run_repository = RunRepository(paths)
@@ -130,6 +135,7 @@ def bootstrap_application(
                 session_manager=session_manager,
                 search_adapter=storyblocks_video_adapter,
                 dom_checker=storyblocks_dom_checker,
+                download_retries=max(0, int(settings.concurrency.retry_budget)),
                 download_timeout_seconds=settings.browser.downloads_timeout_seconds,
             )
         )
@@ -142,6 +148,7 @@ def bootstrap_application(
                 session_manager=session_manager,
                 search_adapter=storyblocks_image_adapter,
                 dom_checker=storyblocks_dom_checker,
+                download_retries=max(0, int(settings.concurrency.retry_budget)),
                 download_timeout_seconds=settings.browser.downloads_timeout_seconds,
             )
         )
@@ -167,6 +174,7 @@ def bootstrap_application(
         media_pipeline,
         orchestrator,
         session_manager=session_manager,
+        concurrency_settings=settings.concurrency,
     )
 
     return ApplicationContainer(

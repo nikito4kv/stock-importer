@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import shutil
 import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
-from domain.models import BrowserProfile
 from domain.enums import SessionHealth
+from domain.models import BrowserProfile
 from services.errors import PersistenceError, SessionError
 from storage.serialization import write_json
 

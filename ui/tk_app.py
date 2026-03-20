@@ -6,22 +6,24 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from domain.project_modes import list_project_modes
+from services.errors import AppError
 
 from .contracts import UiAdvancedSettingsViewModel, UiQuickLaunchSettingsViewModel
 from .controller import DesktopGuiController, handle_ui_error
+from .polling import plan_poll_refresh
 from .presentation import (
-    THEME_LABELS,
     STRICTNESS_LABELS,
+    THEME_LABELS,
     get_ui_theme,
-    label_for_theme,
     label_for_strictness,
+    label_for_theme,
     normalize_ui_theme,
     translate_asset_role,
+    translate_paragraph_status,
     translate_provider,
     translate_run_stage,
     translate_run_status,
     translate_session_health,
-    translate_paragraph_status,
     translate_severity,
     yes_no,
 )
@@ -54,6 +56,9 @@ class DesktopTkApp:
         self._text_widgets: list[tk.Text] = []
         self._last_paragraph_signature: tuple[tuple[int, str, str, bool], ...] = ()
         self._last_journal_signature: tuple[int, str, str] = (0, "", "")
+        self._terminal_refresh_signature: tuple[str | None, str | None] | None = None
+        self._poll_interval_active_ms = 500
+        self._poll_interval_idle_ms = 1600
         self._theme_id = self.controller.get_ui_theme()
 
         self._build_style()
@@ -61,7 +66,7 @@ class DesktopTkApp:
         self._build_layout()
         self._apply_theme(self._theme_id)
         self.refresh()
-        self.root.after(750, self._poll_refresh)
+        self.root.after(self._poll_interval_idle_ms, self._poll_refresh)
 
     def run(self) -> None:
         self.root.mainloop()
@@ -631,14 +636,25 @@ class DesktopTkApp:
         return UiAdvancedSettingsViewModel(
             paragraph_workers=max(1, self.paragraph_workers_var.get()),
             provider_workers=max(1, self.provider_workers_var.get()),
+            provider_queue_size=max(1, self.queue_size_var.get()),
             download_workers=max(1, self.download_workers_var.get()),
+            download_queue_size=max(1, self.queue_size_var.get()),
             relevance_workers=max(1, self.relevance_workers_var.get()),
+            relevance_queue_size=max(1, self.queue_size_var.get()),
             queue_size=max(1, self.queue_size_var.get()),
+            search_timeout_seconds=max(
+                1.0, float(max(1000, self.navigation_timeout_var.get())) / 1000.0
+            ),
+            relevance_timeout_seconds=max(
+                1.0, float(max(1.0, self.download_timeout_var.get())) / 2.0
+            ),
             launch_timeout_ms=max(1000, self.launch_timeout_var.get()),
             navigation_timeout_ms=max(1000, self.navigation_timeout_var.get()),
             downloads_timeout_seconds=max(1.0, self.download_timeout_var.get()),
             top_k_to_relevance=max(1, self.top_k_var.get()),
             retry_budget=max(0, self.retry_budget_var.get()),
+            early_stop_quality_threshold=max(1.0, float(self.top_k_var.get()) / 3.0),
+            fail_fast_storyblocks_errors=True,
             cache_root=self.cache_root_var.get().strip(),
             browser_profile_path=self.browser_profile_path_var.get().strip(),
             allow_generic_web_image=self.allow_generic_web_image_var.get(),
@@ -671,6 +687,8 @@ class DesktopTkApp:
         self._render_preview(preview)
 
     def _apply_state(self, state, *, preserve_forms: bool = False) -> None:
+        self.active_project_id = state.active_project_id
+        self.active_run_id = state.active_run_id
         self.status_var.set(state.status_text)
         if not preserve_forms:
             self._set_if_blank(self.output_dir_var, state.quick_launch.output_dir)
@@ -725,6 +743,8 @@ class DesktopTkApp:
                 )
 
         self._fill_history_tree(state.run_history)
+        self._fill_paragraph_tree(state.paragraph_items)
+        self._render_current_paragraph_detail(state.paragraph_items)
         self._render_session(state.session)
         self._render_preview(state.run_preview)
         self._render_run_progress(state.run_progress)
@@ -756,7 +776,29 @@ class DesktopTkApp:
             self.history_tree.selection_set(self.active_run_id)
 
     def _fill_paragraph_tree(self, paragraph_items) -> None:
-        return None
+        signature = self._paragraph_signature(paragraph_items)
+        selected_paragraph_no = self._selected_paragraph_number()
+        if signature == self._last_paragraph_signature:
+            return
+        self.paragraph_tree.delete(*self.paragraph_tree.get_children())
+        for item in paragraph_items:
+            label = f"P{item.paragraph_no} | {translate_paragraph_status(item.status)}"
+            if not item.numbering_valid:
+                label += " | проблема нумерации"
+            self.paragraph_tree.insert(
+                "",
+                "end",
+                iid=str(item.paragraph_no),
+                text=label,
+            )
+        if (
+            selected_paragraph_no is not None
+            and str(selected_paragraph_no) in self.paragraph_tree.get_children()
+        ):
+            self.paragraph_tree.selection_set(str(selected_paragraph_no))
+        elif paragraph_items:
+            self.paragraph_tree.selection_set(str(paragraph_items[0].paragraph_no))
+        self._last_paragraph_signature = signature
 
     def _render_preview(self, preview) -> None:
         self.preview_text.delete("1.0", "end")
@@ -984,11 +1026,22 @@ class DesktopTkApp:
                 self.active_project_id, self._quick_form(), self._advanced_form()
             )
         except Exception as exc:
+            self._apply_storyblocks_parallelism_autofix(exc)
             self._show_notification(handle_ui_error(exc))
             return
         self.active_run_id = run_id
         self.status_var.set(f"Запуск {run_id} начат")
         self.refresh(preserve_forms=True)
+
+    def _apply_storyblocks_parallelism_autofix(self, exc: Exception) -> None:
+        if not isinstance(exc, AppError):
+            return
+        if exc.code != "storyblocks_parallelism_guard":
+            return
+        self.paragraph_workers_var.set(1)
+        self.status_var.set(
+            "Потоки абзацев автоматически скорректированы до 1 для Storyblocks."
+        )
 
     def on_resume_run(self) -> None:
         if self.active_run_id is None:
@@ -1327,8 +1380,10 @@ class DesktopTkApp:
         self.refresh(preserve_forms=True)
 
     def _poll_refresh(self) -> None:
+        next_interval = self._poll_interval_idle_ms
         try:
             if self.active_project_id is None and self.active_run_id is None:
+                self._terminal_refresh_signature = None
                 return
             live_state = self.controller.build_live_run_state(
                 active_project_id=self.active_project_id,
@@ -1336,19 +1391,33 @@ class DesktopTkApp:
                 selected_paragraph_no=self._selected_paragraph_number(),
             )
             self._apply_live_state(live_state)
-            terminal_statuses = {"completed", "failed", "cancelled"}
-            if (
-                live_state.run_progress is None
-                or live_state.run_progress.status in terminal_statuses
-            ):
+            run_status = (
+                live_state.run_progress.status
+                if live_state.run_progress is not None
+                else None
+            )
+            poll_plan = plan_poll_refresh(
+                run_id=live_state.active_run_id,
+                run_status=run_status,
+                previous_terminal_signature=self._terminal_refresh_signature,
+                active_interval_ms=self._poll_interval_active_ms,
+                idle_interval_ms=self._poll_interval_idle_ms,
+            )
+            if poll_plan.should_heavy_refresh:
                 self.refresh(preserve_forms=True)
+            self._terminal_refresh_signature = poll_plan.terminal_signature
+            next_interval = poll_plan.next_interval_ms
+        except Exception as exc:
+            self._show_notification(handle_ui_error(exc))
         finally:
-            self.root.after(750, self._poll_refresh)
+            self.root.after(next_interval, self._poll_refresh)
 
     def _apply_live_state(self, state) -> None:
         self.active_run_id = state.active_run_id
         self.status_var.set(state.status_text)
         self._render_run_progress(state.run_progress)
+        self._fill_paragraph_tree(state.paragraph_items)
+        self._render_current_paragraph_detail(state.paragraph_items)
         self._set_session_actions_enabled(self.controller.session_actions_enabled())
         self._fill_event_journal(state.event_journal)
 

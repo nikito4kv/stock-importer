@@ -15,20 +15,24 @@ from .downloads import (
     StoryblocksDownloadRequest,
 )
 from .native_browser import (
-    find_available_tcp_port,
     NativeBrowserLaunchPlan,
     NativeBrowserSession,
     SubprocessNativeBrowserLauncher,
+    find_available_tcp_port,
 )
 from .profile_import import ChromiumProfileImportService, ImportableBrowserSession
-from .profiles import BrowserProfilePaths, BrowserProfileRegistry, build_browser_profile_paths
-from .slowmode import BrowserActionPacer, SlowModePolicy
+from .profiles import (
+    BrowserProfilePaths,
+    BrowserProfileRegistry,
+    build_browser_profile_paths,
+)
 from .session import (
     AuthorizationSnapshot,
     BrowserSessionManager,
     BrowserSessionState,
     ManualInterventionRequest,
 )
+from .slowmode import BrowserActionPacer, SlowModePolicy
 from .storyblocks import (
     StoryblocksDomContractChecker,
     StoryblocksDomContractResult,

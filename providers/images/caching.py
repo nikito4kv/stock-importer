@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from contextlib import closing
 import json
-from pathlib import Path
 import sqlite3
+from contextlib import closing
+from pathlib import Path
 from threading import Lock
-from typing import Any
 
 from .clients import SearchCandidate
 

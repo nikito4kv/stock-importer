@@ -20,6 +20,21 @@ from .storyblocks import (
     capture_storyblocks_page_snapshot,
 )
 
+STORYBLOCKS_FATAL_ERROR_CODES = {
+    "storyblocks_profile_missing",
+    "storyblocks_session_not_ready",
+    "storyblocks_login_required",
+    "storyblocks_challenge_detected",
+    "storyblocks_session_expired",
+    "storyblocks_blocked",
+    "storyblocks_page_unavailable",
+    "storyblocks_detail_url_missing",
+}
+
+
+def is_storyblocks_fatal_error_code(code: str) -> bool:
+    return str(code or "").strip().casefold() in STORYBLOCKS_FATAL_ERROR_CODES
+
 
 @dataclass(slots=True)
 class StoryblocksCandidateSearchBackend:
@@ -178,7 +193,11 @@ class StoryblocksCandidateSearchBackend:
             raise DownloadError(
                 code="storyblocks_detail_url_missing",
                 message=f"Storyblocks asset '{asset.asset_id}' has no detail URL for download.",
-                details={"asset_id": asset.asset_id, "provider_id": self.provider_id},
+                details={
+                    "asset_id": asset.asset_id,
+                    "provider_id": self.provider_id,
+                    "fatal": True,
+                },
             )
         session = self.session_manager.open_browser()
         driver = PlaywrightDownloadDriver(
@@ -204,7 +223,10 @@ class StoryblocksCandidateSearchBackend:
                 code="storyblocks_download_failed",
                 message=record.error
                 or f"Storyblocks download failed for asset '{asset.asset_id}'.",
-                details={"asset_id": asset.asset_id, "provider_id": self.provider_id},
+                details={
+                    "asset_id": asset.asset_id,
+                    "provider_id": self.provider_id,
+                },
             )
         downloaded = AssetCandidate.from_dict(asset.to_dict())
         downloaded.local_path = record.local_path

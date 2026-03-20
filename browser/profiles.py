@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-import shutil
 from uuid import uuid4
 
 from domain.enums import SessionHealth

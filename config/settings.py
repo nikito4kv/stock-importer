@@ -8,8 +8,17 @@ from pathlib import Path
 class ConcurrencySettings:
     paragraph_workers: int = 1
     provider_workers: int = 4
+    provider_queue_size: int = 8
     download_workers: int = 4
+    download_queue_size: int = 8
     relevance_workers: int = 2
+    relevance_queue_size: int = 8
+    search_timeout_seconds: float = 20.0
+    download_timeout_seconds: float = 120.0
+    relevance_timeout_seconds: float = 10.0
+    retry_budget: int = 2
+    early_stop_quality_threshold: float = 8.0
+    fail_fast_storyblocks_errors: bool = True
     queue_size: int = 8
 
 

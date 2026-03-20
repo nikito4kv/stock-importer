@@ -3,11 +3,10 @@ from __future__ import annotations
 import ipaddress
 import json
 import socket
-from typing import Any
 import urllib.error
 import urllib.parse
 import urllib.request
-
+from typing import Any
 
 REDIRECT_CODES = {301, 302, 303, 307, 308}
 
@@ -122,7 +121,9 @@ def open_with_safe_redirects(
                 location = exc.headers.get("Location")
                 exc.close()
                 if not location:
-                    raise ValueError("Redirect response has no Location header")
+                    raise ValueError(
+                        "Redirect response has no Location header"
+                    ) from exc
                 next_url = urllib.parse.urljoin(current, location)
                 current = validate_public_url(next_url)
                 continue

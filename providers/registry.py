@@ -1,11 +1,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 from config.settings import ProviderSettings
 from domain.enums import ProviderCapability
 
 from .base import ProviderDescriptor
+
+
+class ExecutionConcurrencyMode(str, Enum):
+    STORYBLOCKS_SAFE = "storyblocks_safe"
+    FREE_IMAGES_PARALLEL = "free_images_parallel"
+    MIXED_SAFE = "mixed_safe"
+
+
+@dataclass(frozen=True, slots=True)
+class ConcurrencyModeResolution:
+    mode: ExecutionConcurrencyMode
+    selected_provider_ids: tuple[str, ...] = ()
+    storyblocks_provider_ids: tuple[str, ...] = ()
+    free_image_provider_ids: tuple[str, ...] = ()
+
+    @property
+    def uses_storyblocks(self) -> bool:
+        return bool(self.storyblocks_provider_ids)
 
 
 @dataclass(slots=True)
@@ -86,6 +105,64 @@ class ProviderRegistry:
             return {"primary": primary, "fallback": fallback, "separate": []}
 
         return {"primary": enabled, "fallback": [], "separate": []}
+
+    def resolve_concurrency_mode(
+        self,
+        settings: ProviderSettings,
+        *,
+        video_enabled: bool = True,
+        storyblocks_images_enabled: bool = True,
+        free_images_enabled: bool = True,
+    ) -> ConcurrencyModeResolution:
+        enabled = self.resolve_enabled(
+            settings,
+            capability=None,
+            include_opt_in=False,
+        )
+        selected: list[ProviderDescriptor] = []
+        for descriptor in enabled:
+            if (
+                descriptor.capability == ProviderCapability.VIDEO
+                and not video_enabled
+            ):
+                continue
+            if descriptor.capability != ProviderCapability.IMAGE:
+                selected.append(descriptor)
+                continue
+            is_storyblocks_image = descriptor.provider_group == "storyblocks_images"
+            if is_storyblocks_image and not storyblocks_images_enabled:
+                continue
+            if (not is_storyblocks_image) and not free_images_enabled:
+                continue
+            selected.append(descriptor)
+
+        selected_ids = tuple(item.provider_id for item in selected)
+        storyblocks_ids = tuple(
+            item.provider_id
+            for item in selected
+            if item.provider_group in {"storyblocks_video", "storyblocks_images"}
+        )
+        free_image_ids = tuple(
+            item.provider_id
+            for item in selected
+            if item.capability == ProviderCapability.IMAGE
+            and item.provider_group != "storyblocks_images"
+        )
+
+        has_storyblocks = bool(storyblocks_ids)
+        has_free_images = bool(free_image_ids)
+        if has_storyblocks and has_free_images:
+            mode = ExecutionConcurrencyMode.MIXED_SAFE
+        elif has_storyblocks:
+            mode = ExecutionConcurrencyMode.STORYBLOCKS_SAFE
+        else:
+            mode = ExecutionConcurrencyMode.FREE_IMAGES_PARALLEL
+        return ConcurrencyModeResolution(
+            mode=mode,
+            selected_provider_ids=selected_ids,
+            storyblocks_provider_ids=storyblocks_ids,
+            free_image_provider_ids=free_image_ids,
+        )
 
 
 def build_default_provider_registry() -> ProviderRegistry:

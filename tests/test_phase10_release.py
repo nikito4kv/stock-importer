@@ -8,7 +8,6 @@ from zipfile import ZipFile
 
 from release_tools.portable import build_portable_bundle
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 

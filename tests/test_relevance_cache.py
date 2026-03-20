@@ -4,7 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from legacy_core.relevance import ImageRelevanceCache, VideoRelevanceCache, parse_relevance_response
+from legacy_core.relevance import (
+    ImageRelevanceCache,
+    VideoRelevanceCache,
+    parse_relevance_response,
+)
 
 
 class RelevanceCacheTests(unittest.TestCase):

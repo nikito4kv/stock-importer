@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -52,7 +53,6 @@ from storage import (
     WorkspaceStorage,
 )
 from storage.serialization import read_json, write_json
-
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "storyblocks"
 
@@ -674,6 +674,124 @@ class Phase9ReliabilityTests(unittest.TestCase):
             self.assertEqual(
                 mixed_selection.fallback_assets[0].provider_name, "openverse"
             )
+
+    def test_high_load_free_image_mode_stays_stable_with_parallelism(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container = bootstrap_application(temp_dir)
+            project = self._create_project(container, temp_dir, paragraph_count=12)
+            descriptor = container.provider_registry.get("openverse")
+            assert descriptor is not None
+            container.media_pipeline._provider_settings.enabled_providers = ["openverse"]
+            container.orchestrator.configure(max_workers=1, queue_size=4)
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="openverse",
+                    capability=ProviderCapability.IMAGE,
+                    descriptor=descriptor,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            f"openverse-{paragraph.paragraph_no}",
+                            "openverse",
+                            AssetKind.IMAGE,
+                            7.0,
+                        )
+                    ],
+                )
+            )
+
+            started_at = time.perf_counter()
+            run, manifest = container.media_run_service.create_and_execute(
+                project.project_id,
+                config=MediaSelectionConfig(
+                    video_enabled=False,
+                    storyblocks_images_enabled=False,
+                    free_images_enabled=True,
+                    supporting_image_limit=0,
+                    fallback_image_limit=1,
+                    provider_workers=4,
+                    provider_queue_size=8,
+                    download_workers=4,
+                    bounded_downloads=8,
+                    relevance_workers=2,
+                    bounded_relevance_queue=8,
+                    early_stop_when_satisfied=False,
+                ),
+            )
+            elapsed = time.perf_counter() - started_at
+
+            self.assertEqual(run.status, RunStatus.COMPLETED)
+            self.assertEqual(manifest.summary["paragraphs_completed"], 12)
+            self.assertLess(elapsed, 6.0)
+
+    def test_pause_cancel_resume_under_free_image_load_remains_responsive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container = bootstrap_application(temp_dir)
+            project = self._create_project(container, temp_dir, paragraph_count=8)
+            descriptor = container.provider_registry.get("openverse")
+            assert descriptor is not None
+            container.media_pipeline._provider_settings.enabled_providers = ["openverse"]
+            container.orchestrator.configure(max_workers=1, queue_size=3)
+
+            def slow_search(paragraph: ParagraphUnit, query: str, limit: int):
+                time.sleep(0.05)
+                return [
+                    _candidate(
+                        f"openverse-{paragraph.paragraph_no}",
+                        "openverse",
+                        AssetKind.IMAGE,
+                        7.0,
+                    )
+                ]
+
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="openverse",
+                    capability=ProviderCapability.IMAGE,
+                    descriptor=descriptor,
+                    search_fn=slow_search,
+                )
+            )
+
+            config = MediaSelectionConfig(
+                video_enabled=False,
+                storyblocks_images_enabled=False,
+                free_images_enabled=True,
+                supporting_image_limit=0,
+                fallback_image_limit=1,
+                provider_workers=3,
+                provider_queue_size=6,
+                early_stop_when_satisfied=False,
+            )
+
+            run, _ = container.media_run_service.create_run(
+                project.project_id,
+                config=config,
+            )
+            container.media_run_service.pause_after_current(run.run_id)
+            paused_run, paused_manifest = container.media_run_service.execute(
+                run.run_id,
+                config=config,
+            )
+            self.assertEqual(paused_run.status, RunStatus.PAUSED)
+            self.assertGreaterEqual(paused_manifest.summary["paragraphs_completed"], 1)
+
+            resumed_run, resumed_manifest = container.media_run_service.resume(
+                run.run_id,
+                config=config,
+            )
+            self.assertEqual(resumed_run.status, RunStatus.COMPLETED)
+            self.assertEqual(resumed_manifest.summary["paragraphs_completed"], 8)
+
+            cancelled_seed, _ = container.media_run_service.create_run(
+                project.project_id,
+                config=config,
+            )
+            container.media_run_service.cancel(cancelled_seed.run_id)
+            cancelled_run, _ = container.media_run_service.execute(
+                cancelled_seed.run_id,
+                config=config,
+            )
+            self.assertEqual(cancelled_run.status, RunStatus.CANCELLED)
 
 
 if __name__ == "__main__":

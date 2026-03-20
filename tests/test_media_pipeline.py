@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import io
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.bootstrap import ApplicationContainer
-from app.bootstrap import bootstrap_application
-from domain.enums import AssetKind, ProviderCapability, RunStatus
+from app.bootstrap import ApplicationContainer, bootstrap_application
+from domain.enums import AssetKind, ProviderCapability, RunStage, RunStatus
 from domain.models import (
     AssetCandidate,
     AssetSelection,
@@ -623,6 +624,10 @@ class MediaPipelineTests(unittest.TestCase):
 
             self.assertEqual(paused_run.status, RunStatus.PAUSED)
             self.assertEqual(paused_manifest.summary["paragraphs_completed"], 1)
+            self.assertNotIn(run.run_id, container.media_pipeline._run_dedupers)
+            self.assertNotIn(
+                run.run_id, container.media_pipeline._manifest_entry_indexes
+            )
 
             resumed_run, failed_manifest = container.media_run_service.resume(
                 run.run_id
@@ -871,6 +876,723 @@ class MediaPipelineTests(unittest.TestCase):
                     for reason in manifest.paragraph_entries[0].rejection_reasons
                 )
             )
+
+    def test_pipeline_seeds_run_deduper_once_per_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=3)
+            video_descriptor = container.provider_registry.get("storyblocks_video")
+            assert video_descriptor is not None
+
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="storyblocks_video",
+                    capability=ProviderCapability.VIDEO,
+                    descriptor=video_descriptor,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            f"video-{paragraph.paragraph_no}",
+                            "storyblocks_video",
+                            AssetKind.VIDEO,
+                            rank_hint=9.0,
+                            title=f"Video {paragraph.paragraph_no}",
+                            semantic_signature=f"video-{paragraph.paragraph_no}",
+                        )
+                    ],
+                )
+            )
+
+            with patch.object(
+                container.media_pipeline,
+                "_seed_run_deduper",
+                wraps=container.media_pipeline._seed_run_deduper,
+            ) as seed_deduper:
+                run, _manifest = container.media_run_service.create_and_execute(
+                    project.project_id,
+                    config=MediaSelectionConfig(
+                        storyblocks_images_enabled=False,
+                        free_images_enabled=False,
+                    ),
+                )
+
+            self.assertEqual(run.status, RunStatus.COMPLETED)
+            self.assertEqual(seed_deduper.call_count, 1)
+            self.assertNotIn(run.run_id, container.media_pipeline._run_dedupers)
+            self.assertNotIn(
+                run.run_id, container.media_pipeline._manifest_entry_indexes
+            )
+
+    def test_resume_keeps_deduper_seeded_after_locked_paragraph(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=3)
+            video_descriptor = container.provider_registry.get("storyblocks_video")
+            assert video_descriptor is not None
+
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="storyblocks_video",
+                    capability=ProviderCapability.VIDEO,
+                    descriptor=video_descriptor,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            "video-1"
+                            if paragraph.paragraph_no == 3
+                            else f"video-{paragraph.paragraph_no}",
+                            "storyblocks_video",
+                            AssetKind.VIDEO,
+                            rank_hint=9.0,
+                            title=f"Video {paragraph.paragraph_no}",
+                            semantic_signature=(
+                                "video-1"
+                                if paragraph.paragraph_no == 3
+                                else f"video-{paragraph.paragraph_no}"
+                            ),
+                        )
+                    ],
+                )
+            )
+
+            run, manifest = container.media_run_service.create_run(project.project_id)
+            first = manifest.paragraph_entries[0]
+            first.selection = AssetSelection(
+                paragraph_no=1,
+                primary_asset=_candidate(
+                    "video-1",
+                    "storyblocks_video",
+                    AssetKind.VIDEO,
+                    rank_hint=9.0,
+                    title="Video 1",
+                    semantic_signature="video-1",
+                ),
+                status="selected",
+            )
+            first.status = "selected"
+
+            second = manifest.paragraph_entries[1]
+            second.selection = AssetSelection(
+                paragraph_no=2,
+                primary_asset=_candidate(
+                    "video-2",
+                    "storyblocks_video",
+                    AssetKind.VIDEO,
+                    rank_hint=9.0,
+                    title="Video 2",
+                    semantic_signature="video-2",
+                ),
+                status="locked",
+                user_locked=True,
+                user_decision_status="locked",
+            )
+            second.status = "locked"
+            second.user_decision_status = "locked"
+
+            container.media_pipeline.save_manifest(manifest)
+            run.completed_paragraphs = [1]
+            container.run_repository.save(run)
+
+            resumed_run, resumed_manifest = container.media_run_service.resume(
+                run.run_id,
+                config=MediaSelectionConfig(
+                    storyblocks_images_enabled=False,
+                    free_images_enabled=False,
+                ),
+            )
+
+            self.assertEqual(resumed_run.status, RunStatus.COMPLETED)
+            third = resumed_manifest.paragraph_entries[2]
+            assert third.selection is not None
+            assert third.diagnostics is not None
+            self.assertEqual(third.status, "no_match")
+            self.assertIsNone(third.selection.primary_asset)
+            self.assertEqual(third.diagnostics.dedupe_rejections.get("source_id"), 1)
+
+    def test_execute_persists_run_without_extra_final_save(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=1)
+            video_descriptor = container.provider_registry.get("storyblocks_video")
+            assert video_descriptor is not None
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="storyblocks_video",
+                    capability=ProviderCapability.VIDEO,
+                    descriptor=video_descriptor,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            f"video-{paragraph.paragraph_no}",
+                            "storyblocks_video",
+                            AssetKind.VIDEO,
+                            rank_hint=9.0,
+                            title=f"Video {paragraph.paragraph_no}",
+                        )
+                    ],
+                )
+            )
+            run, _manifest = container.media_run_service.create_run(project.project_id)
+            with patch.object(
+                container.run_repository,
+                "save",
+                wraps=container.run_repository.save,
+            ) as save_run:
+                completed_run, _ = container.media_run_service.execute(run.run_id)
+
+            self.assertEqual(completed_run.status, RunStatus.COMPLETED)
+            self.assertEqual(save_run.call_count, 2)
+
+    def test_cancelled_run_persists_checkpoint_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=2)
+            run, _manifest = container.media_run_service.create_run(project.project_id)
+            container.media_run_service.cancel(run.run_id)
+
+            cancelled_run, cancelled_manifest = container.media_run_service.execute(
+                run.run_id
+            )
+
+            self.assertEqual(cancelled_run.status, RunStatus.CANCELLED)
+            self.assertIsNotNone(cancelled_run.checkpoint)
+            assert cancelled_run.checkpoint is not None
+            self.assertEqual(cancelled_run.checkpoint.stage, RunStage.PERSIST)
+            self.assertEqual(cancelled_run.checkpoint.completed_paragraphs, [])
+            self.assertEqual(cancelled_run.checkpoint.failed_paragraphs, [])
+            self.assertEqual(cancelled_manifest.summary["paragraphs_processed"], 0)
+
+    def test_free_image_mode_allows_parallel_workers_above_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=1)
+            descriptor = container.provider_registry.get("openverse")
+            assert descriptor is not None
+            container.media_pipeline._provider_settings.enabled_providers = [
+                "openverse"
+            ]
+            container.orchestrator.configure(max_workers=3, queue_size=3)
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="openverse",
+                    capability=ProviderCapability.IMAGE,
+                    descriptor=descriptor,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            f"openverse-{paragraph.paragraph_no}",
+                            "openverse",
+                            AssetKind.IMAGE,
+                            rank_hint=8.0,
+                            title=f"Openverse {paragraph.paragraph_no}",
+                        )
+                    ],
+                )
+            )
+
+            run, manifest = container.media_run_service.create_and_execute(
+                project.project_id,
+                config=MediaSelectionConfig(
+                    video_enabled=False,
+                    storyblocks_images_enabled=False,
+                    free_images_enabled=True,
+                ),
+            )
+
+            self.assertEqual(run.status, RunStatus.COMPLETED)
+            self.assertEqual(len(run.completed_paragraphs), 1)
+            self.assertEqual(manifest.summary["paragraphs_completed"], 1)
+
+    def test_free_image_mode_uses_parallel_provider_pool_and_records_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=1)
+            openverse_descriptor = container.provider_registry.get("openverse")
+            wikimedia_descriptor = container.provider_registry.get("wikimedia")
+            assert openverse_descriptor is not None
+            assert wikimedia_descriptor is not None
+            container.media_pipeline._provider_settings.enabled_providers = [
+                "openverse",
+                "wikimedia",
+            ]
+
+            active_calls = 0
+            max_active_calls = 0
+            guard = threading.Lock()
+
+            def slow_search(
+                paragraph: ParagraphUnit,
+                query: str,
+                limit: int,
+            ) -> list[AssetCandidate]:
+                nonlocal active_calls, max_active_calls
+                with guard:
+                    active_calls += 1
+                    max_active_calls = max(max_active_calls, active_calls)
+                try:
+                    time.sleep(0.08)
+                    return [
+                        _candidate(
+                            f"{query}-{paragraph.paragraph_no}",
+                            "openverse",
+                            AssetKind.IMAGE,
+                            rank_hint=6.0,
+                            title="parallel",
+                        )
+                    ]
+                finally:
+                    with guard:
+                        active_calls -= 1
+
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="openverse",
+                    capability=ProviderCapability.IMAGE,
+                    descriptor=openverse_descriptor,
+                    search_fn=slow_search,
+                )
+            )
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="wikimedia",
+                    capability=ProviderCapability.IMAGE,
+                    descriptor=wikimedia_descriptor,
+                    search_fn=slow_search,
+                )
+            )
+
+            run, manifest = container.media_run_service.create_and_execute(
+                project.project_id,
+                config=MediaSelectionConfig(
+                    video_enabled=False,
+                    storyblocks_images_enabled=False,
+                    free_images_enabled=True,
+                    early_stop_when_satisfied=False,
+                    provider_workers=4,
+                    provider_queue_size=4,
+                    supporting_image_limit=0,
+                    fallback_image_limit=1,
+                ),
+            )
+
+            self.assertEqual(run.status, RunStatus.COMPLETED)
+            self.assertGreaterEqual(max_active_calls, 2)
+            self.assertEqual(run.metadata.get("concurrency_mode"), "free_images_parallel")
+            self.assertEqual(
+                manifest.sourcing_strategy.get("concurrency_mode"),
+                "free_images_parallel",
+            )
+
+    def test_parallel_image_downloads_keep_deterministic_asset_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=1)
+            descriptor = container.provider_registry.get("openverse")
+            assert descriptor is not None
+            container.media_pipeline._provider_settings.enabled_providers = ["openverse"]
+
+            class OrderedDownloadingBackend(CallbackCandidateSearchBackend):
+                def download_asset(
+                    self, asset: AssetCandidate, *, destination_dir: Path, filename: str
+                ) -> AssetCandidate:
+                    destination_dir.mkdir(parents=True, exist_ok=True)
+                    if asset.asset_id == "img-high":
+                        time.sleep(0.12)
+                    else:
+                        time.sleep(0.02)
+                    local_path = destination_dir / filename
+                    local_path.write_bytes(asset.asset_id.encode("utf-8"))
+                    downloaded = AssetCandidate.from_dict(asset.to_dict())
+                    downloaded.local_path = local_path
+                    downloaded.metadata["download_status"] = "completed"
+                    return downloaded
+
+            container.media_pipeline.register_backend(
+                OrderedDownloadingBackend(
+                    provider_id="openverse",
+                    capability=ProviderCapability.IMAGE,
+                    descriptor=descriptor,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            "img-high",
+                            "openverse",
+                            AssetKind.IMAGE,
+                            rank_hint=9.0,
+                            title="high",
+                        ),
+                        _candidate(
+                            "img-low",
+                            "openverse",
+                            AssetKind.IMAGE,
+                            rank_hint=8.0,
+                            title="low",
+                        ),
+                    ],
+                )
+            )
+
+            run, manifest = container.media_run_service.create_and_execute(
+                project.project_id,
+                config=MediaSelectionConfig(
+                    video_enabled=False,
+                    storyblocks_images_enabled=False,
+                    free_images_enabled=True,
+                    supporting_image_limit=0,
+                    fallback_image_limit=2,
+                    download_workers=2,
+                    bounded_downloads=2,
+                    early_stop_when_satisfied=False,
+                ),
+            )
+
+            self.assertEqual(run.status, RunStatus.COMPLETED)
+            entry = manifest.paragraph_entries[0]
+            assert entry.selection is not None
+            self.assertEqual(
+                [asset.asset_id for asset in entry.selection.fallback_assets],
+                ["img-high", "img-low"],
+            )
+
+    def test_fallback_search_uses_fallback_limit_for_early_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=1)
+            openverse_descriptor = container.provider_registry.get("openverse")
+            wikimedia_descriptor = container.provider_registry.get("wikimedia")
+            assert openverse_descriptor is not None
+            assert wikimedia_descriptor is not None
+            container.media_pipeline._provider_settings.enabled_providers = [
+                "openverse",
+                "wikimedia",
+            ]
+
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="openverse",
+                    capability=ProviderCapability.IMAGE,
+                    descriptor=openverse_descriptor,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            "fallback-a",
+                            "openverse",
+                            AssetKind.IMAGE,
+                            rank_hint=9.0,
+                            title="Fallback A",
+                        )
+                    ],
+                )
+            )
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="wikimedia",
+                    capability=ProviderCapability.IMAGE,
+                    descriptor=wikimedia_descriptor,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            "fallback-b",
+                            "wikimedia",
+                            AssetKind.IMAGE,
+                            rank_hint=8.5,
+                            title="Fallback B",
+                        )
+                    ],
+                )
+            )
+
+            run, manifest = container.media_run_service.create_and_execute(
+                project.project_id,
+                config=MediaSelectionConfig(
+                    video_enabled=False,
+                    storyblocks_images_enabled=False,
+                    free_images_enabled=True,
+                    supporting_image_limit=0,
+                    fallback_image_limit=2,
+                    early_stop_when_satisfied=True,
+                ),
+            )
+
+            self.assertEqual(run.status, RunStatus.COMPLETED)
+            entry = manifest.paragraph_entries[0]
+            assert entry.selection is not None
+            self.assertEqual(
+                [asset.asset_id for asset in entry.selection.fallback_assets],
+                ["fallback-a", "fallback-b"],
+            )
+
+    def test_storyblocks_image_session_error_fails_fast(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=1)
+            descriptor = container.provider_registry.get("storyblocks_image")
+            assert descriptor is not None
+            container.media_pipeline._provider_settings.enabled_providers = [
+                "storyblocks_image"
+            ]
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="storyblocks_image",
+                    capability=ProviderCapability.IMAGE,
+                    descriptor=descriptor,
+                    search_fn=lambda paragraph, query, limit: (_ for _ in ()).throw(
+                        SessionError(
+                            code="storyblocks_session_expired",
+                            message="Storyblocks session expired",
+                        )
+                    ),
+                )
+            )
+
+            run, manifest = container.media_run_service.create_and_execute(
+                project.project_id,
+                config=MediaSelectionConfig(
+                    video_enabled=False,
+                    storyblocks_images_enabled=True,
+                    free_images_enabled=False,
+                    retry_budget=0,
+                ),
+            )
+
+            self.assertEqual(run.status, RunStatus.FAILED)
+            self.assertEqual(run.failed_paragraphs, [1])
+            self.assertEqual(manifest.paragraph_entries[0].status, "failed")
+            self.assertIn("Storyblocks session expired", run.last_error or "")
+
+    def test_search_timeout_uses_configured_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=1)
+            descriptor = container.provider_registry.get("storyblocks_video")
+            assert descriptor is not None
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="storyblocks_video",
+                    capability=ProviderCapability.VIDEO,
+                    descriptor=descriptor,
+                    search_fn=lambda paragraph, query, limit: (
+                        time.sleep(0.2),
+                        [
+                            _candidate(
+                                "slow-video",
+                                "storyblocks_video",
+                                AssetKind.VIDEO,
+                                rank_hint=9.0,
+                                title="Slow Video",
+                            )
+                        ],
+                    )[1],
+                )
+            )
+
+            started_at = time.perf_counter()
+            run, _manifest = container.media_run_service.create_and_execute(
+                project.project_id,
+                config=MediaSelectionConfig(
+                    storyblocks_images_enabled=False,
+                    free_images_enabled=False,
+                    search_timeout_seconds=0.05,
+                    retry_budget=0,
+                ),
+            )
+            elapsed = time.perf_counter() - started_at
+
+            self.assertEqual(run.status, RunStatus.FAILED)
+            self.assertLess(elapsed, 0.15)
+            self.assertIn("search timeout exceeded", run.last_error or "")
+
+    def test_download_timeout_marks_image_candidate_failed_quickly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=1)
+            descriptor = container.provider_registry.get("openverse")
+            assert descriptor is not None
+            container.media_pipeline._provider_settings.enabled_providers = ["openverse"]
+
+            class SlowDownloadingBackend(CallbackCandidateSearchBackend):
+                def download_asset(
+                    self, asset: AssetCandidate, *, destination_dir: Path, filename: str
+                ) -> AssetCandidate:
+                    time.sleep(0.2)
+                    destination_dir.mkdir(parents=True, exist_ok=True)
+                    local_path = destination_dir / filename
+                    local_path.write_bytes(b"slow-image")
+                    downloaded = AssetCandidate.from_dict(asset.to_dict())
+                    downloaded.local_path = local_path
+                    downloaded.metadata["download_status"] = "completed"
+                    return downloaded
+
+            container.media_pipeline.register_backend(
+                SlowDownloadingBackend(
+                    provider_id="openverse",
+                    capability=ProviderCapability.IMAGE,
+                    descriptor=descriptor,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            "slow-image",
+                            "openverse",
+                            AssetKind.IMAGE,
+                            rank_hint=9.0,
+                            title="Slow Image",
+                        )
+                    ],
+                )
+            )
+
+            started_at = time.perf_counter()
+            run, manifest = container.media_run_service.create_and_execute(
+                project.project_id,
+                config=MediaSelectionConfig(
+                    video_enabled=False,
+                    storyblocks_images_enabled=False,
+                    free_images_enabled=True,
+                    supporting_image_limit=0,
+                    fallback_image_limit=1,
+                    download_timeout_seconds=0.05,
+                    retry_budget=0,
+                ),
+            )
+            elapsed = time.perf_counter() - started_at
+
+            self.assertEqual(run.status, RunStatus.COMPLETED)
+            self.assertLess(elapsed, 0.15)
+            self.assertEqual(manifest.paragraph_entries[0].status, "no_match")
+            self.assertTrue(
+                any(
+                    "download timeout exceeded" in reason
+                    for reason in manifest.paragraph_entries[0].rejection_reasons
+                )
+            )
+
+    def test_relevance_timeout_degrades_without_blocking_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=1)
+            descriptor = container.provider_registry.get("openverse")
+            assert descriptor is not None
+            container.media_pipeline._provider_settings.enabled_providers = ["openverse"]
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="openverse",
+                    capability=ProviderCapability.IMAGE,
+                    descriptor=descriptor,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            "img-1",
+                            "openverse",
+                            AssetKind.IMAGE,
+                            rank_hint=9.0,
+                            title="Image 1",
+                        ),
+                        _candidate(
+                            "img-2",
+                            "openverse",
+                            AssetKind.IMAGE,
+                            rank_hint=8.0,
+                            title="Image 2",
+                        ),
+                        _candidate(
+                            "img-3",
+                            "openverse",
+                            AssetKind.IMAGE,
+                            rank_hint=7.0,
+                            title="Image 3",
+                        ),
+                        _candidate(
+                            "img-4",
+                            "openverse",
+                            AssetKind.IMAGE,
+                            rank_hint=6.0,
+                            title="Image 4",
+                        ),
+                    ],
+                )
+            )
+
+            def slow_rank(asset: AssetCandidate) -> float:
+                time.sleep(0.05)
+                return float(asset.metadata["rank_hint"])
+
+            started_at = time.perf_counter()
+            with patch.object(container.media_pipeline, "_asset_rank", side_effect=slow_rank):
+                run, manifest = container.media_run_service.create_and_execute(
+                    project.project_id,
+                    config=MediaSelectionConfig(
+                        video_enabled=False,
+                        storyblocks_images_enabled=False,
+                        free_images_enabled=True,
+                        supporting_image_limit=0,
+                        fallback_image_limit=2,
+                        relevance_workers=2,
+                        bounded_relevance_queue=4,
+                        relevance_timeout_seconds=0.01,
+                        early_stop_when_satisfied=False,
+                    ),
+                )
+            elapsed = time.perf_counter() - started_at
+
+            self.assertEqual(run.status, RunStatus.COMPLETED)
+            self.assertLess(elapsed, 0.15)
+            entry = manifest.paragraph_entries[0]
+            assert entry.selection is not None
+            self.assertEqual(
+                [asset.asset_id for asset in entry.selection.fallback_assets],
+                ["img-1", "img-2"],
+            )
+            degraded_events = [
+                event
+                for event in container.event_recorder.by_run(run.run_id)
+                if event.name == "paragraph.relevance.degraded"
+            ]
+            self.assertTrue(degraded_events)
+            self.assertTrue(degraded_events[-1].payload.get("relevance_timed_out"))
+            self.assertGreater(
+                int(degraded_events[-1].payload.get("relevance_tasks_timed_out", 0)),
+                0,
+            )
+
+    def test_no_match_reason_counter_uses_low_cardinality_bucket(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=1)
+            video_descriptor = container.provider_registry.get("storyblocks_video")
+            image_descriptor = container.provider_registry.get("storyblocks_image")
+            assert video_descriptor is not None
+            assert image_descriptor is not None
+
+            class BrokenVideoBackend(CallbackCandidateSearchBackend):
+                def download_asset(
+                    self, asset: AssetCandidate, *, destination_dir: Path, filename: str
+                ) -> AssetCandidate:
+                    raise DownloadError(
+                        code="storyblocks_download_failed",
+                        message=f"asset {asset.asset_id} download failed",
+                    )
+
+            container.media_pipeline.register_backend(
+                BrokenVideoBackend(
+                    provider_id="storyblocks_video",
+                    capability=ProviderCapability.VIDEO,
+                    descriptor=video_descriptor,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            "video-a",
+                            "storyblocks_video",
+                            AssetKind.VIDEO,
+                            rank_hint=9.0,
+                            title="Video A",
+                        )
+                    ],
+                )
+            )
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="storyblocks_image",
+                    capability=ProviderCapability.IMAGE,
+                    descriptor=image_descriptor,
+                    search_fn=lambda paragraph, query, limit: [],
+                )
+            )
+
+            run, _manifest = container.media_run_service.create_and_execute(
+                project.project_id,
+                config=MediaSelectionConfig(
+                    storyblocks_images_enabled=True,
+                    free_images_enabled=False,
+                ),
+            )
+            self.assertEqual(run.status, RunStatus.COMPLETED)
+            reloaded = container.run_repository.load(run.run_id)
+            self.assertIsNotNone(reloaded)
+            assert reloaded is not None
+            perf_context = reloaded.metadata.get("performance_context")
+            self.assertIsInstance(perf_context, dict)
+            assert isinstance(perf_context, dict)
+            counters = dict(perf_context.get("counters") or {})
+            reason_keys = [key for key in counters if key.startswith("no_match_reason_")]
+            self.assertIn("no_match_reason_download_failed", reason_keys)
+            self.assertFalse(any("video_a" in key for key in reason_keys))
 
 
 if __name__ == "__main__":

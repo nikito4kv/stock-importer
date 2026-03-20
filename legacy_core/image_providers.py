@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import importlib
-from typing import Any
 import sys
 import types
+from dataclasses import dataclass
+from typing import Any
 
 from .licenses import normalize_license_info
 from .network import http_get_json
@@ -60,7 +60,7 @@ def _install_imghdr_compat() -> None:
             return "tiff"
         return None
 
-    setattr(module, "what", what)
+    module.what = what
     sys.modules["imghdr"] = module
 
 
@@ -341,8 +341,8 @@ class WikimediaProvider:
                 metadata = {}
             metadata_map: dict[str, Any] = metadata
 
-            def meta_value(key: str) -> str:
-                raw = metadata_map.get(key)
+            def meta_value(key: str, _metadata_map: dict[str, Any] = metadata_map) -> str:
+                raw = _metadata_map.get(key)
                 if isinstance(raw, dict):
                     return _strip_html(str(raw.get("value") or ""))
                 return ""

@@ -1,52 +1,55 @@
 import argparse
-import asyncio
 import hashlib
 import importlib
 import io
-import ipaddress
 import json
 import logging
 import os
 import random
 import re
-import sqlite3
-import socket
 import sys
 import threading
 import time
 import types
-import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
 from legacy_core.common import normalize_keywords as shared_normalize_keywords
 from legacy_core.common import safe_int as shared_safe_int
 from legacy_core.common import slugify as shared_slugify
 from legacy_core.env import get_env_path as shared_get_env_path
 from legacy_core.env import load_dotenv as shared_load_dotenv
 from legacy_core.files import build_run_dir as shared_build_run_dir
-from legacy_core.files import resolve_output_json_path as shared_resolve_output_json_path
+from legacy_core.files import (
+    resolve_output_json_path as shared_resolve_output_json_path,
+)
 from legacy_core.image_providers import BingProvider as SharedBingProvider
 from legacy_core.image_providers import OpenverseProvider as SharedOpenverseProvider
 from legacy_core.image_providers import PexelsProvider as SharedPexelsProvider
 from legacy_core.image_providers import PixabayProvider as SharedPixabayProvider
 from legacy_core.image_providers import SearchCandidate as SharedSearchCandidate
 from legacy_core.image_providers import WikimediaProvider as SharedWikimediaProvider
-from legacy_core.image_providers import build_image_providers
-from legacy_core.keyword_payload import extract_paragraph_tasks as shared_extract_paragraph_tasks
-from legacy_core.keyword_payload import load_keywords_payload as shared_load_keywords_payload
+from legacy_core.keyword_payload import (
+    extract_paragraph_tasks as shared_extract_paragraph_tasks,
+)
+from legacy_core.keyword_payload import (
+    load_keywords_payload as shared_load_keywords_payload,
+)
 from legacy_core.licenses import is_license_allowed as shared_is_license_allowed
 from legacy_core.licenses import normalize_license_info as shared_normalize_license_info
 from legacy_core.network import http_get_json as shared_http_get_json
 from legacy_core.network import is_public_host as shared_is_public_host
-from legacy_core.network import open_with_safe_redirects as shared_open_with_safe_redirects
+from legacy_core.network import (
+    open_with_safe_redirects as shared_open_with_safe_redirects,
+)
 from legacy_core.network import read_limited as shared_read_limited
 from legacy_core.network import validate_public_url as shared_validate_public_url
-from pathlib import Path
-from typing import Any
 from legacy_core.query_utils import build_query_variants as shared_build_query_variants
 from legacy_core.query_utils import candidate_hint_score as shared_candidate_hint_score
 from legacy_core.query_utils import parse_sources as shared_parse_sources
@@ -54,7 +57,9 @@ from legacy_core.query_utils import tokenize as shared_tokenize
 from legacy_core.relevance import ImageRelevanceCache as SharedImageRelevanceCache
 from legacy_core.relevance import SimpleRateLimiter as SharedSimpleRateLimiter
 from legacy_core.relevance import clean_model_text as shared_clean_model_text
-from legacy_core.relevance import parse_relevance_response as shared_parse_relevance_response
+from legacy_core.relevance import (
+    parse_relevance_response as shared_parse_relevance_response,
+)
 from legacy_core.retry import retry_call
 from providers import (
     ImageLicensePolicy,
@@ -62,7 +67,11 @@ from providers import (
     ImageProviderSearchService,
     build_default_provider_registry,
 )
-from services.genai_client import create_gemini_model, ensure_gemini_sdk_available, get_transient_exceptions
+from services.genai_client import (
+    create_gemini_model,
+    ensure_gemini_sdk_available,
+    get_transient_exceptions,
+)
 
 try:
     from PIL import Image, UnidentifiedImageError
@@ -200,7 +209,7 @@ def _install_imghdr_compat() -> None:
 
         return None
 
-    setattr(module, "what", what)
+    module.what = what
     sys.modules["imghdr"] = module
 
 
@@ -643,7 +652,7 @@ class RelevanceEvaluator:
                 api_key=_GEMINI_API_KEY,
                 model_name=self.model_name,
             )
-            setattr(self._local, "model", model)
+            self._local.model = model
         return model
 
     def _make_prompt(self, keyword: str, paragraph_text: str) -> str:

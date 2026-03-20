@@ -10,6 +10,7 @@ from .media import (
     ParagraphMediaRunService,
 )
 from .orchestrator import RunOrchestrator
+from .perf import PerformanceContext
 
 __all__ = [
     "AssetDeduper",
@@ -20,6 +21,7 @@ __all__ = [
     "ParagraphIntentService",
     "ParagraphMediaPipeline",
     "ParagraphMediaRunService",
+    "PerformanceContext",
     "RunOrchestrator",
     "ScriptIngestionService",
 ]

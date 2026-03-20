@@ -9,7 +9,6 @@ from legacy_core.query_utils import candidate_hint_score
 from ..base import ProviderDescriptor
 from .clients import SearchCandidate
 
-
 LOW_QUALITY_TOKENS = {
     "screenshot",
     "illustration",

@@ -6,10 +6,11 @@ from typing import Any
 
 from legacy_core.env import get_env_path as shared_get_env_path
 from legacy_core.env import load_dotenv as shared_load_dotenv
-from legacy_core.ingestion import read_script_paragraphs as shared_read_script_paragraphs
+from legacy_core.ingestion import (
+    read_script_paragraphs as shared_read_script_paragraphs,
+)
 from pipeline import ParagraphIntentService, ScriptIngestionService
 from services.genai_client import create_gemini_model
-
 
 logging.basicConfig(
     level=logging.INFO,
