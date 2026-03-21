@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from config.settings import BrowserSettings
 from domain.enums import SessionHealth
+from domain.models import BrowserProfile
 from services.errors import ConfigError, SessionError
 from storage.serialization import write_json
 
@@ -121,27 +122,28 @@ class BrowserSessionManager:
         self._action_pacer = BrowserActionPacer(
             SlowModePolicy.from_settings(self._settings)
         )
-        self._active_sessions: dict[str, PersistentBrowserSession] = {}
-        self._native_browser_sessions: dict[str, NativeBrowserSession] = {}
-        self._states: dict[str, BrowserSessionState] = {}
+        self._active_session: PersistentBrowserSession | None = None
+        self._native_browser_session: NativeBrowserSession | None = None
+        self._state: BrowserSessionState | None = None
         self._lock = threading.RLock()
 
-    def current_state(self, profile_id: str | None = None) -> BrowserSessionState:
-        profile = self._resolve_profile(profile_id, allow_missing=True)
-        if profile is None:
-            return BrowserSessionState(None, SessionHealth.UNKNOWN, _now())
+    def current_state(self) -> BrowserSessionState:
+        profile = self._resolve_profile()
 
-        native_session = self._refresh_native_browser_session(profile.profile_id)
+        native_session = self._refresh_native_browser_session()
 
         with self._lock:
-            state = self._states.get(profile.profile_id)
+            state = self._state
             if state is not None:
+                state.profile_id = profile.profile_id
                 state.native_login_running = native_session is not None
                 state.native_debug_port = (
                     native_session.plan.remote_debugging_port
                     if native_session is not None
                     else None
                 )
+                if not state.storyblocks_account:
+                    state.storyblocks_account = profile.storyblocks_account
                 return state
         return BrowserSessionState(
             profile_id=profile.profile_id,
@@ -160,9 +162,15 @@ class BrowserSessionManager:
             },
         )
 
-    def set_health(self, profile_id: str, health: SessionHealth) -> BrowserSessionState:
-        profile = self._profile_registry.update_session_health(profile_id, health)
-        state = self.current_state(profile.profile_id)
+    def set_health(
+        self,
+        health: SessionHealth,
+    ) -> BrowserSessionState:
+        profile = self._resolve_profile()
+        profile = self._profile_registry.update_session_health(
+            profile.profile_id, health
+        )
+        state = self.current_state()
         state.health = profile.session_health
         state.authenticated = profile.session_health == SessionHealth.READY
         state.reason_code = _reason_code_for_health(profile.session_health)
@@ -171,18 +179,16 @@ class BrowserSessionManager:
             "storyblocks_account": state.storyblocks_account or "",
         }
         state.last_checked_at = _now()
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
         return state
 
     def set_manual_ready_override(
         self,
-        profile_id: str | None = None,
         *,
         note: str = "Marked ready manually by the operator.",
     ) -> BrowserSessionState:
-        profile = self._resolve_profile(profile_id)
-        state = self.current_state(profile.profile_id)
+        profile = self._resolve_profile()
+        state = self.current_state()
         state.health = SessionHealth.READY
         state.authenticated = True
         state.manual_intervention = None
@@ -193,30 +199,22 @@ class BrowserSessionManager:
         self._profile_registry.update_session_health(
             profile.profile_id, SessionHealth.READY
         )
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
         return state
 
-    def clear_manual_ready_override(
-        self, profile_id: str | None = None
-    ) -> BrowserSessionState:
-        profile = self._resolve_profile(profile_id)
-        state = self.current_state(profile.profile_id)
+    def clear_manual_ready_override(self) -> BrowserSessionState:
+        state = self.current_state()
         state.manual_ready_override = False
         state.manual_ready_override_note = None
         state.last_checked_at = _now()
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
         return state
 
-    def has_manual_ready_override(self, profile_id: str | None = None) -> bool:
-        return self.current_state(profile_id).manual_ready_override
+    def has_manual_ready_override(self) -> bool:
+        return self.current_state().manual_ready_override
 
-    def check_browser_channel(
-        self, profile_id: str | None = None
-    ) -> BrowserSessionState:
-        profile = self._resolve_profile(profile_id)
-        state = self.current_state(profile.profile_id)
+    def check_browser_channel(self) -> BrowserSessionState:
+        state = self.current_state()
         availability = self._channel_resolver.resolve(self._settings.preferred_channels)
         state.browser_channel = availability.channel
         state.browser_available = availability.available
@@ -232,23 +230,22 @@ class BrowserSessionManager:
         }
         state.last_error = availability.reason or None
         state.last_checked_at = _now()
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
         return state
 
-    def profile_in_use(self, profile_id: str | None = None) -> bool:
-        profile = self._resolve_profile(profile_id)
+    def profile_in_use(self) -> bool:
+        profile = self._resolve_profile()
         with self._lock:
-            if profile.profile_id in self._active_sessions:
+            if self._active_session is not None:
                 return False
         return self._lock_probe.is_profile_in_use(
             self._profile_registry.paths_for(profile)
         )
 
-    def open_browser(self, profile_id: str | None = None) -> PersistentBrowserSession:
-        profile = self._resolve_profile(profile_id)
+    def open_browser(self) -> PersistentBrowserSession:
+        profile = self._resolve_profile()
         with self._lock:
-            existing = self._active_sessions.get(profile.profile_id)
+            existing = self._active_session
         if existing is not None:
             if existing.owner_thread_id != _current_thread_id():
                 raise SessionError(
@@ -261,20 +258,19 @@ class BrowserSessionManager:
                         "current_thread_id": _current_thread_id(),
                     },
                 )
-            state = self.current_state(profile.profile_id)
+            state = self.current_state()
             state.persistent_context_ready = True
             state.browser_available = True
-            with self._lock:
-                self._states[profile.profile_id] = state
+            self._remember_state(state)
             return existing
 
-        if self._refresh_native_browser_session(profile.profile_id) is not None:
-            return self._attach_to_native_browser(profile.profile_id)
+        if self._refresh_native_browser_session() is not None:
+            return self._attach_to_native_browser()
 
         profile_paths = self._profile_registry.paths_for(profile)
         availability = self._channel_resolver.resolve(self._settings.preferred_channels)
         if self._lock_probe.is_profile_in_use(profile_paths):
-            state = self.current_state(profile.profile_id)
+            state = self.current_state()
             state.profile_in_use = True
             state.browser_channel = availability.channel
             state.browser_available = availability.available
@@ -282,8 +278,7 @@ class BrowserSessionManager:
             state.last_error = (
                 "Browser profile is already in use by another browser process"
             )
-            with self._lock:
-                self._states[profile.profile_id] = state
+            self._remember_state(state)
             raise SessionError(
                 code="browser_profile_in_use",
                 message="The selected browser profile is already in use by another process.",
@@ -327,30 +322,28 @@ class BrowserSessionManager:
             plan=plan, handle=handle, kind="persistent_context", lock_acquired=True
         )
         with self._lock:
-            self._active_sessions[profile.profile_id] = session
+            self._active_session = session
 
-        state = self.current_state(profile.profile_id)
+        state = self.current_state()
         state.browser_channel = availability.channel
         state.browser_available = True
         state.profile_in_use = False
         state.persistent_context_ready = True
         state.last_error = None
         state.last_checked_at = _now()
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
         return session
 
     def open_native_login_browser(
         self,
-        profile_id: str | None = None,
         *,
         url: str | None = None,
     ) -> BrowserSessionState:
-        profile = self._resolve_profile(profile_id)
-        self.close_browser(profile.profile_id)
-        existing = self._refresh_native_browser_session(profile.profile_id)
+        profile = self._resolve_profile()
+        self.close_browser()
+        existing = self._refresh_native_browser_session()
         if existing is not None:
-            state = self.current_state(profile.profile_id)
+            state = self.current_state()
             state.browser_channel = existing.plan.browser_channel
             state.browser_available = True
             state.profile_in_use = False
@@ -374,18 +367,16 @@ class BrowserSessionManager:
             self._write_native_login_diagnostics(
                 profile.profile_id, status="native_browser_reused"
             )
-            with self._lock:
-                self._states[profile.profile_id] = state
+            self._remember_state(state)
             return state
 
         profile_paths = self._profile_registry.paths_for(profile)
         if self._lock_probe.is_profile_in_use(profile_paths):
-            state = self.current_state(profile.profile_id)
+            state = self.current_state()
             state.profile_in_use = True
             state.last_checked_at = _now()
             state.last_error = "The managed Storyblocks profile is already open in another browser window"
-            with self._lock:
-                self._states[profile.profile_id] = state
+            self._remember_state(state)
             raise SessionError(
                 code="browser_profile_in_use",
                 message="Close the browser window that already uses this managed Storyblocks profile, then try again.",
@@ -413,11 +404,11 @@ class BrowserSessionManager:
             )
         )
         with self._lock:
-            self._native_browser_sessions[profile.profile_id] = native_session
+            self._native_browser_session = native_session
         self._profile_registry.update_session_health(
             profile.profile_id, SessionHealth.LOGIN_REQUIRED
         )
-        state = self.current_state(profile.profile_id)
+        state = self.current_state()
         state.health = SessionHealth.LOGIN_REQUIRED
         state.authenticated = False
         state.browser_channel = availability.channel
@@ -444,40 +435,43 @@ class BrowserSessionManager:
         self._write_native_login_diagnostics(
             profile.profile_id, status="native_browser_started"
         )
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
         return state
 
-    def close_native_browser(self, profile_id: str | None = None) -> None:
-        profile = self._resolve_profile(profile_id)
+    def close_native_browser(self) -> None:
+        profile = self._resolve_profile()
         with self._lock:
-            attached = self._active_sessions.get(profile.profile_id)
+            attached = self._active_session
         if attached is not None and attached.kind == "native_debug_attach":
-            self.close_browser(profile.profile_id)
+            if attached.owner_thread_id == _current_thread_id():
+                self.close_browser()
+            else:
+                with self._lock:
+                    self._active_session = None
         with self._lock:
-            native_session = self._native_browser_sessions.pop(profile.profile_id, None)
+            native_session = self._native_browser_session
+            self._native_browser_session = None
         if native_session is not None and native_session.is_running():
             native_session.terminate()
             time.sleep(0.2)
-        state = self.current_state(profile.profile_id)
+        state = self.current_state()
         state.profile_in_use = False
         state.native_login_running = False
         state.native_debug_port = None
+        state.persistent_context_ready = self._active_session is not None
         state.last_checked_at = _now()
         self._write_native_login_diagnostics(
             profile.profile_id, status="native_browser_closed"
         )
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
 
-    def native_browser_running(self, profile_id: str | None = None) -> bool:
-        profile = self._resolve_profile(profile_id)
-        return self._refresh_native_browser_session(profile.profile_id) is not None
+    def native_browser_running(self) -> bool:
+        return self._refresh_native_browser_session() is not None
 
-    def close_browser(self, profile_id: str | None = None) -> None:
-        profile = self._resolve_profile(profile_id)
+    def close_browser(self) -> None:
+        profile = self._resolve_profile()
         with self._lock:
-            session = self._active_sessions.get(profile.profile_id)
+            session = self._active_session
         if session is not None and session.owner_thread_id != _current_thread_id():
             raise SessionError(
                 code="browser_session_thread_mismatch",
@@ -490,55 +484,56 @@ class BrowserSessionManager:
                 },
             )
         with self._lock:
-            session = self._active_sessions.pop(profile.profile_id, None)
+            session = self._active_session
+            self._active_session = None
         if session is not None:
             try:
                 session.handle.close()
             finally:
                 if session.lock_acquired:
                     self._lock_probe.release(self._profile_registry.paths_for(profile))
-        state = self.current_state(profile.profile_id)
+        state = self.current_state()
         state.persistent_context_ready = False
         state.profile_in_use = False
         state.last_checked_at = _now()
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
 
     def close_browsers_owned_by_current_thread(self) -> None:
-        current_thread_id = _current_thread_id()
         with self._lock:
-            owned_profile_ids = [
-                profile_id
-                for profile_id, session in self._active_sessions.items()
-                if session.owner_thread_id == current_thread_id
-            ]
-        for profile_id in owned_profile_ids:
-            self.close_browser(profile_id)
+            session = self._active_session
+        if session is None:
+            return
+        if session.owner_thread_id == _current_thread_id():
+            self.close_browser()
+
+    def shutdown(self) -> None:
+        self.close_browsers_owned_by_current_thread()
+        profile = self._profile_registry.get_singleton()
+        if profile is not None:
+            self.close_native_browser()
 
     def check_authorization(
         self,
-        profile_id: str | None = None,
         *,
         html: str | None = None,
         current_url: str | None = None,
         persist_handle: bool = True,
     ) -> BrowserSessionState:
-        profile = self._resolve_profile(profile_id)
-        state = self.current_state(profile.profile_id)
+        profile = self._resolve_profile()
+        state = self.current_state()
 
         if self._session_probe is None:
             state.last_checked_at = _now()
-            with self._lock:
-                self._states[profile.profile_id] = state
+            self._remember_state(state)
             return state
 
         if html is not None:
             snapshot = self._session_probe.inspect_document(html, current_url or "")
         else:
             session = None
-            if self._refresh_native_browser_session(profile.profile_id) is not None:
+            if self._refresh_native_browser_session() is not None:
                 try:
-                    session = self._attach_to_native_browser(profile.profile_id)
+                    session = self._attach_to_native_browser()
                 except SessionError as exc:
                     state.health = SessionHealth.LOGIN_REQUIRED
                     state.authenticated = False
@@ -561,11 +556,10 @@ class BrowserSessionManager:
                     self._write_native_login_diagnostics(
                         profile.profile_id, status="attach_failed", error=exc.message
                     )
-                    with self._lock:
-                        self._states[profile.profile_id] = state
+                    self._remember_state(state)
                     return state
             else:
-                session = self.open_browser(profile.profile_id)
+                session = self.open_browser()
             try:
                 self._ensure_storyblocks_page(session)
                 snapshot = self._session_probe.inspect_page(session.handle.page)
@@ -587,8 +581,7 @@ class BrowserSessionManager:
                 "message": snapshot.message,
             }
             state.last_checked_at = _now()
-            with self._lock:
-                self._states[profile.profile_id] = state
+            self._remember_state(state)
             return state
 
         self._profile_registry.update_session_health(
@@ -629,20 +622,17 @@ class BrowserSessionManager:
             status="authorization_checked",
             error=state.last_error or "",
         )
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
         return state
 
     def require_manual_login(
         self,
-        profile_id: str | None = None,
         *,
         paragraph_no: int | None = None,
         query: str | None = None,
         rescue_url: str | None = None,
     ) -> BrowserSessionState:
         return self._set_manual_intervention(
-            profile_id,
             health=SessionHealth.LOGIN_REQUIRED,
             reason="login_required",
             prompt="Storyblocks login is required. Continue in the already opened persistent browser profile.",
@@ -653,14 +643,12 @@ class BrowserSessionManager:
 
     def register_challenge(
         self,
-        profile_id: str | None = None,
         *,
         paragraph_no: int | None = None,
         query: str | None = None,
         rescue_url: str | None = None,
     ) -> BrowserSessionState:
         return self._set_manual_intervention(
-            profile_id,
             health=SessionHealth.CHALLENGE,
             reason="challenge_detected",
             prompt="Storyblocks challenge detected. Wait for the user to finish the manual verification in the persistent browser.",
@@ -669,14 +657,12 @@ class BrowserSessionManager:
             rescue_url=rescue_url,
         )
 
-    def mark_blocked(
-        self, profile_id: str | None = None, message: str = ""
-    ) -> BrowserSessionState:
-        profile = self._resolve_profile(profile_id)
+    def mark_blocked(self, message: str = "") -> BrowserSessionState:
+        profile = self._resolve_profile()
         self._profile_registry.update_session_health(
             profile.profile_id, SessionHealth.BLOCKED
         )
-        state = self.current_state(profile.profile_id)
+        state = self.current_state()
         state.health = SessionHealth.BLOCKED
         state.authenticated = False
         state.manual_ready_override = False
@@ -689,18 +675,16 @@ class BrowserSessionManager:
             "current_url": state.current_url or "",
         }
         state.last_checked_at = _now()
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
         return state
 
     def confirm_manual_intervention(
         self,
-        profile_id: str | None = None,
         *,
         resolved_health: SessionHealth = SessionHealth.READY,
         account: str | None = None,
     ) -> BrowserSessionState:
-        profile = self._resolve_profile(profile_id)
+        profile = self._resolve_profile()
         self._profile_registry.update_session_health(
             profile.profile_id, resolved_health
         )
@@ -709,7 +693,7 @@ class BrowserSessionManager:
                 profile.profile_id, account
             )
 
-        state = self.current_state(profile.profile_id)
+        state = self.current_state()
         state.health = resolved_health
         state.authenticated = resolved_health == SessionHealth.READY
         state.storyblocks_account = account or state.storyblocks_account
@@ -724,19 +708,18 @@ class BrowserSessionManager:
             "current_url": state.current_url or "",
         }
         state.last_checked_at = _now()
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
         return state
 
-    def reset_session_state(self, profile_id: str | None = None) -> BrowserSessionState:
-        profile = self._resolve_profile(profile_id)
-        self.close_browser(profile.profile_id)
-        self.close_native_browser(profile.profile_id)
+    def reset_session_state(self) -> BrowserSessionState:
+        profile = self._resolve_profile()
+        self.close_browser()
+        self.close_native_browser()
         self._profile_registry.update_storyblocks_account(profile.profile_id, None)
         self._profile_registry.update_session_health(
             profile.profile_id, SessionHealth.LOGIN_REQUIRED
         )
-        state = self.current_state(profile.profile_id)
+        state = self.current_state()
         state.health = SessionHealth.LOGIN_REQUIRED
         state.authenticated = False
         state.storyblocks_account = None
@@ -752,24 +735,23 @@ class BrowserSessionManager:
             "reset": "true",
         }
         state.last_checked_at = _now()
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
         return state
 
     def wait_for_user(
         self,
-        profile_id: str | None = None,
         *,
         poll_interval_seconds: float = 1.0,
         max_checks: int = 10,
         inspector: Any | None = None,
     ) -> BrowserSessionState:
-        profile = self._resolve_profile(profile_id)
-        session = self.open_browser(profile.profile_id)
+        session = self.open_browser()
         checker = inspector or (
-            lambda: self._session_probe.inspect_page(session.handle.page)
-            if self._session_probe
-            else AuthorizationSnapshot(self.current_state(profile.profile_id).health)
+            lambda: (
+                self._session_probe.inspect_page(session.handle.page)
+                if self._session_probe
+                else AuthorizationSnapshot(self.current_state().health)
+            )
         )
 
         for _ in range(max(1, max_checks)):
@@ -780,17 +762,15 @@ class BrowserSessionManager:
                     message="Manual intervention inspector must return AuthorizationSnapshot.",
                 )
             state = self.confirm_manual_intervention(
-                profile.profile_id,
                 resolved_health=snapshot.health,
                 account=snapshot.account,
             )
             state.current_url = snapshot.current_url
-            with self._lock:
-                self._states[profile.profile_id] = state
+            self._remember_state(state)
             if snapshot.health == SessionHealth.READY:
                 return state
             time.sleep(max(0.0, poll_interval_seconds))
-        return self.current_state(profile.profile_id)
+        return self.current_state()
 
     def record_instability(self) -> float:
         return self._action_pacer.record_failure()
@@ -798,15 +778,11 @@ class BrowserSessionManager:
     def record_stable_action(self) -> float:
         return self._action_pacer.record_success()
 
-    def restore_session(self, profile_id: str | None = None) -> BrowserSessionState:
-        profile = self._resolve_profile(profile_id)
-        return self.check_authorization(profile.profile_id, persist_handle=False)
+    def restore_session(self) -> BrowserSessionState:
+        return self.check_authorization(persist_handle=False)
 
-    def open_rescue_url(
-        self, url: str, profile_id: str | None = None
-    ) -> BrowserSessionState:
-        profile = self._resolve_profile(profile_id)
-        session = self.open_browser(profile.profile_id)
+    def open_rescue_url(self, url: str) -> BrowserSessionState:
+        session = self.open_browser()
         page = session.handle.page
         if not hasattr(page, "goto"):
             raise SessionError(
@@ -820,12 +796,11 @@ class BrowserSessionManager:
         except Exception:
             self._action_pacer.record_failure()
             raise
-        state = self.current_state(profile.profile_id)
+        state = self.current_state()
         state.rescue_url = url
         state.current_url = url
         state.last_checked_at = _now()
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
         return state
 
     def rescue_storyblocks_query(
@@ -833,7 +808,6 @@ class BrowserSessionManager:
         query: str,
         *,
         search_adapter: Any,
-        profile_id: str | None = None,
         use_homepage: bool = False,
     ) -> BrowserSessionState:
         if search_adapter is None:
@@ -846,11 +820,11 @@ class BrowserSessionManager:
             if use_homepage
             else search_adapter.build_direct_search_url(query)
         )
-        return self.open_rescue_url(url, profile_id=profile_id)
+        return self.open_rescue_url(url)
 
-    def _attach_to_native_browser(self, profile_id: str) -> PersistentBrowserSession:
-        profile = self._resolve_profile(profile_id)
-        native_session = self._refresh_native_browser_session(profile.profile_id)
+    def _attach_to_native_browser(self) -> PersistentBrowserSession:
+        profile = self._resolve_profile()
+        native_session = self._refresh_native_browser_session()
         if native_session is None:
             raise SessionError(
                 code="native_login_browser_missing",
@@ -858,7 +832,7 @@ class BrowserSessionManager:
                 details={"profile_id": profile.profile_id},
             )
         with self._lock:
-            existing = self._active_sessions.get(profile.profile_id)
+            existing = self._active_session
         if existing is not None and existing.kind == "native_debug_attach":
             if existing.owner_thread_id != _current_thread_id():
                 raise SessionError(
@@ -916,9 +890,9 @@ class BrowserSessionManager:
             debug_endpoint_url=native_session.endpoint_url,
         )
         with self._lock:
-            self._active_sessions[profile.profile_id] = session
+            self._active_session = session
 
-        state = self.current_state(profile.profile_id)
+        state = self.current_state()
         state.browser_channel = native_session.plan.browser_channel
         state.browser_available = True
         state.profile_in_use = False
@@ -928,8 +902,7 @@ class BrowserSessionManager:
         state.last_error = None
         state.last_checked_at = _now()
         self._write_native_login_diagnostics(profile.profile_id, status="attached")
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
         return session
 
     def _select_storyblocks_page(self, handle, *, target_url: str = ""):
@@ -961,7 +934,6 @@ class BrowserSessionManager:
 
     def _set_manual_intervention(
         self,
-        profile_id: str | None,
         *,
         health: SessionHealth,
         reason: str,
@@ -970,9 +942,9 @@ class BrowserSessionManager:
         query: str | None,
         rescue_url: str | None,
     ) -> BrowserSessionState:
-        profile = self._resolve_profile(profile_id)
+        profile = self._resolve_profile()
         self._profile_registry.update_session_health(profile.profile_id, health)
-        state = self.current_state(profile.profile_id)
+        state = self.current_state()
         state.health = health
         state.authenticated = False
         state.manual_intervention = ManualInterventionRequest(
@@ -993,50 +965,41 @@ class BrowserSessionManager:
             "rescue_url": rescue_url or "",
         }
         state.last_checked_at = _now()
-        with self._lock:
-            self._states[profile.profile_id] = state
+        self._remember_state(state)
         return state
 
-    def _resolve_profile(self, profile_id: str | None, *, allow_missing: bool = False):
-        if profile_id is not None:
-            return self._profile_registry.get_profile(profile_id)
-        profile = self._profile_registry.get_active()
-        if profile is None and allow_missing:
-            return None
-        if profile is None:
-            raise SessionError(
-                code="active_profile_required",
-                message="Select an active browser profile before opening Storyblocks automation.",
-            )
-        return profile
+    def _resolve_profile(self) -> BrowserProfile:
+        return self._profile_registry.get_or_create_singleton()
 
-    def _refresh_native_browser_session(
-        self, profile_id: str
-    ) -> NativeBrowserSession | None:
+    def _refresh_native_browser_session(self) -> NativeBrowserSession | None:
+        profile_id = self._resolve_profile().profile_id
         with self._lock:
-            native_session = self._native_browser_sessions.get(profile_id)
+            native_session = self._native_browser_session
         if native_session is None:
+            return None
+        if native_session.plan.profile_id != profile_id:
             return None
         if native_session.is_running():
             return native_session
         with self._lock:
-            self._native_browser_sessions.pop(profile_id, None)
-            attached_session = self._active_sessions.get(profile_id)
+            self._native_browser_session = None
+            attached_session = self._active_session
         if (
             attached_session is not None
             and attached_session.kind == "native_debug_attach"
+            and attached_session.plan.profile_id == profile_id
         ):
             if attached_session.owner_thread_id == _current_thread_id():
                 try:
                     attached_session.handle.close()
                 finally:
                     with self._lock:
-                        self._active_sessions.pop(profile_id, None)
+                        self._active_session = None
             else:
                 with self._lock:
-                    self._active_sessions.pop(profile_id, None)
+                    self._active_session = None
         with self._lock:
-            state = self._states.get(profile_id)
+            state = self._state
         if state is not None:
             state.profile_in_use = False
             state.native_login_running = False
@@ -1049,34 +1012,44 @@ class BrowserSessionManager:
             )
         return None
 
+    def _remember_state(self, state: BrowserSessionState) -> None:
+        with self._lock:
+            self._state = state
+
     def _write_native_login_diagnostics(
         self, profile_id: str, *, status: str, error: str = ""
     ) -> None:
-        profile = self._profile_registry.get_profile(profile_id)
-        if profile is None:
+        try:
+            profile = self._profile_registry.get_profile(profile_id)
+        except KeyError:
             return
         paths = self._profile_registry.paths_for(profile)
         with self._lock:
-            native_session = self._native_browser_sessions.get(profile_id)
-            state = self._states.get(profile_id)
+            native_session = self._native_browser_session
+            state = self._state
         payload = {
             "profile_id": profile_id,
             "status": status,
             "checked_at": _now().isoformat(),
             "browser_channel": native_session.plan.browser_channel
             if native_session is not None
+            and native_session.plan.profile_id == profile_id
             else "",
             "target_url": native_session.plan.target_url
             if native_session is not None
+            and native_session.plan.profile_id == profile_id
             else "",
             "remote_debugging_port": native_session.plan.remote_debugging_port
             if native_session is not None
+            and native_session.plan.profile_id == profile_id
             else None,
             "endpoint_url": native_session.endpoint_url
             if native_session is not None
+            and native_session.plan.profile_id == profile_id
             else "",
             "login_browser_running": native_session.is_running()
             if native_session is not None
+            and native_session.plan.profile_id == profile_id
             else False,
             "error": error,
             "reason_code": state.reason_code if state is not None else "",

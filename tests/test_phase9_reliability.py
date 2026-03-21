@@ -37,7 +37,6 @@ from domain.models import (
     ProviderResult,
     QueryBundle,
     Run,
-    RunCheckpoint,
     RunManifest,
     ScriptDocument,
 )
@@ -53,6 +52,7 @@ from storage import (
     WorkspaceStorage,
 )
 from storage.serialization import read_json, write_json
+from ui.controller import DesktopGuiController
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "storyblocks"
 
@@ -209,7 +209,9 @@ class Phase9ReliabilityTests(unittest.TestCase):
             )
         )
 
-    def test_domain_models_roundtrip_preserves_nested_types(self) -> None:
+    def test_domain_models_roundtrip_preserves_nested_types_and_legacy_run_mapping(
+        self,
+    ) -> None:
         selection = AssetSelection(
             paragraph_no=1,
             primary_asset=_candidate(
@@ -240,10 +242,8 @@ class Phase9ReliabilityTests(unittest.TestCase):
             ],
             rejection_reasons=["none"],
             diagnostics={"score": 0.9},
-            user_decision_status="locked",
             reason="User approved selection",
-            user_locked=True,
-            status="selected",
+            status="completed",
         )
         manifest = RunManifest(
             run_id="run-1",
@@ -269,35 +269,59 @@ class Phase9ReliabilityTests(unittest.TestCase):
                     diagnostics=ParagraphDiagnostics(
                         paragraph_no=1, selected_from_provider="storyblocks_video"
                     ),
-                    user_decision_status="locked",
-                    status="selected",
+                    status="completed",
                 )
             ],
             summary={"paragraphs_total": 1, "paragraphs_completed": 1},
         )
-        run = Run(
-            run_id="run-1",
-            project_id="project-1",
-            status=RunStatus.PAUSED,
-            stage=RunStage.PERSIST,
-            checkpoint=RunCheckpoint(
-                run_id="run-1", stage=RunStage.PERSIST, current_paragraph_no=1
-            ),
-        )
+        legacy_run_payload = {
+            "run_id": "run-1",
+            "project_id": "project-1",
+            "status": "paused",
+            "stage": RunStage.PERSIST.value,
+            "checkpoint": {
+                "run_id": "run-1",
+                "stage": RunStage.PERSIST.value,
+                "current_paragraph_no": 1,
+            },
+        }
+        legacy_decision_key = "user_decision" + "_status"
+        legacy_fallback_key = "fallback" + "_options"
 
-        restored_manifest = RunManifest.from_dict(manifest.to_dict())
-        restored_run = Run.from_dict(run.to_dict())
+        legacy_manifest_payload = manifest.to_dict()
+        self.assertNotIn(
+            "user_locked",
+            legacy_manifest_payload["paragraph_entries"][0]["selection"],
+        )
+        legacy_manifest_payload["paragraph_entries"][0]["status"] = "locked"
+        legacy_manifest_payload["paragraph_entries"][0][legacy_decision_key] = "locked"
+        legacy_manifest_payload["paragraph_entries"][0][legacy_fallback_key] = [
+            _candidate("fallback-1", "openverse", AssetKind.IMAGE, 5.0).to_dict()
+        ]
+        selection_payload = legacy_manifest_payload["paragraph_entries"][0]["selection"]
+        selection_payload["status"] = "selected"
+        selection_payload[legacy_decision_key] = "locked"
+        selection_payload["user_locked"] = True
+
+        restored_manifest = RunManifest.from_dict(legacy_manifest_payload)
+        restored_run = Run.from_dict(legacy_run_payload)
 
         restored_selection = restored_manifest.paragraph_entries[0].selection
         self.assertIsNotNone(restored_selection)
         assert restored_selection is not None
+        self.assertFalse(hasattr(restored_selection, "user_locked"))
+        self.assertFalse(
+            hasattr(restored_manifest.paragraph_entries[0].slots[0], "user_locked")
+        )
         self.assertEqual(restored_selection.primary_asset.kind, AssetKind.VIDEO)
         self.assertIsInstance(restored_selection.primary_asset.local_path, Path)
         self.assertEqual(
             restored_selection.provider_results[0].capability, ProviderCapability.VIDEO
         )
-        self.assertEqual(restored_run.status, RunStatus.PAUSED)
-        self.assertEqual(restored_run.checkpoint.stage, RunStage.PERSIST)
+        self.assertEqual(restored_run.status, RunStatus.CANCELLED)
+        self.assertEqual(restored_run.stage, RunStage.PERSIST)
+        self.assertFalse(hasattr(restored_run, "checkpoint"))
+        self.assertEqual(restored_run.metadata.get("legacy_status"), "paused")
 
     def test_settings_manager_merges_partial_snapshot_and_secrets_roundtrip(
         self,
@@ -373,7 +397,7 @@ class Phase9ReliabilityTests(unittest.TestCase):
                 Run(
                     run_id="run-storage",
                     project_id=project.project_id,
-                    status=RunStatus.READY,
+                    status=RunStatus.RUNNING,
                 )
             )
             manifest = manifest_repository.save(
@@ -396,7 +420,8 @@ class Phase9ReliabilityTests(unittest.TestCase):
                 "Storage",
             )
             self.assertEqual(
-                RunRepository(reloaded_paths).load(run.run_id).status, RunStatus.READY
+                RunRepository(reloaded_paths).load(run.run_id).status,
+                RunStatus.RUNNING,
             )
             self.assertEqual(
                 ManifestRepository(reloaded_paths).load(manifest.run_id).project_name,
@@ -450,10 +475,7 @@ class Phase9ReliabilityTests(unittest.TestCase):
     def test_session_manager_rejects_missing_browser_channel(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
-            profile = container.profile_registry.create_profile(
-                "Primary", container.workspace.paths.browser_profiles_dir
-            )
-            container.profile_registry.set_active(profile.profile_id)
+            container.profile_registry.get_or_create_singleton()
             manager = BrowserSessionManager(
                 container.profile_registry,
                 container.settings.browser,
@@ -538,31 +560,45 @@ class Phase9ReliabilityTests(unittest.TestCase):
             self.assertEqual(record.attempts, 2)
             self.assertIn("did not complete cleanly", record.error or "")
 
-    def test_run_can_resume_after_application_restart(self) -> None:
+    def test_run_repository_normalizes_legacy_paused_payload_with_checkpoint(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            container = bootstrap_application(temp_dir)
-            project = self._create_project(container, temp_dir)
-            self._register_video_backend(container)
-
-            run, _manifest = container.media_run_service.create_run(project.project_id)
-            container.media_run_service.pause_after_current(run.run_id)
-            paused_run, paused_manifest = container.media_run_service.execute(
-                run.run_id
+            paths = WorkspaceStorage(temp_dir).initialize()
+            repository = RunRepository(paths)
+            legacy_run_id = "legacy-paused-run"
+            write_json(
+                repository.path_for(legacy_run_id),
+                {
+                    "run_id": legacy_run_id,
+                    "project_id": "legacy-project",
+                    "status": "paused",
+                    "stage": "persist",
+                    "selected_paragraphs": [2],
+                    "completed_paragraphs": [1],
+                    "failed_paragraphs": [3],
+                    "checkpoint": {
+                        "run_id": legacy_run_id,
+                        "stage": "persist",
+                        "current_paragraph_no": 1,
+                        "selected_paragraphs": [2],
+                        "completed_paragraphs": [1],
+                        "failed_paragraphs": [3],
+                    },
+                },
             )
 
-            self.assertEqual(paused_run.status, RunStatus.PAUSED)
-            self.assertEqual(paused_manifest.summary["paragraphs_completed"], 1)
+            run = repository.load(legacy_run_id)
 
-            container.close()
-            restarted = bootstrap_application(temp_dir)
-            self._register_video_backend(restarted)
-            resumed_run, resumed_manifest = restarted.media_run_service.resume(
-                run.run_id
-            )
-
-            self.assertEqual(resumed_run.status, RunStatus.COMPLETED)
-            self.assertEqual(resumed_manifest.summary["paragraphs_completed"], 3)
-            restarted.close()
+            self.assertIsNotNone(run)
+            assert run is not None
+            self.assertEqual(run.status, RunStatus.CANCELLED)
+            self.assertEqual(run.stage, RunStage.PERSIST)
+            self.assertEqual(run.selected_paragraphs, [2])
+            self.assertEqual(run.completed_paragraphs, [1])
+            self.assertEqual(run.failed_paragraphs, [3])
+            self.assertEqual(run.metadata.get("legacy_status"), "paused")
+            self.assertFalse(hasattr(run, "checkpoint"))
 
     def test_failing_event_listener_does_not_break_run_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -603,31 +639,95 @@ class Phase9ReliabilityTests(unittest.TestCase):
             self.assertEqual(len(container.run_repository.list_all()), 1)
             container.close()
 
-    def test_locked_selection_survives_application_restart(self) -> None:
+    def test_legacy_manifest_manual_fields_normalize_for_new_ui(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            container = bootstrap_application(temp_dir)
-            project = self._create_project(container, temp_dir, paragraph_count=1)
-            run, _manifest = container.media_run_service.create_run(project.project_id)
-            locked = AssetSelection(
-                paragraph_no=1,
-                primary_asset=_candidate(
-                    "locked-video", "storyblocks_video", AssetKind.VIDEO, 100.0
-                ),
-                reason="Locked by reviewer",
-                user_locked=True,
-                status="locked",
-                user_decision_status="locked",
+            controller = DesktopGuiController.create(temp_dir)
+            container = controller.application.container
+            project = self._create_project(container, temp_dir, paragraph_count=2)
+            assert project.script_document is not None
+            run = container.run_repository.save(
+                Run(
+                    run_id="legacy-run",
+                    project_id=project.project_id,
+                    status=RunStatus.COMPLETED,
+                    stage=RunStage.COMPLETE,
+                )
+            )
+            saved_file = Path(temp_dir) / "downloads" / "legacy-video.mp4"
+            saved_file.parent.mkdir(parents=True, exist_ok=True)
+            saved_file.write_bytes(b"legacy-video")
+            first = project.script_document.paragraphs[0]
+            second = project.script_document.paragraphs[1]
+            legacy_decision_key = "user_decision" + "_status"
+            legacy_fallback_key = "fallback" + "_options"
+            write_json(
+                container.manifest_repository.path_for(run.run_id),
+                {
+                    "run_id": run.run_id,
+                    "project_id": project.project_id,
+                    "project_name": project.name,
+                    "paragraph_entries": [
+                        {
+                            "paragraph_no": first.paragraph_no,
+                            "original_index": first.original_index,
+                            "text": first.text,
+                            "status": "locked",
+                            legacy_decision_key: "locked",
+                            legacy_fallback_key: [],
+                            "rejection_reasons": [],
+                            "selection": {
+                                "paragraph_no": first.paragraph_no,
+                                "primary_asset": _candidate(
+                                    "legacy-video",
+                                    "storyblocks_video",
+                                    AssetKind.VIDEO,
+                                    100.0,
+                                ).to_dict()
+                                | {"local_path": str(saved_file)},
+                                "supporting_assets": [],
+                                "fallback_assets": [],
+                                "media_slots": [],
+                                "provider_results": [],
+                                "rejection_reasons": [],
+                                "diagnostics": {},
+                                "reason": "Legacy locked selection",
+                                "status": "selected",
+                                "user_locked": True,
+                                legacy_decision_key: "locked",
+                            },
+                        },
+                        {
+                            "paragraph_no": second.paragraph_no,
+                            "original_index": second.original_index,
+                            "text": second.text,
+                            "status": "needs_review",
+                            legacy_decision_key: "needs_review",
+                            legacy_fallback_key: [],
+                            "rejection_reasons": ["network timeout"],
+                            "selection": None,
+                        },
+                    ],
+                    "summary": {
+                        "paragraphs_total": 2,
+                        "paragraphs_processed": 2,
+                    },
+                },
             )
 
-            container.media_run_service.lock_selection(run.run_id, 1, locked)
-            restarted = bootstrap_application(temp_dir)
-            reloaded_manifest = restarted.media_run_service.load_manifest(run.run_id)
+            items = controller.build_paragraph_workbench(project.project_id, run.run_id)
+            first_item = next(
+                item for item in items if item.paragraph_no == first.paragraph_no
+            )
+            second_item = next(
+                item for item in items if item.paragraph_no == second.paragraph_no
+            )
 
-            self.assertIsNotNone(reloaded_manifest)
-            assert reloaded_manifest is not None
-            entry = reloaded_manifest.paragraph_entries[0]
-            self.assertEqual(entry.user_decision_status, "locked")
-            self.assertEqual(entry.selection.primary_asset.asset_id, "locked-video")
+            self.assertEqual(first_item.status, "completed")
+            self.assertEqual(first_item.result_note, "Legacy locked selection")
+            self.assertEqual(len(first_item.downloaded_files), 1)
+            self.assertEqual(first_item.downloaded_files[0].local_path, str(saved_file))
+            self.assertEqual(second_item.status, "failed")
+            self.assertIn("network timeout", second_item.result_note)
 
     def test_free_image_only_and_mixed_mode_work_without_legacy_free_video(
         self,
@@ -685,7 +785,9 @@ class Phase9ReliabilityTests(unittest.TestCase):
             project = self._create_project(container, temp_dir, paragraph_count=12)
             descriptor = container.provider_registry.get("openverse")
             assert descriptor is not None
-            container.media_pipeline._provider_settings.enabled_providers = ["openverse"]
+            container.media_pipeline._provider_settings.enabled_providers = [
+                "openverse"
+            ]
             container.orchestrator.configure(max_workers=1, queue_size=4)
             container.media_pipeline.register_backend(
                 CallbackCandidateSearchBackend(
@@ -716,8 +818,6 @@ class Phase9ReliabilityTests(unittest.TestCase):
                     provider_queue_size=8,
                     download_workers=4,
                     bounded_downloads=8,
-                    relevance_workers=2,
-                    bounded_relevance_queue=8,
                     early_stop_when_satisfied=False,
                 ),
             )
@@ -727,13 +827,15 @@ class Phase9ReliabilityTests(unittest.TestCase):
             self.assertEqual(manifest.summary["paragraphs_completed"], 12)
             self.assertLess(elapsed, 6.0)
 
-    def test_pause_cancel_resume_under_free_image_load_remains_responsive(self) -> None:
+    def test_cancel_under_free_image_load_remains_responsive(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
             project = self._create_project(container, temp_dir, paragraph_count=8)
             descriptor = container.provider_registry.get("openverse")
             assert descriptor is not None
-            container.media_pipeline._provider_settings.enabled_providers = ["openverse"]
+            container.media_pipeline._provider_settings.enabled_providers = [
+                "openverse"
+            ]
             container.orchestrator.configure(max_workers=1, queue_size=3)
 
             def slow_search(paragraph: ParagraphUnit, query: str, limit: int):
@@ -771,28 +873,9 @@ class Phase9ReliabilityTests(unittest.TestCase):
                 project.project_id,
                 config=config,
             )
-            container.media_run_service.pause_after_current(run.run_id)
-            paused_run, paused_manifest = container.media_run_service.execute(
-                run.run_id,
-                config=config,
-            )
-            self.assertEqual(paused_run.status, RunStatus.PAUSED)
-            self.assertGreaterEqual(paused_manifest.summary["paragraphs_completed"], 1)
-
-            resumed_run, resumed_manifest = container.media_run_service.resume(
-                run.run_id,
-                config=config,
-            )
-            self.assertEqual(resumed_run.status, RunStatus.COMPLETED)
-            self.assertEqual(resumed_manifest.summary["paragraphs_completed"], 8)
-
-            cancelled_seed, _ = container.media_run_service.create_run(
-                project.project_id,
-                config=config,
-            )
-            container.media_run_service.cancel(cancelled_seed.run_id)
+            container.media_run_service.cancel(run.run_id)
             cancelled_run, _ = container.media_run_service.execute(
-                cancelled_seed.run_id,
+                run.run_id,
                 config=config,
             )
             self.assertEqual(cancelled_run.status, RunStatus.CANCELLED)

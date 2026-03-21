@@ -91,7 +91,6 @@ def infer_project_mode(
     video_enabled: bool,
     storyblocks_images_enabled: bool,
     free_images_enabled: bool,
-    mixed_image_fallback: bool | None = None,
 ) -> str:
     for definition in PROJECT_MODES.values():
         if (
@@ -102,11 +101,7 @@ def infer_project_mode(
         ):
             return definition.mode_id
     if video_enabled and storyblocks_images_enabled and free_images_enabled:
-        return (
-            "sb_video_plus_free_images"
-            if mixed_image_fallback
-            else "sb_video_plus_sb_images"
-        )
+        return "sb_video_plus_free_images"
     if not video_enabled and storyblocks_images_enabled and not free_images_enabled:
         return "sb_images_plus_free_images"
     if not any((video_enabled, storyblocks_images_enabled, free_images_enabled)):

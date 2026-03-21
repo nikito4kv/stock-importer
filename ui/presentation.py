@@ -45,10 +45,7 @@ SESSION_HEALTH_LABELS: dict[str, str] = {
 }
 
 RUN_STATUS_LABELS: dict[str, str] = {
-    "draft": "Черновик",
-    "ready": "Готово",
     "running": "Выполняется",
-    "paused": "На паузе",
     "completed": "Завершено",
     "failed": "С ошибкой",
     "cancelled": "Остановлено",
@@ -67,20 +64,11 @@ RUN_STAGE_LABELS: dict[str, str] = {
 
 PARAGRAPH_STATUS_LABELS: dict[str, str] = {
     "pending": "Ожидает",
-    "selected": "Выбрано",
-    "locked": "Закреплено",
-    "partial_success": "Частично готово",
-    "needs_review": "Нужна проверка",
+    "processing": "Обрабатывается",
+    "completed": "Готово",
+    "no_match": "Без файлов",
     "failed": "Ошибка",
     "skipped": "Пропущено",
-}
-
-DECISION_STATUS_LABELS: dict[str, str] = {
-    "auto_selected": "Автовыбор",
-    "locked": "Закреплено",
-    "user_rejected": "Отклонено",
-    "needs_review": "Нужна проверка",
-    "pending": "Ожидает",
 }
 
 SEVERITY_LABELS: dict[str, str] = {
@@ -106,11 +94,9 @@ ASSET_KIND_LABELS: dict[str, str] = {
 }
 
 ASSET_ROLE_LABELS: dict[str, str] = {
-    "candidate": "Кандидат",
     "primary": "Основной",
     "supporting": "Дополнительный",
     "fallback": "Резерв",
-    "locked": "Закреплен",
 }
 
 _ERROR_TRANSLATIONS: dict[str, str] = {
@@ -227,10 +213,6 @@ def translate_session_health(value: str | None) -> str:
 
 def translate_paragraph_status(value: str | None) -> str:
     return map_label(PARAGRAPH_STATUS_LABELS, value)
-
-
-def translate_decision_status(value: str | None) -> str:
-    return map_label(DECISION_STATUS_LABELS, value)
 
 
 def translate_severity(value: str | None) -> str:

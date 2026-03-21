@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from pathlib import Path
 
 import image_fetcher
 from app.bootstrap import bootstrap_application
@@ -28,7 +29,14 @@ class FakeProvider:
         self.descriptor = descriptor
         self._candidates = list(candidates)
 
-    def search(self, query: str, limit: int) -> list[SearchCandidate]:
+    def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[SearchCandidate]:
+        del timeout_seconds
         return [
             SearchCandidate(
                 source=item.source,
@@ -93,6 +101,13 @@ class ImageProviderArchitectureTests(unittest.TestCase):
             ["openverse", "pixabay", "storyblocks_image"],
         )
 
+    def test_provider_descriptors_drop_legacy_strategy_fields(self) -> None:
+        registry = build_default_provider_registry()
+
+        for descriptor in registry.list_all():
+            self.assertFalse(hasattr(descriptor, "provider_group"))
+            self.assertFalse(hasattr(descriptor, "priority"))
+
     def test_query_planner_and_default_sources_use_supported_paths_only(self) -> None:
         registry = build_default_provider_registry()
         planner = ImageQueryPlanner()
@@ -115,8 +130,8 @@ class ImageProviderArchitectureTests(unittest.TestCase):
             "A river boat moving through morning mist.",
         )
 
-        self.assertIn("river boat photo", stock_plan.queries)
-        self.assertIn("river boat cinematic", storyblocks_plan.queries)
+        self.assertEqual(stock_plan.queries, ["river boat"])
+        self.assertEqual(storyblocks_plan.queries, ["river boat"])
         self.assertEqual(image_fetcher.DEFAULT_SOURCES, "pexels,pixabay,openverse")
 
     def test_build_image_provider_clients_keeps_input_order(self) -> None:
@@ -137,7 +152,7 @@ class ImageProviderArchitectureTests(unittest.TestCase):
             ["openverse", "pixabay"],
         )
 
-    def test_search_and_metadata_cache_round_trip(self) -> None:
+    def test_search_cache_round_trip_does_not_create_metadata_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = ImageProviderSearchService(
                 build_default_provider_registry(), temp_dir
@@ -189,6 +204,9 @@ class ImageProviderArchitectureTests(unittest.TestCase):
             self.assertEqual(second[0].url, "https://example.com/good-photo.jpg")
             self.assertEqual(diagnostics.cache_hits, 0)
             self.assertGreaterEqual(second_diagnostics.cache_hits, 1)
+            self.assertFalse(
+                (Path(temp_dir) / "provider_cache" / "metadata.sqlite").exists()
+            )
 
     def test_settings_repository_normalizes_legacy_removed_providers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -223,7 +241,9 @@ class ImageProviderArchitectureTests(unittest.TestCase):
 
             reloaded = container.settings_manager.load()
 
-            self.assertEqual(reloaded.providers.project_mode, "sb_video_plus_free_images")
+            self.assertEqual(
+                reloaded.providers.project_mode, "sb_video_plus_free_images"
+            )
             self.assertEqual(
                 reloaded.providers.enabled_providers,
                 ["storyblocks_video", "pexels", "pixabay", "openverse"],
@@ -243,7 +263,46 @@ class ImageProviderArchitectureTests(unittest.TestCase):
             self.assertNotIn("image_provider_priority", saved_payload)
             self.assertNotIn("mixed_image_fallback", saved_payload)
 
-    def test_filter_pipeline_rejects_low_quality_results_from_supported_providers(
+    def test_settings_repository_maps_legacy_mixed_image_fallback_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container = bootstrap_application(temp_dir)
+            settings_path = container.workspace.paths.config_dir / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "providers": {
+                            "enabled_providers": [
+                                "storyblocks_video",
+                                "storyblocks_image",
+                                "openverse",
+                            ],
+                            "mixed_image_fallback": False,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            reloaded = container.settings_manager.load()
+
+            self.assertEqual(
+                reloaded.providers.project_mode,
+                "sb_video_plus_sb_images",
+            )
+            self.assertEqual(
+                reloaded.providers.enabled_providers,
+                ["storyblocks_video", "storyblocks_image"],
+            )
+            self.assertEqual(
+                reloaded.providers.default_image_providers,
+                ["storyblocks_image"],
+            )
+
+            container.settings_manager.save(reloaded)
+            saved_payload = settings_path.read_text(encoding="utf-8")
+            self.assertNotIn("mixed_image_fallback", saved_payload)
+
+    def test_search_keyword_preserves_provider_order_without_quality_prefilter(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -304,13 +363,10 @@ class ImageProviderArchitectureTests(unittest.TestCase):
             )
             service.close()
 
-            self.assertEqual(found[0].source, "pexels")
-            self.assertTrue(
-                any(
-                    reason.startswith("openverse:low_quality_prefilter")
-                    for reason in diagnostics.rejected_prefilters
-                )
+            self.assertEqual(
+                [candidate.source for candidate in found], ["openverse", "pexels"]
             )
+            self.assertEqual(diagnostics.rejected_prefilters, [])
 
     def test_search_keyword_keeps_attribution_licensed_results(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

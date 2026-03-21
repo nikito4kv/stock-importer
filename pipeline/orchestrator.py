@@ -8,7 +8,7 @@ from typing import Callable
 from uuid import uuid4
 
 from domain.enums import EventLevel, RunStage, RunStatus
-from domain.models import AssetSelection, ParagraphUnit, Run, RunCheckpoint
+from domain.models import AssetSelection, ParagraphUnit, Run
 from services.events import AppEvent, EventBus
 from storage.repositories import RunRepository
 
@@ -29,7 +29,6 @@ ParagraphProcessor = Callable[[ParagraphUnit], AssetSelection]
 
 @dataclass(slots=True)
 class RunControls:
-    pause_after_current: bool = False
     cancel_requested: bool = False
 
 
@@ -67,28 +66,12 @@ class RunOrchestrator:
         run = Run(
             run_id=run_id,
             project_id=project_id,
-            status=RunStatus.READY,
+            status=RunStatus.RUNNING,
             stage=RunStage.IDLE,
             selected_paragraphs=list(selected_paragraphs or []),
-            checkpoint=RunCheckpoint(
-                run_id=run_id,
-                stage=RunStage.IDLE,
-                selected_paragraphs=list(selected_paragraphs or []),
-            ),
         )
         self._controls[run_id] = RunControls()
         return self._save_run(run)
-
-    def pause_after_current(self, run_id: str) -> None:
-        self._controls.setdefault(run_id, RunControls()).pause_after_current = True
-        run = self._run_repository.load(run_id)
-        if run is not None:
-            self._emit(
-                "run.pause_requested",
-                EventLevel.INFO,
-                "Pause requested after current paragraph",
-                run,
-            )
 
     def cancel(self, run_id: str) -> None:
         self._controls.setdefault(run_id, RunControls()).cancel_requested = True
@@ -148,15 +131,11 @@ class RunOrchestrator:
                     self._record_failure(
                         run, paragraph.paragraph_no, exc, perf_context=perf_context
                     )
-                    if controls.pause_after_current:
-                        return self._pause_run(run, perf_context=perf_context)
                     continue
 
                 self._record_success(
                     run, result.paragraph_no, perf_context=perf_context
                 )
-                if controls.pause_after_current:
-                    return self._pause_run(run, perf_context=perf_context)
 
             return self._finalize_run(run, perf_context=perf_context)
 
@@ -164,7 +143,7 @@ class RunOrchestrator:
             max_workers=self._max_workers,
             queue_size=self._queue_size,
         )
-        transition: str | None = None
+        transition = False
         transition_payload: dict[str, object] | None = None
         try:
             next_submit_index = 0
@@ -173,7 +152,7 @@ class RunOrchestrator:
 
             def submit_next() -> bool:
                 nonlocal next_submit_index
-                if transition is not None or controls.cancel_requested:
+                if transition or controls.cancel_requested:
                     return False
                 if next_submit_index >= len(remaining):
                     return False
@@ -186,6 +165,7 @@ class RunOrchestrator:
                 pass
 
             if controls.cancel_requested and not pending:
+                transition = True
                 return self._cancel_run(
                     run,
                     perf_context=perf_context,
@@ -224,23 +204,15 @@ class RunOrchestrator:
                 if saw_interrupt:
                     controls.cancel_requested = True
 
-                decision = transition
                 if controls.cancel_requested:
-                    decision = "cancel"
-                elif transition is None and controls.pause_after_current:
-                    # In multi-worker mode "after current" means:
-                    # stop new submissions, cancel queued-but-not-started work,
-                    # and drain only already running paragraphs.
-                    decision = "pause"
-                if decision is not None:
+                    transition = True
                     cancelled_now = self._cancel_pending_futures(pending)
                     cancelled_unsubmitted = max(
                         0,
                         len(remaining) - next_submit_index,
                     )
-                    transition = decision
                     transition_payload = self._transition_payload(
-                        decision,
+                        "cancel",
                         done_futures=batch_done,
                         pending_futures=len(pending),
                         cancelled_futures=(
@@ -248,13 +220,7 @@ class RunOrchestrator:
                         ),
                     )
                     if not pending:
-                        if decision == "cancel":
-                            return self._cancel_run(
-                                run,
-                                perf_context=perf_context,
-                                payload=transition_payload,
-                            )
-                        return self._pause_run(
+                        return self._cancel_run(
                             run,
                             perf_context=perf_context,
                             payload=transition_payload,
@@ -264,40 +230,13 @@ class RunOrchestrator:
                 while len(pending) < submission_window and submit_next():
                     pass
 
-            if transition == "cancel":
+            if transition:
                 return self._cancel_run(
-                    run, perf_context=perf_context, payload=transition_payload
-                )
-            if transition == "pause":
-                return self._pause_run(
                     run, perf_context=perf_context, payload=transition_payload
                 )
             return self._finalize_run(run, perf_context=perf_context)
         finally:
-            executor.shutdown(wait=transition is None, cancel_futures=transition is not None)
-
-    def resume(
-        self,
-        run_id: str,
-        paragraphs: list[ParagraphUnit],
-        processor: ParagraphProcessor,
-        *,
-        perf_context: PerformanceContext | None = None,
-    ) -> Run:
-        run = self._run_repository.load(run_id)
-        if run is None:
-            raise KeyError(run_id)
-        completed = set(run.completed_paragraphs)
-        pending = [
-            paragraph
-            for paragraph in paragraphs
-            if paragraph.paragraph_no not in completed
-        ]
-        controls = self._controls.setdefault(run_id, RunControls())
-        controls.pause_after_current = False
-        controls.cancel_requested = False
-        self._emit("run.resumed", EventLevel.INFO, "Run resumed from checkpoint", run)
-        return self.execute(run, pending, processor, perf_context=perf_context)
+            executor.shutdown(wait=not transition, cancel_futures=transition)
 
     def _cancel_run(
         self,
@@ -309,38 +248,10 @@ class RunOrchestrator:
         run.status = RunStatus.CANCELLED
         run.finished_at = _now()
         run.stage = RunStage.PERSIST
-        if run.checkpoint is not None:
-            run.checkpoint.stage = RunStage.PERSIST
-            run.checkpoint.completed_paragraphs = list(run.completed_paragraphs)
-            run.checkpoint.failed_paragraphs = list(run.failed_paragraphs)
-            run.checkpoint.updated_at = _now()
         self._emit(
             "run.cancelled",
             EventLevel.WARNING,
             "Run cancelled",
-            run,
-            payload=payload,
-        )
-        return self._save_run(run, perf_context=perf_context)
-
-    def _pause_run(
-        self,
-        run: Run,
-        *,
-        perf_context: PerformanceContext | None = None,
-        payload: dict[str, object] | None = None,
-    ) -> Run:
-        run.status = RunStatus.PAUSED
-        run.stage = RunStage.PERSIST
-        if run.checkpoint is not None:
-            run.checkpoint.stage = RunStage.PERSIST
-            run.checkpoint.completed_paragraphs = list(run.completed_paragraphs)
-            run.checkpoint.failed_paragraphs = list(run.failed_paragraphs)
-            run.checkpoint.updated_at = _now()
-        self._emit(
-            "run.paused",
-            EventLevel.INFO,
-            "Run paused",
             run,
             payload=payload,
         )
@@ -360,12 +271,6 @@ class RunOrchestrator:
             run.failed_paragraphs.append(paragraph_no)
         if perf_context is not None:
             perf_context.increment("paragraphs_failed_total", 1)
-        if run.checkpoint is not None:
-            run.checkpoint.stage = RunStage.PERSIST
-            run.checkpoint.current_paragraph_no = paragraph_no
-            run.checkpoint.completed_paragraphs = list(run.completed_paragraphs)
-            run.checkpoint.failed_paragraphs = list(run.failed_paragraphs)
-            run.checkpoint.updated_at = _now()
         self._emit(
             "paragraph.failed",
             EventLevel.ERROR,
@@ -394,12 +299,6 @@ class RunOrchestrator:
             item for item in run.failed_paragraphs if item != paragraph_no
         ]
         run.last_error = None if not run.failed_paragraphs else run.last_error
-        if run.checkpoint is not None:
-            run.checkpoint.stage = RunStage.PERSIST
-            run.checkpoint.current_paragraph_no = paragraph_no
-            run.checkpoint.completed_paragraphs = list(run.completed_paragraphs)
-            run.checkpoint.failed_paragraphs = list(run.failed_paragraphs)
-            run.checkpoint.updated_at = _now()
         self._emit(
             "paragraph.completed",
             EventLevel.INFO,
@@ -421,11 +320,6 @@ class RunOrchestrator:
         finalize_started_at = perf_counter()
         run.stage = RunStage.COMPLETE
         run.finished_at = _now()
-        if run.checkpoint is not None:
-            run.checkpoint.stage = RunStage.COMPLETE
-            run.checkpoint.completed_paragraphs = list(run.completed_paragraphs)
-            run.checkpoint.failed_paragraphs = list(run.failed_paragraphs)
-            run.checkpoint.updated_at = _now()
         if perf_context is not None:
             perf_context.add_timing("finalize_ms", _elapsed_ms(finalize_started_at))
         payload = perf_context.summary_payload() if perf_context is not None else {}
@@ -467,16 +361,6 @@ class RunOrchestrator:
         if perf_context is not None:
             persist_run_performance_context(run, perf_context)
         return self._run_repository.save(run)
-
-    def rerun_selected(
-        self,
-        run: Run,
-        paragraph_numbers: list[int],
-        paragraphs: list[ParagraphUnit],
-        processor: ParagraphProcessor,
-    ) -> Run:
-        rerun = self.create_run(run.project_id, selected_paragraphs=paragraph_numbers)
-        return self.execute(rerun, paragraphs, processor)
 
     def _emit(
         self,

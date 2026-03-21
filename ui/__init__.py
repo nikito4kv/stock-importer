@@ -5,7 +5,7 @@ from typing import Callable
 
 from .contracts import (
     UiAdvancedSettingsViewModel,
-    UiAssetPreview,
+    UiDownloadedFileItem,
     UiErrorPayload,
     UiNotification,
     UiParagraphWorkbenchItem,
@@ -48,7 +48,7 @@ __all__ = [
     "LaunchProfileCustomTiming",
     "LaunchProfileId",
     "UiAdvancedSettingsViewModel",
-    "UiAssetPreview",
+    "UiDownloadedFileItem",
     "UiErrorPayload",
     "UiNotification",
     "UiParagraphWorkbenchItem",

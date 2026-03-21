@@ -17,7 +17,6 @@ SQLITE_SYNCHRONOUS_MODE = "NORMAL"
 SQLITE_BUSY_TIMEOUT_MS = 5_000
 SQLITE_FOREIGN_KEYS_ENABLED = True
 SEARCH_RESULT_CACHE_TTL_SECONDS = 6 * 60 * 60
-METADATA_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 CACHE_CLEANUP_EVERY_OPERATIONS = 32
 
 
@@ -168,7 +167,10 @@ class SQLiteCacheBase:
             self._purge_expired_locked(force=True)
 
     def _purge_expired_locked(self, *, force: bool) -> int:
-        if not force and self._operations_since_cleanup < self._cleanup_every_operations:
+        if (
+            not force
+            and self._operations_since_cleanup < self._cleanup_every_operations
+        ):
             return 0
         cursor = self._conn.execute(
             f"DELETE FROM {self._table_name} WHERE created_at IS NULL OR created_at < ?",
@@ -238,7 +240,9 @@ class SearchResultCache(SQLiteCacheBase):
         payload = json.loads(str(row["payload"]))
         if not isinstance(payload, list):
             return None
-        return [_deserialize_candidate(item) for item in payload if isinstance(item, dict)]
+        return [
+            _deserialize_candidate(item) for item in payload if isinstance(item, dict)
+        ]
 
     def set(
         self,
@@ -270,70 +274,8 @@ class SearchResultCache(SQLiteCacheBase):
             self._mark_write_locked()
 
 
-class MetadataCache(SQLiteCacheBase):
-    def __init__(
-        self,
-        path: str | Path,
-        *,
-        ttl_seconds: int = METADATA_CACHE_TTL_SECONDS,
-        time_fn: Callable[[], float] | None = None,
-        cleanup_every_operations: int = CACHE_CLEANUP_EVERY_OPERATIONS,
-    ):
-        super().__init__(
-            path,
-            table_name="metadata_cache",
-            create_table_sql=(
-                "CREATE TABLE IF NOT EXISTS metadata_cache ("
-                "cache_key TEXT PRIMARY KEY, "
-                "payload TEXT NOT NULL, "
-                "created_at REAL"
-                ")"
-            ),
-            ttl_seconds=ttl_seconds,
-            time_fn=time_fn,
-            cleanup_every_operations=cleanup_every_operations,
-        )
-
-    def get(self, cache_key: str) -> dict[str, object] | None:
-        with self._lock:
-            self._require_open_locked()
-            row = self._conn.execute(
-                """
-                SELECT payload, created_at
-                FROM metadata_cache
-                WHERE cache_key = ?
-                """,
-                (cache_key,),
-            ).fetchone()
-            if row is None:
-                return None
-            if self._is_expired(row["created_at"]):
-                self._delete_row_locked("cache_key = ?", (cache_key,))
-                return None
-
-        payload = json.loads(str(row["payload"]))
-        if not isinstance(payload, dict):
-            return None
-        return payload
-
-    def set(self, cache_key: str, payload: dict[str, object]) -> None:
-        with self._lock:
-            self._require_open_locked()
-            self._conn.execute(
-                """
-                INSERT OR REPLACE INTO metadata_cache(cache_key, payload, created_at)
-                VALUES (?, ?, ?)
-                """,
-                (cache_key, json.dumps(payload, ensure_ascii=False), self._timestamp()),
-            )
-            self._conn.commit()
-            self._mark_write_locked()
-
-
 __all__ = [
     "CACHE_CLEANUP_EVERY_OPERATIONS",
-    "METADATA_CACHE_TTL_SECONDS",
-    "MetadataCache",
     "SEARCH_RESULT_CACHE_TTL_SECONDS",
     "SQLITE_BUSY_TIMEOUT_MS",
     "SQLITE_JOURNAL_MODE",

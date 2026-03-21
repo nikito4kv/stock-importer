@@ -325,10 +325,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
     def test_browser_profile_registry_creates_predictable_structure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
-            profile = container.profile_registry.create_profile(
-                "Storyblocks",
-                container.workspace.paths.browser_profiles_dir,
-            )
+            profile = container.profile_registry.get_or_create_singleton()
 
             paths = container.profile_registry.paths_for(profile.profile_id)
             self.assertTrue(paths.root.exists())
@@ -353,11 +350,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
     def test_session_manager_opens_persistent_context_and_checks_auth(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
-            profile = container.profile_registry.create_profile(
-                "Primary",
-                container.workspace.paths.browser_profiles_dir,
-            )
-            container.profile_registry.set_active(profile.profile_id)
+            container.profile_registry.get_or_create_singleton()
 
             chrome_path = Path(temp_dir) / "chrome.exe"
             chrome_path.write_bytes(b"x")
@@ -388,11 +381,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
-            profile = container.profile_registry.create_profile(
-                "Primary",
-                container.workspace.paths.browser_profiles_dir,
-            )
-            container.profile_registry.set_active(profile.profile_id)
+            container.profile_registry.get_or_create_singleton()
 
             chrome_path = Path(temp_dir) / "chrome.exe"
             chrome_path.write_bytes(b"x")
@@ -412,12 +401,10 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
                 session_probe=StoryblocksSessionProbe(),
             )
 
-            state = manager.check_authorization(
-                profile.profile_id, persist_handle=False
-            )
+            state = manager.check_authorization(persist_handle=False)
 
             self.assertEqual(state.health, SessionHealth.READY)
-            self.assertNotIn(profile.profile_id, manager._active_sessions)
+            self.assertIsNone(manager._active_session)
             self.assertEqual(context_factory.closed_handles, 1)
 
     def test_storyblocks_backend_search_reopens_session_safely_after_ui_check(
@@ -425,11 +412,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
-            profile = container.profile_registry.create_profile(
-                "Primary",
-                container.workspace.paths.browser_profiles_dir,
-            )
-            container.profile_registry.set_active(profile.profile_id)
+            container.profile_registry.get_or_create_singleton()
 
             chrome_path = Path(temp_dir) / "chrome.exe"
             chrome_path.write_bytes(b"x")
@@ -467,11 +450,9 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
                 dom_checker=StoryblocksDomContractChecker(),
             )
 
-            ui_state = manager.check_authorization(
-                profile.profile_id, persist_handle=False
-            )
+            ui_state = manager.check_authorization(persist_handle=False)
             self.assertEqual(ui_state.health, SessionHealth.READY)
-            self.assertNotIn(profile.profile_id, manager._active_sessions)
+            self.assertIsNone(manager._active_session)
 
             result_holder: dict[str, object] = {}
 
@@ -499,7 +480,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             result = result_holder["result"]
             self.assertEqual(result.candidates[0].asset_id, "asset-123")
-            self.assertNotIn(profile.profile_id, manager._active_sessions)
+            self.assertIsNone(manager._active_session)
 
     def test_session_probe_retries_transient_navigation_before_reading_content(
         self,
@@ -630,11 +611,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
     def test_session_manager_detects_lock_and_manual_recovery_flow(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
-            profile = container.profile_registry.create_profile(
-                "Primary",
-                container.workspace.paths.browser_profiles_dir,
-            )
-            container.profile_registry.set_active(profile.profile_id)
+            profile = container.profile_registry.get_or_create_singleton()
             paths = container.profile_registry.paths_for(profile.profile_id)
             (paths.user_data_dir / "SingletonLock").write_text("busy", encoding="utf-8")
 
@@ -681,11 +658,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
-            profile = container.profile_registry.create_profile(
-                "Primary",
-                container.workspace.paths.browser_profiles_dir,
-            )
-            container.profile_registry.set_active(profile.profile_id)
+            container.profile_registry.get_or_create_singleton()
 
             chrome_path = Path(temp_dir) / "chrome.exe"
             chrome_path.write_bytes(b"x")
@@ -706,7 +679,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
                 session_probe=StoryblocksSessionProbe(),
             )
 
-            login_state = manager.open_native_login_browser(profile.profile_id)
+            login_state = manager.open_native_login_browser()
             prompt = (
                 login_state.manual_intervention.prompt
                 if login_state.manual_intervention is not None
@@ -718,10 +691,11 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
             self.assertIsNotNone(login_state.native_debug_port)
             self.assertIn("then click Check Session", prompt)
 
-            ready_state = manager.check_authorization(profile.profile_id)
+            ready_state = manager.check_authorization()
             self.assertEqual(ready_state.health, SessionHealth.READY)
             self.assertTrue(ready_state.persistent_context_ready)
-            attached = manager._active_sessions[profile.profile_id]
+            attached = manager._active_session
+            assert attached is not None
             self.assertEqual(attached.kind, "native_debug_attach")
             self.assertIn(
                 f":{login_state.native_debug_port}", attached.debug_endpoint_url
@@ -730,11 +704,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
     def test_session_manager_prefers_storyblocks_page_after_native_attach(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
-            profile = container.profile_registry.create_profile(
-                "Primary",
-                container.workspace.paths.browser_profiles_dir,
-            )
-            container.profile_registry.set_active(profile.profile_id)
+            container.profile_registry.get_or_create_singleton()
 
             chrome_path = Path(temp_dir) / "chrome.exe"
             chrome_path.write_bytes(b"x")
@@ -760,13 +730,42 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
                 session_probe=StoryblocksSessionProbe(),
             )
 
-            manager.open_native_login_browser(profile.profile_id)
-            ready_state = manager.check_authorization(profile.profile_id)
+            manager.open_native_login_browser()
+            ready_state = manager.check_authorization()
 
             self.assertEqual(ready_state.health, SessionHealth.READY)
             self.assertEqual(
                 ready_state.current_url, "https://www.storyblocks.com/dashboard"
             )
+
+    def test_container_close_shuts_down_native_login_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container = bootstrap_application(temp_dir)
+            container.profile_registry.get_or_create_singleton()
+
+            chrome_path = Path(temp_dir) / "chrome.exe"
+            chrome_path.write_bytes(b"x")
+            native_launcher = FakeNativeBrowserLauncher()
+            manager = BrowserSessionManager(
+                container.profile_registry,
+                container.settings.browser,
+                channel_resolver=BrowserChannelResolver(
+                    explicit_candidates={"chrome": [chrome_path]}
+                ),
+                context_factory=FakeContextFactory(FakePage()),
+                native_browser_launcher=native_launcher,
+                session_probe=StoryblocksSessionProbe(),
+            )
+            container.session_manager = manager
+
+            manager.open_native_login_browser()
+
+            self.assertTrue(native_launcher.sessions[0].is_running())
+
+            container.close()
+
+            self.assertFalse(native_launcher.sessions[0].is_running())
+            self.assertFalse(manager.native_browser_running())
 
     def test_storyblocks_adapters_build_urls_parse_cards_and_rescue_query(self) -> None:
         video_adapter = StoryblocksVideoSearchAdapter()
@@ -816,11 +815,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
-            profile = container.profile_registry.create_profile(
-                "Primary",
-                container.workspace.paths.browser_profiles_dir,
-            )
-            container.profile_registry.set_active(profile.profile_id)
+            container.profile_registry.get_or_create_singleton()
             chrome_path = Path(temp_dir) / "chrome.exe"
             chrome_path.write_bytes(b"x")
             manager = BrowserSessionManager(
@@ -845,11 +840,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
-            profile = container.profile_registry.create_profile(
-                "Primary",
-                container.workspace.paths.browser_profiles_dir,
-            )
-            container.profile_registry.set_active(profile.profile_id)
+            container.profile_registry.get_or_create_singleton()
 
             chrome_path = Path(temp_dir) / "chrome.exe"
             chrome_path.write_bytes(b"x")
@@ -906,11 +897,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
-            profile = container.profile_registry.create_profile(
-                "Primary",
-                container.workspace.paths.browser_profiles_dir,
-            )
-            container.profile_registry.set_active(profile.profile_id)
+            container.profile_registry.get_or_create_singleton()
 
             chrome_path = Path(temp_dir) / "chrome.exe"
             chrome_path.write_bytes(b"x")
@@ -934,7 +921,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
                 context_factory=FakeContextFactory(page),
                 session_probe=StoryblocksSessionProbe(),
             )
-            manager.set_manual_ready_override(profile.profile_id)
+            manager.set_manual_ready_override()
             descriptor = container.provider_registry.get("storyblocks_video")
             assert descriptor is not None
             backend = StoryblocksCandidateSearchBackend(
@@ -960,9 +947,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
             )
 
             self.assertEqual(result.candidates[0].asset_id, "asset-123")
-            self.assertFalse(
-                manager.current_state(profile.profile_id).manual_ready_override
-            )
+            self.assertFalse(manager.current_state().manual_ready_override)
 
     def test_import_service_discovers_and_copies_existing_chrome_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -981,11 +966,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
                 '{"os_crypt": {"encrypted_key": "dummy"}}', encoding="utf-8"
             )
 
-            profile = container.profile_registry.create_profile(
-                "Primary",
-                container.workspace.paths.browser_profiles_dir,
-            )
-            container.profile_registry.set_active(profile.profile_id)
+            profile = container.profile_registry.get_or_create_singleton()
 
             service = ChromiumProfileImportService(
                 container.profile_registry,
@@ -996,7 +977,7 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
             self.assertEqual(len(discovered), 1)
             self.assertEqual(discovered[0].profile_label, "Storyblocks Personal")
 
-            imported = service.import_profile(discovered[0], profile.profile_id)
+            imported = service.import_profile(discovered[0])
             paths = container.profile_registry.paths_for(profile.profile_id)
 
             self.assertEqual(imported.import_source_browser, "chrome")
@@ -1019,13 +1000,9 @@ class StoryblocksBrowserCoreTests(unittest.TestCase):
     def test_session_manager_launches_selected_profile_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
-            profile = container.profile_registry.create_profile(
-                "Primary",
-                container.workspace.paths.browser_profiles_dir,
-            )
+            profile = container.profile_registry.get_or_create_singleton()
             profile.launch_profile_dir_name = "Profile 7"
             container.profile_registry.save_profile(profile)
-            container.profile_registry.set_active(profile.profile_id)
 
             chrome_path = Path(temp_dir) / "chrome.exe"
             chrome_path.write_bytes(b"x")

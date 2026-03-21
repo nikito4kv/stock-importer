@@ -10,7 +10,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Start desktop application core")
     parser.add_argument("--workspace", help="Workspace root", default=None)
     parser.add_argument("--smoke", action="store_true", help="Run startup smoke output")
-    parser.add_argument("--no-gui", action="store_true", help="Do not launch the GUI after startup")
+    parser.add_argument(
+        "--no-gui", action="store_true", help="Do not launch the GUI after startup"
+    )
     args = parser.parse_args()
 
     application = DesktopApplication.create(args.workspace)
@@ -21,7 +23,7 @@ def main() -> None:
                 {
                     "workspace_root": str(snapshot.workspace_root),
                     "providers": snapshot.providers,
-                    "browser_profiles": snapshot.browser_profiles,
+                    "storyblocks_profile_id": snapshot.storyblocks_profile_id,
                 },
                 ensure_ascii=False,
             )

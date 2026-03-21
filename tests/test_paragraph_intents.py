@@ -92,13 +92,19 @@ class ParagraphIntentTests(unittest.TestCase):
         self.assertEqual(intent.primary_video_queries[0], "Spanish soldiers")
         self.assertNotIn("fear of the unknown", intent.primary_video_queries)
         self.assertNotIn("alien force", intent.primary_video_queries)
-        self.assertIn("jungle river", intent.image_queries)
+        self.assertLessEqual(len(intent.image_queries), 2)
+        self.assertEqual(
+            query_bundle.provider_queries["storyblocks_image"], intent.image_queries
+        )
+        self.assertEqual(
+            query_bundle.provider_queries["free_image"], intent.image_queries
+        )
         self.assertEqual(
             query_bundle.provider_queries["storyblocks_video"][0], "Spanish soldiers"
         )
         self.assertTrue(
-            any(
-                query.startswith("rowing") or query.endswith("photo")
+            all(
+                "photo" not in query.casefold()
                 for query in query_bundle.provider_queries["free_image"]
             )
         )
@@ -134,6 +140,10 @@ class ParagraphIntentTests(unittest.TestCase):
         query_bundle = service.build_query_bundle(intent, strictness="balanced")
 
         self.assertEqual(intent.primary_video_queries[0], "armed warriors")
+        self.assertEqual(
+            query_bundle.provider_queries["storyblocks_image"],
+            query_bundle.provider_queries["free_image"],
+        )
         self.assertIn(
             "stone temple", query_bundle.provider_queries["storyblocks_image"]
         )
@@ -280,6 +290,14 @@ class ParagraphIntentTests(unittest.TestCase):
             self.assertEqual(
                 set(updated_document.paragraphs[1].query_bundle.provider_queries),
                 {"storyblocks_video", "storyblocks_image", "free_image"},
+            )
+            self.assertEqual(
+                updated_document.paragraphs[1].query_bundle.provider_queries[
+                    "storyblocks_image"
+                ],
+                updated_document.paragraphs[1].query_bundle.provider_queries[
+                    "free_image"
+                ],
             )
 
     def test_extract_document_collects_intent_timing_aggregates_and_error_counters(

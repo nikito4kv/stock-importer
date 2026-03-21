@@ -39,6 +39,7 @@ class Phase2ArchitectureTests(unittest.TestCase):
 
             self.assertEqual(snapshot.workspace_root, Path(temp_dir))
             self.assertIn("storyblocks_video", snapshot.providers)
+            self.assertEqual(snapshot.storyblocks_profile_id, "storyblocks")
             self.assertTrue((Path(temp_dir) / "projects").exists())
             self.assertTrue((Path(temp_dir) / "runs").exists())
 
@@ -125,40 +126,45 @@ class Phase2ArchitectureTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "PySide6 is required"):
                 ui.launch_desktop_app(object())
 
-    def test_browser_profile_registry_lifecycle(self) -> None:
+    def test_browser_profile_registry_uses_singleton_storyblocks_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
 
-            profile = container.profile_registry.create_profile(
-                "Primary",
-                container.workspace.paths.browser_profiles_dir,
-            )
+            profile = container.profile_registry.get_or_create_singleton()
+            reused = container.profile_registry.get_or_create_singleton()
+
             self.assertTrue(profile.storage_path.exists())
+            self.assertEqual(reused.profile_id, profile.profile_id)
+            self.assertEqual(profile.profile_id, "storyblocks")
 
-            renamed = container.profile_registry.rename_profile(
-                profile.profile_id, "Storyblocks Main"
-            )
-            self.assertEqual(renamed.display_name, "Storyblocks Main")
-
-            active = container.profile_registry.set_active(profile.profile_id)
-            self.assertTrue(active.is_active)
-
-            state = container.session_manager.set_health(
-                profile.profile_id, SessionHealth.READY
-            )
+            state = container.session_manager.set_health(SessionHealth.READY)
             self.assertEqual(state.health, SessionHealth.READY)
             self.assertEqual(
                 container.session_manager.current_state().profile_id, profile.profile_id
             )
 
-            profile_json = (
-                container.workspace.paths.browser_profiles_dir
-                / f"{profile.profile_id}.json"
-            )
-            profile_dir = profile.storage_path
-            container.profile_registry.delete_profile(profile.profile_id)
-            self.assertFalse(profile_json.exists())
-            self.assertFalse(profile_dir.exists())
+    def test_storyblocks_singleton_cleanup_removes_multi_profile_api(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        profiles_source = (repo_root / "browser" / "profiles.py").read_text(
+            encoding="utf-8"
+        )
+        session_source = (repo_root / "browser" / "session.py").read_text(
+            encoding="utf-8"
+        )
+        controller_source = (repo_root / "ui" / "controller.py").read_text(
+            encoding="utf-8"
+        )
+
+        for marker in (
+            "def list_profiles",
+            "def rename_profile",
+            "def delete_profile",
+            "def set_active",
+            "def select_profile",
+        ):
+            self.assertNotIn(marker, profiles_source)
+        self.assertNotIn("discover_storyblocks_sessions", controller_source)
+        self.assertNotIn("profile_id: str | None = None", session_source)
 
     def test_media_run_service_uses_configured_shared_orchestrator(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -168,7 +174,7 @@ class Phase2ArchitectureTests(unittest.TestCase):
                 container.media_run_service._orchestrator, container.orchestrator
             )
 
-    def test_orchestrator_pause_resume_and_failure_tracking(self) -> None:
+    def test_orchestrator_cancel_and_failure_tracking(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container = bootstrap_application(temp_dir)
             paragraphs = [
@@ -183,17 +189,11 @@ class Phase2ArchitectureTests(unittest.TestCase):
                 )
 
             run = container.orchestrator.create_run("project-1")
-            container.orchestrator.pause_after_current(run.run_id)
-            paused = container.orchestrator.execute(run, paragraphs, processor)
+            container.orchestrator.cancel(run.run_id)
+            cancelled = container.orchestrator.execute(run, paragraphs, processor)
 
-            self.assertEqual(paused.status, RunStatus.PAUSED)
-            self.assertEqual(len(paused.completed_paragraphs), 1)
-
-            resumed = container.orchestrator.resume(
-                paused.run_id, paragraphs, processor
-            )
-            self.assertEqual(resumed.status, RunStatus.COMPLETED)
-            self.assertEqual(sorted(resumed.completed_paragraphs), [1, 2, 3])
+            self.assertEqual(cancelled.status, RunStatus.CANCELLED)
+            self.assertEqual(cancelled.completed_paragraphs, [])
 
             failed_run = container.orchestrator.create_run("project-2")
 

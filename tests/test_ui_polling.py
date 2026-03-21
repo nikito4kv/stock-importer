@@ -12,6 +12,7 @@ POLLING_MODULE = module_from_spec(POLLING_SPEC)
 sys.modules[POLLING_SPEC.name] = POLLING_MODULE
 POLLING_SPEC.loader.exec_module(POLLING_MODULE)
 plan_poll_refresh = POLLING_MODULE.plan_poll_refresh
+TERMINAL_RUN_STATUSES = POLLING_MODULE.TERMINAL_RUN_STATUSES
 
 
 class UiPollingTests(unittest.TestCase):
@@ -66,6 +67,19 @@ class UiPollingTests(unittest.TestCase):
         )
         self.assertTrue(next_run.should_heavy_refresh)
         self.assertEqual(next_run.terminal_signature, ("run-2", "completed"))
+
+    def test_paused_status_is_not_terminal(self) -> None:
+        self.assertNotIn("paused", TERMINAL_RUN_STATUSES)
+        plan = plan_poll_refresh(
+            run_id="run-1",
+            run_status="paused",
+            previous_terminal_signature=None,
+            active_interval_ms=500,
+            idle_interval_ms=1600,
+        )
+        self.assertFalse(plan.should_heavy_refresh)
+        self.assertEqual(plan.next_interval_ms, 500)
+        self.assertIsNone(plan.terminal_signature)
 
 
 if __name__ == "__main__":

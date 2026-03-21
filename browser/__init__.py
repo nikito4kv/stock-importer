@@ -20,7 +20,7 @@ from .native_browser import (
     SubprocessNativeBrowserLauncher,
     find_available_tcp_port,
 )
-from .profile_import import ChromiumProfileImportService, ImportableBrowserSession
+from .profile_import import ChromiumProfileImportService, ImportableBrowserProfile
 from .profiles import (
     BrowserProfilePaths,
     BrowserProfileRegistry,
@@ -61,7 +61,7 @@ __all__ = [
     "BrowserSessionManager",
     "BrowserSessionState",
     "ChromiumProfileImportService",
-    "ImportableBrowserSession",
+    "ImportableBrowserProfile",
     "ManualInterventionRequest",
     "find_available_tcp_port",
     "NativeBrowserLaunchPlan",

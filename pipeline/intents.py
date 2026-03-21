@@ -360,7 +360,7 @@ def _query_variants_from_text(
     return _unique_strings([item for item in candidates if item])
 
 
-def _rank_query_candidate(
+def _score_video_query_candidate(
     query: str,
     *,
     subject: str,
@@ -414,7 +414,7 @@ def _rank_query_candidate(
     return score
 
 
-def _sort_query_candidates(
+def _sort_video_query_candidates(
     candidates: list[str],
     *,
     subject: str,
@@ -426,7 +426,7 @@ def _sort_query_candidates(
     return sorted(
         unique,
         key=lambda item: (
-            -_rank_query_candidate(
+            -_score_video_query_candidate(
                 item,
                 subject=subject,
                 action=action,
@@ -438,7 +438,7 @@ def _sort_query_candidates(
     )
 
 
-def _fallback_query_candidates(
+def _fallback_video_query_candidates(
     *,
     subject: str,
     action: str,
@@ -457,7 +457,7 @@ def _fallback_query_candidates(
     filtered = [
         candidate for candidate in candidates if not _is_query_too_abstract(candidate)
     ]
-    return _sort_query_candidates(
+    return _sort_video_query_candidates(
         filtered,
         subject=subject,
         action=action,
@@ -515,14 +515,14 @@ def _is_query_too_abstract(query: str) -> bool:
     return False
 
 
-def _compose_visual_query(
+def _compose_video_query(
     *,
     subject: str,
     action: str,
     setting: str,
     paragraph_text: str,
 ) -> str:
-    candidates = _fallback_query_candidates(
+    candidates = _fallback_video_query_candidates(
         subject=subject,
         action=action,
         setting=setting,
@@ -534,7 +534,7 @@ def _compose_visual_query(
     return normalize_whitespace(paragraph_text)[:80]
 
 
-def _sanitize_queries(
+def _sanitize_video_queries(
     raw_queries: list[str],
     *,
     subject: str,
@@ -558,7 +558,7 @@ def _sanitize_queries(
             kept.append(candidate)
 
     kept = _limit_query_list_words(_unique_strings(kept), max_words=QUERY_WORD_LIMIT)
-    kept = _sort_query_candidates(
+    kept = _sort_video_query_candidates(
         kept,
         subject=subject,
         action=action,
@@ -566,7 +566,7 @@ def _sanitize_queries(
         paragraph_text=paragraph_text,
     )
     if not kept:
-        kept = _fallback_query_candidates(
+        kept = _fallback_video_query_candidates(
             subject=subject,
             action=action,
             setting=setting,
@@ -581,18 +581,42 @@ def _sanitize_queries(
     return kept[:limit]
 
 
-def _append_photo_hint(query: str) -> str:
-    lowered = query.casefold()
-    if any(
-        token in lowered for token in ("photo", "photograph", "portrait", "realistic")
-    ):
-        return query
-    if (
-        len([token for token in normalize_whitespace(query).split() if token])
-        >= QUERY_WORD_LIMIT
-    ):
-        return query
-    return f"{query} photo"
+def _sanitize_image_queries(
+    raw_queries: list[str],
+    *,
+    subject: str,
+    action: str,
+    setting: str,
+    paragraph_text: str,
+    limit: int = 2,
+) -> list[str]:
+    max_queries = max(1, min(2, int(limit)))
+    kept: list[str] = []
+    seen: set[str] = set()
+
+    def append_from(value: str, *, prefer_tail: bool = False) -> None:
+        if len(kept) >= max_queries:
+            return
+        for candidate in _query_variants_from_text(value, prefer_tail=prefer_tail):
+            limited = _limit_query_words(candidate, max_words=QUERY_WORD_LIMIT)
+            if not limited or _is_query_too_abstract(limited):
+                continue
+            key = limited.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(limited)
+            if len(kept) >= max_queries:
+                return
+
+    for raw_query in raw_queries:
+        append_from(raw_query)
+    append_from(subject)
+    append_from(setting, prefer_tail=True)
+    append_from(action)
+    if not kept:
+        append_from(paragraph_text)
+    return kept[:max_queries]
 
 
 def _limit_query_words(query: str, *, max_words: int) -> str:
@@ -786,7 +810,7 @@ class ParagraphIntentService:
             action = action or fallback_action
             setting = setting or fallback_setting
 
-        fallback_queries = _fallback_query_candidates(
+        fallback_queries = _fallback_video_query_candidates(
             subject=subject,
             action=action,
             setting=setting,
@@ -795,7 +819,7 @@ class ParagraphIntentService:
         visual_query = (
             fallback_queries[0]
             if fallback_queries
-            else _compose_visual_query(
+            else _compose_video_query(
                 subject=subject,
                 action=action,
                 setting=setting,
@@ -829,7 +853,7 @@ class ParagraphIntentService:
         else:
             intent.estimated_duration_seconds = round(duration, 2)
 
-        intent.primary_video_queries = _sanitize_queries(
+        intent.primary_video_queries = _sanitize_video_queries(
             _normalize_string_list(intent.primary_video_queries, limit=limit + 1),
             subject=subject,
             action=action,
@@ -838,14 +862,13 @@ class ParagraphIntentService:
             fallback_queries=fallback_queries or [visual_query],
             limit=limit,
         )
-        intent.image_queries = _sanitize_queries(
+        intent.image_queries = _sanitize_image_queries(
             _normalize_string_list(intent.image_queries, limit=limit + 1),
             subject=subject,
             action=action,
             setting=setting,
             paragraph_text=paragraph_text,
-            fallback_queries=fallback_queries or [visual_query],
-            limit=limit,
+            limit=2,
         )
         return intent
 
@@ -901,28 +924,29 @@ class ParagraphIntentService:
     def _build_storyblocks_image_queries(
         self, intent: ParagraphIntent, *, strictness: str
     ) -> list[str]:
-        limit = QUERY_LIMITS[strictness]
-        queries = list(intent.image_queries or intent.primary_video_queries)
-        queries.extend(_query_variants_from_text(intent.subject))
-        queries.extend(_query_variants_from_text(intent.setting, prefer_tail=True))
-        queries.extend(_query_variants_from_text(intent.action))
-        if strictness == "simple" and intent.subject:
-            queries.extend(_query_variants_from_text(intent.subject))
-        queries = _limit_query_list_words(
-            _unique_strings(queries), max_words=QUERY_WORD_LIMIT
+        del strictness
+        return self._build_image_provider_queries(intent)
+
+    def _build_image_provider_queries(self, intent: ParagraphIntent) -> list[str]:
+        fallback_text = " ".join(
+            part
+            for part in [intent.subject, intent.setting, intent.action]
+            if _normalize_string(part)
         )
-        return [query for query in queries if not _is_query_too_abstract(query)][:limit]
+        return _sanitize_image_queries(
+            _normalize_string_list(intent.image_queries, limit=2),
+            subject=_normalize_string(intent.subject),
+            action=_normalize_string(intent.action),
+            setting=_normalize_string(intent.setting),
+            paragraph_text=fallback_text,
+            limit=2,
+        )
 
     def _build_free_image_queries(
         self, intent: ParagraphIntent, *, strictness: str
     ) -> list[str]:
-        base_queries = self._build_storyblocks_image_queries(
-            intent, strictness=strictness
-        )
-        queries = [_append_photo_hint(query) for query in base_queries]
-        if intent.translated_queries:
-            queries.extend(intent.translated_queries)
-        return _unique_strings(queries)[: QUERY_LIMITS[strictness]]
+        del strictness
+        return self._build_image_provider_queries(intent)
 
     def build_query_bundle(
         self,
@@ -945,7 +969,7 @@ class ParagraphIntentService:
             "free_image": free_image,
         }
 
-        image_queries = _unique_strings(storyblocks_image + free_image)
+        image_queries = list(storyblocks_image)
         return QueryBundle(
             video_queries=storyblocks_video,
             image_queries=image_queries,
@@ -965,7 +989,7 @@ class ParagraphIntentService:
         translated_queries: list[str] = []
         if source_language != "en":
             translated_queries.append(
-                _compose_visual_query(
+                _compose_video_query(
                     subject=subject,
                     action=action,
                     setting=setting,

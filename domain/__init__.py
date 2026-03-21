@@ -20,7 +20,6 @@ from .models import (
     ProviderResult,
     QueryBundle,
     Run,
-    RunCheckpoint,
     RunManifest,
     ScriptDocument,
 )
@@ -54,7 +53,6 @@ __all__ = [
     "ProviderResult",
     "QueryBundle",
     "Run",
-    "RunCheckpoint",
     "RunManifest",
     "RunStage",
     "RunStatus",

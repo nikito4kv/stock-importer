@@ -8,6 +8,7 @@ from .media import (
     MediaSelectionConfig,
     ParagraphMediaPipeline,
     ParagraphMediaRunService,
+    VideoSelectionPolicy,
 )
 from .orchestrator import RunOrchestrator
 from .perf import PerformanceContext
@@ -24,4 +25,5 @@ __all__ = [
     "PerformanceContext",
     "RunOrchestrator",
     "ScriptIngestionService",
+    "VideoSelectionPolicy",
 ]

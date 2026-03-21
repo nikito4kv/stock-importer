@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -20,13 +21,12 @@ from .presentation import (
     label_for_theme,
     launch_profile_value_from_label,
     normalize_ui_theme,
-    translate_asset_role,
+    translate_asset_kind,
     translate_paragraph_status,
     translate_provider,
     translate_run_stage,
     translate_run_status,
     translate_session_health,
-    translate_severity,
     yes_no,
 )
 
@@ -61,15 +61,15 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         self._project_ids_by_row: list[str] = []
         self._history_ids_by_row: list[tuple[str, str]] = []
         self._paragraph_numbers_by_row: list[int] = []
-        self._selected_asset_ids_by_row: list[str] = []
-        self._candidate_asset_ids_by_row: list[str] = []
         self._session_buttons: list[QtWidgets.QPushButton] = []
-        self._last_paragraph_signature: tuple[tuple[int, str, str, bool], ...] = ()
-        self._last_journal_signature: tuple[int, str, str] = (0, "", "")
+        self._last_paragraph_signature: tuple[tuple[int, str, str, int, bool], ...] = ()
         self._terminal_refresh_signature: tuple[str | None, str | None] | None = None
         self._poll_interval_active_ms = 500
         self._poll_interval_idle_ms = 1600
         self._theme_id = self.controller.get_ui_theme()
+        self._current_downloads_root = ""
+        self._current_videos_dir = ""
+        self._current_images_dir = ""
 
         self.setWindowTitle("Vid Img Downloader")
         self.resize(1480, 920)
@@ -88,10 +88,8 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         for text, handler in (
             ("Открыть сценарий", self.on_open_script),
             ("Старт", self.on_start_run),
-            ("Продолжить", self.on_resume_run),
-            ("Пауза", self.on_pause_run),
-            ("Остановить", self.on_abort_run),
-            ("Повторить ошибки", self.on_retry_failed),
+            ("Отменить", self.on_abort_run),
+            ("Повторить весь прогон", self.on_rerun_full_run),
             ("Проверить сессию", self.on_check_session),
         ):
             action = toolbar.addAction(text)
@@ -279,13 +277,15 @@ class DesktopQtApp(QtWidgets.QMainWindow):
             edit.setPlaceholderText(f"Введите ключ для {label}")
             save_button = QtWidgets.QPushButton("Сохранить")
             save_button.clicked.connect(
-                lambda _checked=False,
-                provider_id=provider_id: self.on_store_provider_key(provider_id)
+                lambda _checked=False, provider_id=provider_id: (
+                    self.on_store_provider_key(provider_id)
+                )
             )
             clear_button = QtWidgets.QPushButton("Удалить")
             clear_button.clicked.connect(
-                lambda _checked=False,
-                provider_id=provider_id: self.on_clear_provider_key(provider_id)
+                lambda _checked=False, provider_id=provider_id: (
+                    self.on_clear_provider_key(provider_id)
+                )
             )
             row.addWidget(edit, 1)
             row.addWidget(save_button)
@@ -392,9 +392,10 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         actions = (
             ("Войти в браузере", self.on_prepare_login),
             ("Проверить сессию", self.on_check_session),
-            ("Открыть браузер Storyblocks", self.on_open_browser),
+            ("Импортировать сессию", self.on_import_session),
+            ("Подтвердить вручную", self.on_mark_session_ready),
+            ("Снять подтверждение", self.on_clear_session_override),
             ("Выйти", self.on_logout),
-            ("Сменить аккаунт", self.on_switch_account),
             ("Сбросить сессию", self.on_reset_session),
         )
         for index, (text, handler) in enumerate(actions):
@@ -418,44 +419,84 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         self.run_summary_label = QtWidgets.QLabel("Нет активного запуска")
         self.run_summary_label.setObjectName("RunSummary")
         self.run_detail_label = QtWidgets.QLabel("Откройте сценарий и нажмите Старт")
+        self.run_paths_label = QtWidgets.QLabel("")
+        self.run_paths_label.setWordWrap(True)
         self.run_eta_label = QtWidgets.QLabel("")
-        self.run_checkpoint_label = QtWidgets.QLabel("")
+        self.run_totals_label = QtWidgets.QLabel("")
         self.run_progress = QtWidgets.QProgressBar()
         self.run_progress.setRange(0, 100)
         self.run_progress.setFormat("%p%")
         progress_layout.addWidget(self.run_summary_label)
         progress_layout.addWidget(self.run_detail_label)
+        progress_layout.addWidget(self.run_paths_label)
         progress_layout.addWidget(self.run_eta_label)
-        progress_layout.addWidget(self.run_checkpoint_label)
+        progress_layout.addWidget(self.run_totals_label)
         progress_layout.addWidget(self.run_progress)
-        parent_layout.addWidget(progress_box)
-
-        journal_box = QtWidgets.QGroupBox("Журнал событий")
-        journal_layout = QtWidgets.QVBoxLayout(journal_box)
-        journal_header = QtWidgets.QHBoxLayout()
-        journal_header.addWidget(
-            QtWidgets.QLabel(
-                "Здесь отображается ход обработки, найденные результаты и возможные ошибки."
-            )
-        )
-        journal_header.addStretch(1)
+        progress_actions = QtWidgets.QHBoxLayout()
+        self.open_downloads_button = QtWidgets.QPushButton("Открыть папку выгрузки")
+        self.open_downloads_button.clicked.connect(self.on_open_downloads_folder)
+        progress_actions.addWidget(self.open_downloads_button)
+        progress_actions.addStretch(1)
         self.export_logs_button = QtWidgets.QPushButton("Скачать логи")
         self.export_logs_button.clicked.connect(self.on_export_logs)
-        journal_header.addWidget(self.export_logs_button)
-        journal_layout.addLayout(journal_header)
-        self.journal_text = QtWidgets.QPlainTextEdit()
-        self.journal_text.setReadOnly(True)
-        self.journal_text.setMinimumHeight(420)
-        journal_layout.addWidget(self.journal_text, 1)
-        parent_layout.addWidget(journal_box, 1)
+        progress_actions.addWidget(self.export_logs_button)
+        progress_layout.addLayout(progress_actions)
+        parent_layout.addWidget(progress_box)
 
         self.project_list = QtWidgets.QListWidget()
         self.paragraph_list = QtWidgets.QListWidget()
+        self.paragraph_list.itemSelectionChanged.connect(self.on_paragraph_selected)
         self.paragraph_text = QtWidgets.QPlainTextEdit()
+        self.paragraph_text.setReadOnly(True)
         self.video_queries_text = QtWidgets.QPlainTextEdit()
         self.image_queries_text = QtWidgets.QPlainTextEdit()
-        self.selected_assets_list = QtWidgets.QListWidget()
-        self.candidate_assets_list = QtWidgets.QListWidget()
+        self.downloaded_files_list = QtWidgets.QListWidget()
+        self.paragraph_status_value = QtWidgets.QLabel("-")
+        self.paragraph_note_value = QtWidgets.QLabel("-")
+        self.paragraph_note_value.setWordWrap(True)
+        self.downloads_root_value = QtWidgets.QLabel("-")
+        self.videos_dir_value = QtWidgets.QLabel("-")
+        self.images_dir_value = QtWidgets.QLabel("-")
+        for label in (
+            self.downloads_root_value,
+            self.videos_dir_value,
+            self.images_dir_value,
+        ):
+            label.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            label.setWordWrap(True)
+
+        result_box = QtWidgets.QGroupBox("Результат")
+        result_layout = QtWidgets.QVBoxLayout(result_box)
+        result_hint = QtWidgets.QLabel(
+            "После завершения прогона проверьте реальные файлы в папке downloads."
+        )
+        result_hint.setWordWrap(True)
+        result_layout.addWidget(result_hint)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.paragraph_list.setMinimumWidth(240)
+        splitter.addWidget(self.paragraph_list)
+
+        detail_widget = QtWidgets.QWidget()
+        detail_layout = QtWidgets.QVBoxLayout(detail_widget)
+        detail_form = QtWidgets.QFormLayout()
+        detail_form.addRow("Статус", self.paragraph_status_value)
+        detail_form.addRow("Короткая заметка", self.paragraph_note_value)
+        detail_form.addRow("Папка downloads", self.downloads_root_value)
+        detail_form.addRow("Папка videos", self.videos_dir_value)
+        detail_form.addRow("Папка images", self.images_dir_value)
+        detail_layout.addLayout(detail_form)
+        detail_layout.addWidget(QtWidgets.QLabel("Текст абзаца"))
+        detail_layout.addWidget(self.paragraph_text, 1)
+        detail_layout.addWidget(QtWidgets.QLabel("Сохраненные файлы"))
+        detail_layout.addWidget(self.downloaded_files_list, 1)
+        splitter.addWidget(detail_widget)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        result_layout.addWidget(splitter, 1)
+        parent_layout.addWidget(result_box, 1)
 
     def _quick_form(self) -> UiQuickLaunchSettingsViewModel:
         selected_mode = self._mode_ids_by_label.get(
@@ -569,7 +610,6 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         self.status_label.setText(state.status_text)
         self._render_run_progress(state.run_progress)
         self._set_session_actions_enabled(self.controller.session_actions_enabled())
-        self._fill_journal(state.event_journal)
         self.export_logs_button.setEnabled(self.active_run_id is not None)
 
     def _apply_live_paragraph_items(self, paragraph_items) -> None:
@@ -660,7 +700,6 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         self._render_preview(state.run_preview)
         self._render_run_progress(state.run_progress)
         self._set_session_actions_enabled(self.controller.session_actions_enabled())
-        self._fill_journal(state.event_journal)
         self.export_logs_button.setEnabled(self.active_run_id is not None)
 
     def _set_session_actions_enabled(self, enabled: bool) -> None:
@@ -749,12 +788,17 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         if progress is None:
             self.run_summary_label.setText("Нет активного запуска")
             self.run_detail_label.setText("Откройте сценарий и нажмите Старт")
+            self.run_paths_label.setText("")
             self.run_eta_label.setText("")
-            self.run_checkpoint_label.setText("")
+            self.run_totals_label.setText("")
             self.run_progress.setValue(0)
+            self._current_downloads_root = ""
+            self._current_videos_dir = ""
+            self._current_images_dir = ""
+            self.open_downloads_button.setEnabled(False)
             return
         self.run_summary_label.setText(
-            f"Обработано {progress.project_progress_completed} из {progress.project_progress_total} абзацев"
+            f"{translate_run_status(progress.status)} · обработано {progress.paragraphs_processed} из {progress.paragraphs_total} абзацев"
         )
         stage = translate_run_stage(progress.current_stage)
         current = (
@@ -765,55 +809,45 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         self.run_detail_label.setText(
             f"{translate_run_status(progress.status)} - {stage} - {current}"
         )
+        self._current_downloads_root = progress.downloads_root
+        self._current_videos_dir = progress.videos_dir
+        self._current_images_dir = progress.images_dir
+        self.run_paths_label.setText(
+            (
+                f"Папка выгрузки: {progress.downloads_root}"
+                if progress.downloads_root
+                else "После завершения прогона проверьте папку downloads."
+            )
+        )
         self.run_eta_label.setText(progress.eta_text)
-        self.run_checkpoint_label.setText(
-            f"Найдено: {progress.paragraphs_matched} · Без результата: {progress.paragraphs_no_match} · Ошибки: {progress.paragraphs_failed}"
+        self.run_totals_label.setText(
+            "С файлами: "
+            f"{progress.paragraphs_completed} · "
+            f"Без файлов: {progress.paragraphs_no_match} · "
+            f"Ошибки: {progress.paragraphs_failed} · "
+            f"Видео: {progress.downloaded_video_files} · "
+            f"Изображения: {progress.downloaded_image_files}"
         )
         self.run_progress.setValue(int(progress.percent_complete))
-
-    def _fill_journal(self, items) -> None:
-        signature = self._journal_signature(items)
-        if signature == self._last_journal_signature:
-            return
-        lines: list[str] = []
-        for item in items:
-            context = []
-            if item.paragraph_no is not None:
-                context.append(f"P{item.paragraph_no}")
-            if item.provider_name:
-                context.append(translate_provider(item.provider_name))
-            if item.query:
-                context.append(item.query)
-            if item.current_asset_id:
-                context.append(item.current_asset_id)
-            suffix = f" [{' | '.join(context)}]" if context else ""
-            lines.append(
-                f"{item.created_at[-8:]} | {translate_severity(item.severity)} | {translate_run_stage(item.stage)} | {item.message}{suffix}"
-            )
-        self.journal_text.setPlainText("\n".join(lines))
-        self._last_journal_signature = signature
+        self.open_downloads_button.setEnabled(bool(progress.downloads_root))
 
     def _paragraph_signature(
         self, paragraph_items
-    ) -> tuple[tuple[int, str, str, bool], ...]:
+    ) -> tuple[tuple[int, str, str, int, bool], ...]:
         return tuple(
             (
                 item.paragraph_no,
                 item.status,
-                item.user_decision_status,
+                item.result_note,
+                len(item.downloaded_files),
                 item.numbering_valid,
             )
             for item in paragraph_items
         )
 
-    def _journal_signature(self, items) -> tuple[int, str, str]:
-        if not items:
-            return (0, "", "")
-        latest = items[0]
-        return (len(items), latest.created_at, latest.message)
-
     def _render_current_paragraph_detail(self, paragraph_items) -> None:
         if not paragraph_items:
+            self._clear_paragraph_detail()
             return
         selected_paragraph_no = self._current_paragraph_number()
         if selected_paragraph_no is not None:
@@ -825,7 +859,6 @@ class DesktopQtApp(QtWidgets.QMainWindow):
 
     def _render_session(self, session) -> None:
         lines = [
-            f"Профиль: {session.profile_name or session.profile_id or 'не выбран'}",
             f"Состояние: {translate_session_health(session.health)}",
             f"Аккаунт: {session.account or 'вход не выполнен'}",
             f"Браузер готов: {yes_no(session.browser_ready)}",
@@ -870,16 +903,27 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         self.paragraph_text.setPlainText("\n".join(detail_lines))
         self.video_queries_text.setPlainText("\n".join(item.video_queries))
         self.image_queries_text.setPlainText("\n".join(item.image_queries))
-        self.selected_assets_list.clear()
-        self._selected_asset_ids_by_row = []
-        for asset in item.selected_assets:
-            self.selected_assets_list.addItem(
-                f"{translate_provider(asset.provider_name)} | {translate_asset_role(asset.role)} | {asset.title}"
-                + (f" | {asset.local_path}" if asset.local_path else "")
+        self.paragraph_status_value.setText(translate_paragraph_status(item.status))
+        self.paragraph_note_value.setText(item.result_note or "-")
+        self.downloads_root_value.setText(self._current_downloads_root or "-")
+        self.videos_dir_value.setText(self._current_videos_dir or "-")
+        self.images_dir_value.setText(self._current_images_dir or "-")
+        self.downloaded_files_list.clear()
+        for asset in item.downloaded_files:
+            path_suffix = f" | {asset.local_path}" if asset.local_path else ""
+            exists_suffix = "" if asset.exists else " | файл не найден"
+            self.downloaded_files_list.addItem(
+                f"{translate_provider(asset.provider_name)} | {asset.role} | {translate_asset_kind(asset.kind)} | {asset.title}{path_suffix}{exists_suffix}"
             )
-            self._selected_asset_ids_by_row.append(asset.asset_id)
-        self.candidate_assets_list.clear()
-        self._candidate_asset_ids_by_row = []
+
+    def _clear_paragraph_detail(self) -> None:
+        self.paragraph_status_value.setText("-")
+        self.paragraph_note_value.setText("-")
+        self.downloads_root_value.setText(self._current_downloads_root or "-")
+        self.videos_dir_value.setText(self._current_videos_dir or "-")
+        self.images_dir_value.setText(self._current_images_dir or "-")
+        self.paragraph_text.setPlainText("")
+        self.downloaded_files_list.clear()
 
     def on_browse_script(self) -> None:
         path, _selected = QtWidgets.QFileDialog.getOpenFileName(
@@ -938,36 +982,6 @@ class DesktopQtApp(QtWidgets.QMainWindow):
             return
         self.launch_profile_combo.setCurrentText(self._launch_profile_labels["normal"])
 
-    def on_resume_run(self) -> None:
-        if self.active_run_id is None:
-            return
-        try:
-            self.controller.resume_run_async(self.active_run_id, self._advanced_form())
-        except Exception as exc:
-            self._show_notification(handle_ui_error(exc))
-            return
-        self.refresh(preserve_forms=True)
-
-    def on_pause_run(self) -> None:
-        if self.active_run_id is None:
-            return
-        try:
-            self.controller.pause_run(self.active_run_id)
-        except Exception as exc:
-            self._show_notification(handle_ui_error(exc))
-            return
-        self.refresh(preserve_forms=True)
-
-    def on_stop_after_current(self) -> None:
-        if self.active_run_id is None:
-            return
-        try:
-            self.controller.stop_after_current(self.active_run_id)
-        except Exception as exc:
-            self._show_notification(handle_ui_error(exc))
-            return
-        self.refresh(preserve_forms=True)
-
     def on_abort_run(self) -> None:
         if self.active_run_id is None:
             return
@@ -978,12 +992,14 @@ class DesktopQtApp(QtWidgets.QMainWindow):
             return
         self.refresh(preserve_forms=True)
 
-    def on_retry_failed(self) -> None:
-        if self.active_run_id is None:
+    def on_rerun_full_run(self) -> None:
+        if self.active_project_id is None:
             return
         try:
-            self.active_run_id = self.controller.retry_failed_run_async(
-                self.active_run_id, self._advanced_form()
+            self.active_run_id = self.controller.rerun_full_run_async(
+                self.active_project_id,
+                self._quick_form(),
+                self._advanced_form(),
             )
         except Exception as exc:
             self._show_notification(handle_ui_error(exc))
@@ -1074,26 +1090,14 @@ class DesktopQtApp(QtWidgets.QMainWindow):
             edit.clear()
         self._show_notification(self.controller.delete_provider_api_key(provider_id))
 
-    def on_open_browser(self) -> None:
-        self._run_session_action(self.controller.open_storyblocks_browser)
-
     def on_prepare_login(self) -> None:
         self._run_session_action(self.controller.prepare_storyblocks_login)
 
-    def on_import_chrome_session(self) -> None:
-        self._import_existing_session("chrome")
-
-    def on_import_edge_session(self) -> None:
-        self._import_existing_session("msedge")
-
-    def on_reimport_session(self) -> None:
-        self._run_session_action(self.controller.reimport_storyblocks_session)
+    def on_import_session(self) -> None:
+        self._import_existing_session()
 
     def on_logout(self) -> None:
         self._run_session_action(self.controller.logout_storyblocks)
-
-    def on_switch_account(self) -> None:
-        self._run_session_action(self.controller.switch_storyblocks_account)
 
     def on_check_session(self) -> None:
         self._run_session_action(self.controller.check_storyblocks_session)
@@ -1106,9 +1110,6 @@ class DesktopQtApp(QtWidgets.QMainWindow):
 
     def on_clear_session_override(self) -> None:
         self._run_session_action(self.controller.clear_storyblocks_session_override)
-
-    def on_clear_profile(self) -> None:
-        self._run_session_action(self.controller.clear_storyblocks_profile)
 
     def on_enrich_project_intents(self) -> None:
         if self.active_project_id is None:
@@ -1160,7 +1161,7 @@ class DesktopQtApp(QtWidgets.QMainWindow):
             return
         QtWidgets.QMessageBox.information(
             self,
-            "Журнал событий",
+            "Лог запуска",
             f"Лог сохранен: {saved}",
         )
 
@@ -1176,6 +1177,17 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         )
         if item is not None:
             self._render_paragraph_detail(item)
+
+    def on_open_downloads_folder(self) -> None:
+        path = self._current_downloads_root.strip()
+        if not path:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Папка выгрузки",
+                "Путь к папке выгрузки появится после создания summary для запуска.",
+            )
+            return
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
 
     def on_save_queries(self) -> None:
         if self.active_project_id is None:
@@ -1195,86 +1207,11 @@ class DesktopQtApp(QtWidgets.QMainWindow):
             return
         self.refresh()
 
-    def on_lock_asset(self) -> None:
-        if self.active_run_id is None:
-            return
-        paragraph_no = self._current_paragraph_number()
-        asset_id = self._current_candidate_asset_id()
-        if paragraph_no is None or asset_id is None:
-            return
-        try:
-            self.controller.lock_asset(self.active_run_id, paragraph_no, asset_id)
-        except Exception as exc:
-            self._show_notification(handle_ui_error(exc))
-            return
-        self.refresh()
-
-    def on_reject_asset(self) -> None:
-        if self.active_run_id is None:
-            return
-        paragraph_no = self._current_paragraph_number()
-        asset_id = self._current_candidate_asset_id()
-        if paragraph_no is None or asset_id is None:
-            return
-        try:
-            self.controller.reject_asset(self.active_run_id, paragraph_no, asset_id)
-        except Exception as exc:
-            self._show_notification(handle_ui_error(exc))
-            return
-        self.refresh()
-
-    def on_rerun_current_paragraph(self) -> None:
-        if self.active_project_id is None:
-            return
-        paragraph_no = self._current_paragraph_number()
-        if paragraph_no is None:
-            return
-        try:
-            self.active_run_id = self.controller.rerun_current_paragraph_async(
-                self.active_project_id,
-                paragraph_no,
-                self._quick_form(),
-                self._advanced_form(),
-            )
-        except Exception as exc:
-            self._show_notification(handle_ui_error(exc))
-            return
-        self.refresh(preserve_forms=True)
-
-    def on_rerun_selected_paragraphs(self) -> None:
-        if self.active_project_id is None:
-            return
-        rows = sorted({index.row() for index in self.paragraph_list.selectedIndexes()})
-        paragraph_numbers = [
-            self._paragraph_numbers_by_row[row]
-            for row in rows
-            if row < len(self._paragraph_numbers_by_row)
-        ]
-        if not paragraph_numbers:
-            return
-        try:
-            self.active_run_id = self.controller.rerun_selected_paragraphs_async(
-                self.active_project_id,
-                paragraph_numbers,
-                self._quick_form(),
-                self._advanced_form(),
-            )
-        except Exception as exc:
-            self._show_notification(handle_ui_error(exc))
-            return
-        self.refresh(preserve_forms=True)
-
     def _current_paragraph_number(self) -> int | None:
         row = self.paragraph_list.currentRow()
         if row < 0 or row >= len(self._paragraph_numbers_by_row):
             return None
         return self._paragraph_numbers_by_row[row]
-
-    def _current_candidate_asset_id(self) -> str | None:
-        row = self.candidate_assets_list.currentRow()
-        if row < 0 or row >= len(self._candidate_asset_ids_by_row):
-            return None
-        return self._candidate_asset_ids_by_row[row]
 
     def _apply_quick_form(self, quick: UiQuickLaunchSettingsViewModel) -> None:
         self.project_name_edit.setText(quick.project_name)
@@ -1317,9 +1254,9 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         self._render_session(session)
         self.refresh()
 
-    def _import_existing_session(self, browser_name: str) -> None:
+    def _import_existing_session(self, browser_name: str | None = None) -> None:
         try:
-            options = self.controller.discover_storyblocks_sessions(browser_name)
+            options = self.controller.discover_importable_browser_profiles(browser_name)
         except Exception as exc:
             self._show_notification(handle_ui_error(exc))
             return
@@ -1330,8 +1267,8 @@ class DesktopQtApp(QtWidgets.QMainWindow):
             labels = [item.display_label for item in options]
             label, accepted = QtWidgets.QInputDialog.getItem(
                 self,
-                "Импорт существующей сессии",
-                "Выберите найденный профиль браузера для импорта:",
+                "Импорт профиля браузера",
+                "Выберите внешний профиль Chrome или Edge для импорта:",
                 labels,
                 0,
                 False,
@@ -1342,17 +1279,18 @@ class DesktopQtApp(QtWidgets.QMainWindow):
             selected_path = selected.profile_dir
             selected_browser = selected.browser_name
         else:
-            caption = "Выберите папку профиля Chrome/Edge (Default/Profile X)"
+            caption = "Выберите папку внешнего профиля Chrome/Edge (Default/Profile X)"
             selected_path = QtWidgets.QFileDialog.getExistingDirectory(
                 self, caption, str(Path.home())
             )
             if not selected_path:
                 return
         self._run_session_action(
-            lambda selected_path=selected_path,
-            selected_browser=selected_browser: self.controller.import_storyblocks_session_from_path(
-                selected_path,
-                browser_name=selected_browser,
+            lambda selected_path=selected_path, selected_browser=selected_browser: (
+                self.controller.import_storyblocks_session_from_path(
+                    selected_path,
+                    browser_name=selected_browser,
+                )
             )
         )
 
@@ -1378,7 +1316,7 @@ class DesktopQtApp(QtWidgets.QMainWindow):
 
     def _apply_theme(self, theme_id: str) -> None:
         theme = get_ui_theme(theme_id)
-        app = QtWidgets.QApplication.instance()
+        app = cast(QtWidgets.QApplication | None, QtWidgets.QApplication.instance())
         if app is not None:
             app.setStyle("Fusion")
             palette = QtGui.QPalette()

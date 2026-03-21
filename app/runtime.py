@@ -7,7 +7,6 @@ from uuid import uuid4
 
 from domain.enums import EventLevel
 from domain.models import (
-    AssetSelection,
     ParagraphIntent,
     Project,
     QueryBundle,
@@ -34,7 +33,7 @@ def _elapsed_ms(started_at: float, *, minimum: int = 0) -> int:
 class ApplicationSnapshot:
     workspace_root: Path
     providers: list[str]
-    browser_profiles: list[str]
+    storyblocks_profile_id: str | None
 
 
 class DesktopApplication:
@@ -46,10 +45,7 @@ class DesktopApplication:
         return cls(bootstrap_application(workspace_root))
 
     def start(self) -> ApplicationSnapshot:
-        profiles = [
-            profile.profile_id
-            for profile in self.container.profile_registry.list_profiles()
-        ]
+        profile = self.container.profile_registry.get_or_create_singleton()
         providers = [
             provider.provider_id
             for provider in self.container.provider_registry.list_all()
@@ -57,7 +53,7 @@ class DesktopApplication:
         return ApplicationSnapshot(
             workspace_root=self.container.workspace.paths.root,
             providers=providers,
-            browser_profiles=profiles,
+            storyblocks_profile_id=profile.profile_id,
         )
 
     def close(self) -> None:
@@ -278,28 +274,15 @@ class DesktopApplication:
             config=config,
         )
 
-    def resume_media_run(
+    def rerun_full_media_run(
         self,
-        run_id: str,
         *,
+        run_id: str | None = None,
+        project_id: str | None = None,
         config: MediaSelectionConfig | None = None,
     ) -> tuple[Run, RunManifest]:
-        return self.container.media_run_service.resume(run_id, config=config)
-
-    def retry_failed_media_run(
-        self,
-        run_id: str,
-        *,
-        config: MediaSelectionConfig | None = None,
-    ) -> tuple[Run, RunManifest]:
-        return self.container.media_run_service.retry_failed_only(run_id, config=config)
-
-    def lock_paragraph_selection(
-        self,
-        run_id: str,
-        paragraph_no: int,
-        selection: AssetSelection,
-    ) -> RunManifest:
-        return self.container.media_run_service.lock_selection(
-            run_id, paragraph_no, selection
+        return self.container.media_run_service.rerun_full_run(
+            run_id=run_id,
+            project_id=project_id,
+            config=config,
         )

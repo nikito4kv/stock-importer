@@ -13,7 +13,6 @@ from browser import StoryblocksOperationPolicy
 from domain.enums import AssetKind, ProviderCapability, RunStage, RunStatus
 from domain.models import (
     AssetCandidate,
-    AssetSelection,
     ParagraphIntent,
     ParagraphUnit,
     Project,
@@ -21,7 +20,11 @@ from domain.models import (
     QueryBundle,
     ScriptDocument,
 )
-from pipeline import CallbackCandidateSearchBackend, MediaSelectionConfig
+from pipeline import (
+    CallbackCandidateSearchBackend,
+    MediaSelectionConfig,
+    VideoSelectionPolicy,
+)
 from services.errors import DownloadError, SessionError
 
 
@@ -146,17 +149,19 @@ class MediaPipelineTests(unittest.TestCase):
                     provider_id="storyblocks_image",
                     capability=ProviderCapability.IMAGE,
                     descriptor=image_descriptor,
-                    search_fn=lambda paragraph, query, limit: []
-                    if paragraph.paragraph_no == 2
-                    else [
-                        _candidate(
-                            f"sb-image-{paragraph.paragraph_no}",
-                            "storyblocks_image",
-                            AssetKind.IMAGE,
-                            rank_hint=8.0,
-                            title=f"Storyblocks image {paragraph.paragraph_no}",
-                        )
-                    ],
+                    search_fn=lambda paragraph, query, limit: (
+                        []
+                        if paragraph.paragraph_no == 2
+                        else [
+                            _candidate(
+                                f"sb-image-{paragraph.paragraph_no}",
+                                "storyblocks_image",
+                                AssetKind.IMAGE,
+                                rank_hint=8.0,
+                                title=f"Storyblocks image {paragraph.paragraph_no}",
+                            )
+                        ]
+                    ),
                 )
             )
             container.media_pipeline.register_backend(
@@ -182,7 +187,7 @@ class MediaPipelineTests(unittest.TestCase):
                     supporting_image_limit=1,
                     fallback_image_limit=1,
                     max_candidates_per_provider=4,
-                    top_k_to_relevance=3,
+                    video_selection=VideoSelectionPolicy(ranked_candidate_limit=3),
                 ),
             )
 
@@ -205,7 +210,9 @@ class MediaPipelineTests(unittest.TestCase):
                 second.selection.fallback_assets[0].provider_name, "openverse"
             )
             self.assertEqual(first.slots[0].slot_id, "primary_video")
-            self.assertEqual(manifest.summary["primary_videos"], 2)
+            self.assertIn("downloads_root", manifest.summary)
+            self.assertIn("videos_dir", manifest.summary)
+            self.assertIn("images_dir", manifest.summary)
             self.assertEqual(
                 manifest.sourcing_strategy["image_primary_providers"],
                 ["storyblocks_image"],
@@ -518,14 +525,29 @@ class MediaPipelineTests(unittest.TestCase):
                 "мой-сценарий",
             )
 
-    def test_user_locked_selection_is_preserved_in_manifest(self) -> None:
+    def test_manifest_summary_includes_download_paths_and_saved_file_counts(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            container, project = self._create_project(temp_dir)
+            container, project = self._create_project(temp_dir, paragraph_count=1)
             video_descriptor = container.provider_registry.get("storyblocks_video")
             assert video_descriptor is not None
 
+            class DownloadingBackend(CallbackCandidateSearchBackend):
+                def download_asset(
+                    self, asset: AssetCandidate, *, destination_dir: Path, filename: str
+                ) -> AssetCandidate:
+                    destination_dir.mkdir(parents=True, exist_ok=True)
+                    local_path = destination_dir / filename
+                    local_path.write_bytes(b"video-bytes")
+                    downloaded = AssetCandidate.from_dict(asset.to_dict())
+                    downloaded.local_path = local_path
+                    downloaded.metadata["download_status"] = "completed"
+                    return downloaded
+
+            output_root = Path(temp_dir) / "exports"
             container.media_pipeline.register_backend(
-                CallbackCandidateSearchBackend(
+                DownloadingBackend(
                     provider_id="storyblocks_video",
                     capability=ProviderCapability.VIDEO,
                     descriptor=video_descriptor,
@@ -544,31 +566,26 @@ class MediaPipelineTests(unittest.TestCase):
                 )
             )
 
-            run, manifest = container.media_run_service.create_run(project.project_id)
-            locked = AssetSelection(
-                paragraph_no=1,
-                primary_asset=_candidate(
-                    "locked-video",
-                    "storyblocks_video",
-                    AssetKind.VIDEO,
-                    rank_hint=100.0,
-                    title="Locked video",
-                    semantic_signature="locked-video",
-                ),
-                reason="User locked selection",
-                user_locked=True,
-                status="locked",
-                user_decision_status="locked",
+            completed_run, manifest = container.media_run_service.create_and_execute(
+                project.project_id,
+                config=MediaSelectionConfig(output_root=str(output_root)),
             )
-            container.media_run_service.lock_selection(run.run_id, 1, locked)
-            completed_run, manifest = container.media_run_service.execute(run.run_id)
 
             self.assertEqual(completed_run.status, RunStatus.COMPLETED)
-            first = manifest.paragraph_entries[0]
-            assert first.selection is not None
-            assert first.selection.primary_asset is not None
-            self.assertTrue(first.selection.user_locked)
-            self.assertEqual(first.selection.primary_asset.asset_id, "locked-video")
+            self.assertEqual(
+                manifest.summary["downloads_root"],
+                str((output_root / "media-project" / "downloads").resolve()),
+            )
+            self.assertEqual(
+                manifest.summary["videos_dir"],
+                str((output_root / "media-project" / "downloads" / "videos").resolve()),
+            )
+            self.assertEqual(
+                manifest.summary["images_dir"],
+                str((output_root / "media-project" / "downloads" / "images").resolve()),
+            )
+            self.assertEqual(manifest.summary["downloaded_video_files"], 1)
+            self.assertEqual(manifest.summary["downloaded_image_files"], 0)
 
     def test_snapshot_live_run_state_does_not_fallback_to_manifest_load_after_release(
         self,
@@ -642,93 +659,106 @@ class MediaPipelineTests(unittest.TestCase):
                 second.diagnostics.dedupe_rejections.get("raw_file_hash"), 1
             )
 
-    def test_pause_resume_and_retry_failed_only_keep_manifest_consistent(self) -> None:
+    def test_rerun_full_run_ignores_previous_subset_and_creates_new_manifest(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container, project = self._create_project(temp_dir, paragraph_count=3)
             video_descriptor = container.provider_registry.get("storyblocks_video")
             assert video_descriptor is not None
-            state = {"fail": True}
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="storyblocks_video",
+                    capability=ProviderCapability.VIDEO,
+                    descriptor=video_descriptor,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            f"video-{paragraph.paragraph_no}",
+                            "storyblocks_video",
+                            AssetKind.VIDEO,
+                            rank_hint=10.0,
+                            title=f"Video {paragraph.paragraph_no}",
+                        )
+                    ],
+                )
+            )
 
-            def flaky_search(
-                paragraph: ParagraphUnit, query: str, limit: int
-            ) -> list[AssetCandidate]:
-                if paragraph.paragraph_no == 2 and state["fail"]:
-                    raise RuntimeError("provider offline")
-                return [
-                    _candidate(
-                        f"video-{paragraph.paragraph_no}",
-                        "storyblocks_video",
-                        AssetKind.VIDEO,
-                        rank_hint=10.0,
-                        title=f"Video {paragraph.paragraph_no}",
-                    )
-                ]
+            subset_run, subset_manifest = (
+                container.media_run_service.create_and_execute(
+                    project.project_id,
+                    selected_paragraphs=[2],
+                    config=MediaSelectionConfig(
+                        storyblocks_images_enabled=False,
+                        free_images_enabled=False,
+                    ),
+                )
+            )
+            rerun_run, rerun_manifest = container.media_run_service.rerun_full_run(
+                run_id=subset_run.run_id,
+                config=MediaSelectionConfig(
+                    storyblocks_images_enabled=False,
+                    free_images_enabled=False,
+                ),
+            )
+
+            self.assertEqual(
+                [entry.paragraph_no for entry in subset_manifest.paragraph_entries],
+                [2],
+            )
+            self.assertEqual(subset_run.selected_paragraphs, [2])
+            self.assertEqual(rerun_run.status, RunStatus.COMPLETED)
+            self.assertNotEqual(rerun_run.run_id, subset_run.run_id)
+            self.assertEqual(rerun_run.selected_paragraphs, [])
+            self.assertEqual(
+                [entry.paragraph_no for entry in rerun_manifest.paragraph_entries],
+                [1, 2, 3],
+            )
+
+    def test_rerun_full_run_accepts_project_id_without_inheriting_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container, project = self._create_project(temp_dir, paragraph_count=3)
+            video_descriptor = container.provider_registry.get("storyblocks_video")
+            assert video_descriptor is not None
 
             container.media_pipeline.register_backend(
                 CallbackCandidateSearchBackend(
                     provider_id="storyblocks_video",
                     capability=ProviderCapability.VIDEO,
                     descriptor=video_descriptor,
-                    search_fn=flaky_search,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            f"video-{paragraph.paragraph_no}",
+                            "storyblocks_video",
+                            AssetKind.VIDEO,
+                            rank_hint=9.0,
+                            title=f"Video {paragraph.paragraph_no}",
+                        )
+                    ],
                 )
             )
 
-            run, _ = container.media_run_service.create_run(project.project_id)
-            container.media_run_service.pause_after_current(run.run_id)
-            paused_run, paused_manifest = container.media_run_service.execute(
-                run.run_id
+            subset_run, _ = container.media_run_service.create_and_execute(
+                project.project_id,
+                selected_paragraphs=[1],
+                config=MediaSelectionConfig(
+                    storyblocks_images_enabled=False,
+                    free_images_enabled=False,
+                ),
+            )
+            rerun_run, rerun_manifest = container.media_run_service.rerun_full_run(
+                project_id=project.project_id,
+                config=MediaSelectionConfig(
+                    storyblocks_images_enabled=False,
+                    free_images_enabled=False,
+                ),
             )
 
-            self.assertEqual(paused_run.status, RunStatus.PAUSED)
-            self.assertEqual(paused_manifest.summary["paragraphs_completed"], 1)
-            self.assertNotIn(run.run_id, container.media_pipeline._run_dedupers)
-            self.assertNotIn(
-                run.run_id, container.media_pipeline._manifest_entry_indexes
-            )
-
-            resumed_run, failed_manifest = container.media_run_service.resume(
-                run.run_id
-            )
-            self.assertEqual(resumed_run.status, RunStatus.FAILED)
-            self.assertEqual(sorted(resumed_run.completed_paragraphs), [1, 3])
-            self.assertEqual(resumed_run.failed_paragraphs, [2])
-            self.assertEqual(failed_manifest.summary["paragraphs_failed"], 1)
-            assert failed_manifest.paragraph_entries[0].selection is not None
-            assert (
-                failed_manifest.paragraph_entries[0].selection.primary_asset is not None
-            )
+            self.assertEqual(subset_run.selected_paragraphs, [1])
+            self.assertEqual(rerun_run.status, RunStatus.COMPLETED)
+            self.assertEqual(rerun_run.selected_paragraphs, [])
             self.assertEqual(
-                failed_manifest.paragraph_entries[0].selection.primary_asset.asset_id,
-                "video-1",
-            )
-            self.assertEqual(failed_manifest.paragraph_entries[1].status, "failed")
-            assert failed_manifest.paragraph_entries[2].selection is not None
-            assert (
-                failed_manifest.paragraph_entries[2].selection.primary_asset is not None
-            )
-            self.assertEqual(
-                failed_manifest.paragraph_entries[2].selection.primary_asset.asset_id,
-                "video-3",
-            )
-
-            state["fail"] = False
-            retried_run, retried_manifest = (
-                container.media_run_service.retry_failed_only(run.run_id)
-            )
-
-            self.assertEqual(retried_run.status, RunStatus.COMPLETED)
-            self.assertEqual(
-                [entry.paragraph_no for entry in retried_manifest.paragraph_entries],
-                [2],
-            )
-            assert retried_manifest.paragraph_entries[0].selection is not None
-            assert (
-                retried_manifest.paragraph_entries[0].selection.primary_asset
-                is not None
-            )
-            self.assertEqual(
-                retried_manifest.paragraph_entries[0].selection.primary_asset.asset_id,
-                "video-2",
+                [entry.paragraph_no for entry in rerun_manifest.paragraph_entries],
+                [1, 2, 3],
             )
 
     def test_storyblocks_video_download_falls_back_to_next_candidate_when_top_download_fails(
@@ -841,7 +871,7 @@ class MediaPipelineTests(unittest.TestCase):
             self.assertEqual(sorted(run.completed_paragraphs), [1, 3])
             self.assertEqual(run.failed_paragraphs, [2])
             self.assertEqual(manifest.paragraph_entries[1].status, "failed")
-            self.assertEqual(manifest.paragraph_entries[2].status, "selected")
+            self.assertEqual(manifest.paragraph_entries[2].status, "completed")
 
     def test_image_enabled_mode_creates_shared_images_dir_even_when_no_images_are_selected(
         self,
@@ -978,90 +1008,6 @@ class MediaPipelineTests(unittest.TestCase):
                 run.run_id, container.media_pipeline._manifest_entry_indexes
             )
 
-    def test_resume_keeps_deduper_seeded_after_locked_paragraph(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            container, project = self._create_project(temp_dir, paragraph_count=3)
-            video_descriptor = container.provider_registry.get("storyblocks_video")
-            assert video_descriptor is not None
-
-            container.media_pipeline.register_backend(
-                CallbackCandidateSearchBackend(
-                    provider_id="storyblocks_video",
-                    capability=ProviderCapability.VIDEO,
-                    descriptor=video_descriptor,
-                    search_fn=lambda paragraph, query, limit: [
-                        _candidate(
-                            "video-1"
-                            if paragraph.paragraph_no == 3
-                            else f"video-{paragraph.paragraph_no}",
-                            "storyblocks_video",
-                            AssetKind.VIDEO,
-                            rank_hint=9.0,
-                            title=f"Video {paragraph.paragraph_no}",
-                            semantic_signature=(
-                                "video-1"
-                                if paragraph.paragraph_no == 3
-                                else f"video-{paragraph.paragraph_no}"
-                            ),
-                        )
-                    ],
-                )
-            )
-
-            run, manifest = container.media_run_service.create_run(project.project_id)
-            first = manifest.paragraph_entries[0]
-            first.selection = AssetSelection(
-                paragraph_no=1,
-                primary_asset=_candidate(
-                    "video-1",
-                    "storyblocks_video",
-                    AssetKind.VIDEO,
-                    rank_hint=9.0,
-                    title="Video 1",
-                    semantic_signature="video-1",
-                ),
-                status="selected",
-            )
-            first.status = "selected"
-
-            second = manifest.paragraph_entries[1]
-            second.selection = AssetSelection(
-                paragraph_no=2,
-                primary_asset=_candidate(
-                    "video-2",
-                    "storyblocks_video",
-                    AssetKind.VIDEO,
-                    rank_hint=9.0,
-                    title="Video 2",
-                    semantic_signature="video-2",
-                ),
-                status="locked",
-                user_locked=True,
-                user_decision_status="locked",
-            )
-            second.status = "locked"
-            second.user_decision_status = "locked"
-
-            container.media_pipeline.save_manifest(manifest)
-            run.completed_paragraphs = [1]
-            container.run_repository.save(run)
-
-            resumed_run, resumed_manifest = container.media_run_service.resume(
-                run.run_id,
-                config=MediaSelectionConfig(
-                    storyblocks_images_enabled=False,
-                    free_images_enabled=False,
-                ),
-            )
-
-            self.assertEqual(resumed_run.status, RunStatus.COMPLETED)
-            third = resumed_manifest.paragraph_entries[2]
-            assert third.selection is not None
-            assert third.diagnostics is not None
-            self.assertEqual(third.status, "no_match")
-            self.assertIsNone(third.selection.primary_asset)
-            self.assertEqual(third.diagnostics.dedupe_rejections.get("source_id"), 1)
-
     def test_execute_persists_run_without_extra_final_save(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container, project = self._create_project(temp_dir, paragraph_count=1)
@@ -1094,7 +1040,7 @@ class MediaPipelineTests(unittest.TestCase):
             self.assertEqual(completed_run.status, RunStatus.COMPLETED)
             self.assertEqual(save_run.call_count, 2)
 
-    def test_cancelled_run_persists_checkpoint_state(self) -> None:
+    def test_cancelled_run_persists_without_checkpoint_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container, project = self._create_project(temp_dir, paragraph_count=2)
             run, _manifest = container.media_run_service.create_run(project.project_id)
@@ -1105,88 +1051,8 @@ class MediaPipelineTests(unittest.TestCase):
             )
 
             self.assertEqual(cancelled_run.status, RunStatus.CANCELLED)
-            self.assertIsNotNone(cancelled_run.checkpoint)
-            assert cancelled_run.checkpoint is not None
-            self.assertEqual(cancelled_run.checkpoint.stage, RunStage.PERSIST)
-            self.assertEqual(cancelled_run.checkpoint.completed_paragraphs, [])
-            self.assertEqual(cancelled_run.checkpoint.failed_paragraphs, [])
+            self.assertFalse(hasattr(cancelled_run, "checkpoint"))
             self.assertEqual(cancelled_manifest.summary["paragraphs_processed"], 0)
-
-    def test_parallel_pause_drains_inflight_and_cancels_queued_paragraphs(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            container, project = self._create_project(temp_dir, paragraph_count=4)
-            descriptor = container.provider_registry.get("openverse")
-            assert descriptor is not None
-            container.media_pipeline._provider_settings.enabled_providers = [
-                "openverse"
-            ]
-            container.orchestrator.configure(max_workers=2, queue_size=4)
-            sync_point = threading.Barrier(2)
-
-            def slow_search(
-                paragraph: ParagraphUnit, query: str, limit: int
-            ) -> list[AssetCandidate]:
-                try:
-                    sync_point.wait(timeout=1.0)
-                except threading.BrokenBarrierError:
-                    pass
-                time.sleep(0.05)
-                return [
-                    _candidate(
-                        f"openverse-{paragraph.paragraph_no}",
-                        "openverse",
-                        AssetKind.IMAGE,
-                        rank_hint=8.0,
-                        title=f"Openverse {paragraph.paragraph_no}",
-                    )
-                ]
-
-            container.media_pipeline.register_backend(
-                CallbackCandidateSearchBackend(
-                    provider_id="openverse",
-                    capability=ProviderCapability.IMAGE,
-                    descriptor=descriptor,
-                    search_fn=slow_search,
-                )
-            )
-            config = MediaSelectionConfig(
-                video_enabled=False,
-                storyblocks_images_enabled=False,
-                free_images_enabled=True,
-                supporting_image_limit=0,
-                fallback_image_limit=1,
-                early_stop_when_satisfied=False,
-            )
-
-            run, _manifest = container.media_run_service.create_run(
-                project.project_id,
-                config=config,
-            )
-            container.media_run_service.pause_after_current(run.run_id)
-            paused_run, paused_manifest = container.media_run_service.execute(
-                run.run_id,
-                config=config,
-            )
-
-            self.assertEqual(paused_run.status, RunStatus.PAUSED)
-            self.assertEqual(sorted(paused_run.completed_paragraphs), [1, 2])
-            self.assertEqual(paused_manifest.summary["paragraphs_completed"], 2)
-            paused_event = next(
-                event
-                for event in reversed(container.event_recorder.by_run(run.run_id))
-                if event.name == "run.paused"
-            )
-            self.assertGreaterEqual(int(paused_event.payload.get("done_futures", 0)), 1)
-            self.assertLessEqual(int(paused_event.payload.get("pending_futures", 0)), 1)
-            self.assertEqual(paused_event.payload.get("cancelled_futures"), 2)
-
-            resumed_run, resumed_manifest = container.media_run_service.resume(
-                run.run_id,
-                config=config,
-            )
-            self.assertEqual(resumed_run.status, RunStatus.COMPLETED)
-            self.assertEqual(sorted(resumed_run.completed_paragraphs), [1, 2, 3, 4])
-            self.assertEqual(resumed_manifest.summary["paragraphs_completed"], 4)
 
     def test_parallel_cancel_drains_inflight_and_cancels_queued_paragraphs(
         self,
@@ -1725,7 +1591,7 @@ class MediaPipelineTests(unittest.TestCase):
             )
             self.assertEqual(backend.operation_policy.download_retries, 7)
             self.assertEqual(backend.operation_policy.download_timeout_seconds, 99.0)
-            self.assertEqual(manifest.paragraph_entries[0].status, "selected")
+            self.assertEqual(manifest.paragraph_entries[0].status, "completed")
 
     def test_storyblocks_search_timeout_cleans_up_before_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1813,7 +1679,7 @@ class MediaPipelineTests(unittest.TestCase):
             )
 
             self.assertEqual(run.status, RunStatus.COMPLETED)
-            self.assertEqual(manifest.paragraph_entries[0].status, "selected")
+            self.assertEqual(manifest.paragraph_entries[0].status, "completed")
             self.assertEqual(backend.session_manager.reset_calls, 1)
             self.assertEqual(backend.max_active_calls, 1)
             self.assertEqual(backend.received_timeouts, [0.02, 0.02])
@@ -1909,7 +1775,9 @@ class MediaPipelineTests(unittest.TestCase):
             time.sleep(0.15)
             self.assertFalse(backend.output_path.exists())
 
-    def test_relevance_timeout_degrades_without_blocking_run(self) -> None:
+    def test_image_selection_preserves_provider_order_without_relevance_ranking(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container, project = self._create_project(temp_dir, paragraph_count=1)
             descriptor = container.provider_registry.get("openverse")
@@ -1927,41 +1795,40 @@ class MediaPipelineTests(unittest.TestCase):
                             "img-1",
                             "openverse",
                             AssetKind.IMAGE,
-                            rank_hint=9.0,
+                            rank_hint=1.0,
                             title="Image 1",
                         ),
                         _candidate(
                             "img-2",
                             "openverse",
                             AssetKind.IMAGE,
-                            rank_hint=8.0,
+                            rank_hint=9.0,
                             title="Image 2",
                         ),
                         _candidate(
                             "img-3",
                             "openverse",
                             AssetKind.IMAGE,
-                            rank_hint=7.0,
+                            rank_hint=8.0,
                             title="Image 3",
                         ),
                         _candidate(
                             "img-4",
                             "openverse",
                             AssetKind.IMAGE,
-                            rank_hint=6.0,
+                            rank_hint=7.0,
                             title="Image 4",
                         ),
                     ],
                 )
             )
 
-            def slow_rank(asset: AssetCandidate) -> float:
-                time.sleep(0.05)
-                return float(asset.metadata["rank_hint"])
-
-            started_at = time.perf_counter()
             with patch.object(
-                container.media_pipeline, "_asset_rank", side_effect=slow_rank
+                container.media_pipeline,
+                "_asset_rank",
+                side_effect=AssertionError(
+                    "Image path should not call relevance ranking"
+                ),
             ):
                 run, manifest = container.media_run_service.create_and_execute(
                     project.project_id,
@@ -1971,16 +1838,11 @@ class MediaPipelineTests(unittest.TestCase):
                         free_images_enabled=True,
                         supporting_image_limit=0,
                         fallback_image_limit=2,
-                        relevance_workers=2,
-                        bounded_relevance_queue=4,
-                        relevance_timeout_seconds=0.01,
                         early_stop_when_satisfied=False,
                     ),
                 )
-            elapsed = time.perf_counter() - started_at
 
             self.assertEqual(run.status, RunStatus.COMPLETED)
-            self.assertLess(elapsed, 0.15)
             entry = manifest.paragraph_entries[0]
             assert entry.selection is not None
             self.assertEqual(
@@ -1990,14 +1852,9 @@ class MediaPipelineTests(unittest.TestCase):
             degraded_events = [
                 event
                 for event in container.event_recorder.by_run(run.run_id)
-                if event.name == "paragraph.relevance.degraded"
+                if event.name == "paragraph.video_ranking.degraded"
             ]
-            self.assertTrue(degraded_events)
-            self.assertTrue(degraded_events[-1].payload.get("relevance_timed_out"))
-            self.assertGreater(
-                int(degraded_events[-1].payload.get("relevance_tasks_timed_out", 0)),
-                0,
-            )
+            self.assertEqual(degraded_events, [])
 
     def test_no_match_reason_counter_uses_low_cardinality_bucket(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

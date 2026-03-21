@@ -13,7 +13,7 @@ from domain.enums import RunStage, RunStatus, SessionHealth
 from domain.models import (
     AssetCandidate,
     AssetSelection,
-    LiveAssetSnapshot,
+    LiveDownloadedFileSnapshot,
     LiveRunStateSnapshot,
     ParagraphIntent,
     Preset,
@@ -31,14 +31,14 @@ from domain.project_modes import (
     provider_ids_for_mode,
 )
 from pipeline import MediaSelectionConfig
+from providers import resolve_execution_concurrency_mode
 from services.errors import AppError
 from services.events import AppEvent
 
 from .contracts import (
     UiAdvancedSettingsViewModel,
-    UiAssetPreview,
-    UiEventJournalItem,
-    UiImportableSessionOption,
+    UiDownloadedFileItem,
+    UiImportableBrowserProfileOption,
     UiLiveRunStateViewModel,
     UiLiveSnapshotViewModel,
     UiNotification,
@@ -73,7 +73,6 @@ def _iso(value) -> str:
 @dataclass(slots=True)
 class _BackgroundRunTask:
     run_id: str
-    mode: str
     thread: threading.Thread
     project_id: str
     notification_sent: bool = False
@@ -124,7 +123,6 @@ class DesktopGuiController:
             notifications=list(self.notifications[-10:]),
         )
         if active_run_id is not None:
-            state.event_journal = self.build_event_journal(active_run_id)
             state.run_progress = self.build_run_progress(
                 active_run_id, active_project_id=active_project_id
             )
@@ -143,9 +141,7 @@ class DesktopGuiController:
         else:
             state.progress_total = len(state.paragraph_items)
             state.progress_completed = sum(
-                1
-                for item in state.paragraph_items
-                if item.status in {"selected", "locked", "partial_success"}
+                1 for item in state.paragraph_items if item.status == "completed"
             )
         return state
 
@@ -164,7 +160,6 @@ class DesktopGuiController:
         state = UiLiveRunStateViewModel(
             active_run_id=live.active_run_id,
             status_text=live.status_text,
-            event_journal=list(live.event_journal),
             run_progress=live.run_progress,
         )
         resolved_run_id = live.active_run_id
@@ -199,7 +194,6 @@ class DesktopGuiController:
         *,
         active_project_id: str | None = None,
         active_run_id: str | None = None,
-        journal_limit: int = 40,
     ) -> UiLiveSnapshotViewModel:
         self._finalize_background_run_if_needed()
         resolved_run_id = self._resolve_active_run_id(active_project_id, active_run_id)
@@ -233,14 +227,6 @@ class DesktopGuiController:
             state.status_text = (
                 f"{state.run_progress.status}: {state.run_progress.live_state}{current}"
             )
-        events = self.application.container.event_recorder.tail_by_run(
-            resolved_run_id, limit=max(10, int(journal_limit))
-        )
-        state.event_journal = self.build_event_journal(
-            resolved_run_id,
-            limit=max(10, int(journal_limit)),
-            events=events,
-        )
         return state
 
     def _resolve_active_run_id(
@@ -512,6 +498,7 @@ class DesktopGuiController:
         live_states = (
             dict(live_run_state.paragraph_states) if live_run_state is not None else {}
         )
+        paragraphs_in_run = set(manifest_entries) | set(live_states)
         latest_events = (
             latest_events
             if latest_events is not None
@@ -522,24 +509,47 @@ class DesktopGuiController:
         for paragraph in document.paragraphs:
             entry = manifest_entries.get(paragraph.paragraph_no)
             live_state = live_states.get(paragraph.paragraph_no)
-            selection = entry.selection if entry is not None else None
-            status = (
-                live_state.status
-                if live_state is not None
-                else (entry.status if entry is not None else "pending")
-            )
-            decision = (
-                live_state.user_decision_status
-                if live_state is not None
-                else (
-                    entry.user_decision_status if entry is not None else "auto_selected"
-                )
-            )
             latest_event = latest_events.get(paragraph.paragraph_no)
             include_detail = (
                 detailed_paragraph_no is None
                 or paragraph.paragraph_no == detailed_paragraph_no
             )
+            has_downloaded_files = (
+                bool(live_state.downloaded_files)
+                if live_state is not None
+                else self._has_downloaded_files(
+                    entry.selection if entry is not None else None
+                )
+            )
+            downloaded_files = (
+                self._live_downloaded_files(live_state.downloaded_files)
+                if include_detail and live_state is not None
+                else (
+                    self._downloaded_files(
+                        entry.selection if entry is not None else None
+                    )
+                    if include_detail
+                    else []
+                )
+            )
+            if live_state is not None:
+                status = self._normalize_paragraph_status(
+                    live_state.status,
+                    has_downloaded_files=has_downloaded_files,
+                )
+                result_note = live_state.result_note
+            elif entry is not None:
+                status = self._normalize_paragraph_status(
+                    entry.status,
+                    has_downloaded_files=has_downloaded_files,
+                )
+                result_note = self._entry_result_note(entry)
+            elif run_id is not None and paragraphs_in_run:
+                status = "skipped"
+                result_note = ""
+            else:
+                status = "pending"
+                result_note = ""
             items.append(
                 UiParagraphWorkbenchItem(
                     paragraph_no=paragraph.paragraph_no,
@@ -548,7 +558,7 @@ class DesktopGuiController:
                     numbering_valid=paragraph.numbering_valid,
                     validation_issues=list(paragraph.validation_issues),
                     status=status,
-                    user_decision_status=decision,
+                    result_note=result_note,
                     intent_summary=self._intent_summary(paragraph.intent),
                     current_stage=latest_event.stage.value
                     if latest_event is not None and latest_event.stage is not None
@@ -569,27 +579,7 @@ class DesktopGuiController:
                         if include_detail and paragraph.query_bundle is not None
                         else []
                     ),
-                    selected_assets=(
-                        self._live_asset_previews(live_state.selected_assets)
-                        if include_detail and live_state is not None
-                        else (
-                            self._selected_assets(selection) if include_detail else []
-                        )
-                    ),
-                    candidate_assets=(
-                        self._live_asset_previews(live_state.candidate_assets)
-                        if include_detail and live_state is not None
-                        else (self._candidate_assets(entry) if include_detail else [])
-                    ),
-                    rejection_reasons=list(
-                        live_state.rejection_reasons
-                        if include_detail and live_state is not None
-                        else (
-                            entry.rejection_reasons
-                            if include_detail and entry is not None
-                            else []
-                        )
-                    ),
+                    downloaded_files=downloaded_files,
                 )
             )
         return items
@@ -718,7 +708,6 @@ class DesktopGuiController:
         self._start_background_run(
             run.run_id,
             project_id,
-            "execute",
             lambda: self.application.container.media_run_service.execute(
                 run.run_id, config=config
             ),
@@ -728,259 +717,79 @@ class DesktopGuiController:
         )
         return run.run_id
 
-    def resume_run(
-        self, run_id: str, advanced: UiAdvancedSettingsViewModel | None = None
-    ):
-        config = self._media_config_from_forms(
-            self.build_quick_launch_settings(),
-            advanced or self.build_advanced_settings(),
+    def rerun_full_run(
+        self,
+        project_id: str,
+        quick: UiQuickLaunchSettingsViewModel,
+        advanced: UiAdvancedSettingsViewModel,
+    ) -> tuple[Run, RunManifest]:
+        full_quick = replace(quick, selected_paragraphs=[], paragraph_selection_text="")
+        full_quick = self._validate_run_request(project_id, full_quick, advanced)
+        self.apply_forms_to_settings(full_quick, advanced)
+        run, manifest = self.application.rerun_full_media_run(
+            project_id=project_id,
+            config=self._media_config_from_forms(full_quick, advanced),
         )
-        return self.application.resume_media_run(run_id, config=config)
-
-    def resume_run_async(
-        self, run_id: str, advanced: UiAdvancedSettingsViewModel | None = None
-    ) -> str:
-        run = self._require_run(run_id)
-        config = self._media_config_from_forms(
-            self.build_quick_launch_settings(),
-            advanced or self.build_advanced_settings(),
-        )
-        self._start_background_run(
-            run_id,
-            run.project_id,
-            "resume",
-            lambda: self.application.resume_media_run(run_id, config=config),
-        )
-        self._remember_active_run(run.project_id, run_id)
+        self._remember_active_run(project_id, run.run_id)
         self._push_notification(
             UiNotification(
-                "Запуск продолжен",
-                f"Запуск {run_id} продолжен с контрольной точки",
-                "info",
+                "Полный повтор завершен",
+                f"Создан новый полный запуск {run.run_id} со статусом {run.status.value}",
+                "success",
             )
         )
-        return run_id
+        return run, manifest
 
-    def retry_failed_run(
-        self, run_id: str, advanced: UiAdvancedSettingsViewModel | None = None
-    ):
-        config = self._media_config_from_forms(
-            self.build_quick_launch_settings(),
-            advanced or self.build_advanced_settings(),
-        )
-        return self.application.retry_failed_media_run(run_id, config=config)
-
-    def retry_failed_run_async(
-        self, run_id: str, advanced: UiAdvancedSettingsViewModel | None = None
-    ) -> str:
-        source_run = self._require_run(run_id)
-        if not source_run.failed_paragraphs:
-            raise AppError(
-                "no_failed_paragraphs", "В этом запуске нет абзацев для повтора."
-            )
-        config = self._media_config_from_forms(
-            self.build_quick_launch_settings(),
-            advanced or self.build_advanced_settings(),
-        )
-        new_run, _manifest = self.application.container.media_run_service.create_run(
-            source_run.project_id,
-            selected_paragraphs=list(source_run.failed_paragraphs),
-            config=config,
-        )
-        self._remember_active_run(source_run.project_id, new_run.run_id)
-        self._start_background_run(
-            new_run.run_id,
-            source_run.project_id,
-            "retry_failed",
-            lambda: self.application.container.media_run_service.execute(
-                new_run.run_id, config=config
-            ),
-        )
-        self._push_notification(
-            UiNotification(
-                "Повтор начат", f"Повторный запуск {new_run.run_id} выполняется", "info"
-            )
-        )
-        return new_run.run_id
-
-    def rerun_current_paragraph(
+    def rerun_full_run_async(
         self,
         project_id: str,
-        paragraph_no: int,
-        quick: UiQuickLaunchSettingsViewModel,
-        advanced: UiAdvancedSettingsViewModel,
-    ):
-        quick = self._validate_run_request(project_id, quick, advanced)
-        self.apply_forms_to_settings(quick, advanced)
-        return self.application.container.media_run_service.rerun_selected(
-            project_id,
-            [paragraph_no],
-            config=self._media_config_from_forms(quick, advanced),
-        )
-
-    def rerun_current_paragraph_async(
-        self,
-        project_id: str,
-        paragraph_no: int,
         quick: UiQuickLaunchSettingsViewModel,
         advanced: UiAdvancedSettingsViewModel,
     ) -> str:
-        return self.rerun_selected_paragraphs_async(
-            project_id, [paragraph_no], quick, advanced
-        )
-
-    def rerun_selected_paragraphs(
-        self,
-        project_id: str,
-        paragraph_numbers: list[int],
-        quick: UiQuickLaunchSettingsViewModel,
-        advanced: UiAdvancedSettingsViewModel,
-    ):
-        quick = self._validate_run_request(project_id, quick, advanced)
-        self.apply_forms_to_settings(quick, advanced)
-        return self.application.container.media_run_service.rerun_selected(
-            project_id,
-            paragraph_numbers,
-            config=self._media_config_from_forms(quick, advanced),
-        )
-
-    def rerun_selected_paragraphs_async(
-        self,
-        project_id: str,
-        paragraph_numbers: list[int],
-        quick: UiQuickLaunchSettingsViewModel,
-        advanced: UiAdvancedSettingsViewModel,
-    ) -> str:
-        quick = self._validate_run_request(project_id, quick, advanced)
-        self.apply_forms_to_settings(quick, advanced)
-        config = self._media_config_from_forms(quick, advanced)
+        full_quick = replace(quick, selected_paragraphs=[], paragraph_selection_text="")
+        full_quick = self._validate_run_request(project_id, full_quick, advanced)
+        self.apply_forms_to_settings(full_quick, advanced)
+        config = self._media_config_from_forms(full_quick, advanced)
         run, _manifest = self.application.container.media_run_service.create_run(
             project_id,
-            selected_paragraphs=paragraph_numbers,
             config=config,
         )
         self._remember_active_run(project_id, run.run_id)
         self._start_background_run(
             run.run_id,
             project_id,
-            "rerun_selected",
             lambda: self.application.container.media_run_service.execute(
                 run.run_id, config=config
             ),
         )
         self._push_notification(
             UiNotification(
-                "Повтор абзацев начат",
-                f"Запуск {run.run_id} повторно обрабатывает выбранные абзацы",
+                "Полный повтор начат",
+                f"Создан новый полный запуск {run.run_id}",
                 "info",
             )
         )
         return run.run_id
-
-    def pause_run(self, run_id: str) -> None:
-        self.application.container.media_run_service.pause_after_current(run_id)
-        self._push_notification(
-            UiNotification(
-                "Запрошена пауза",
-                f"Запуск {run_id} остановится на паузу после текущего абзаца",
-                "warning",
-            )
-        )
-
-    def stop_after_current(self, run_id: str) -> None:
-        self.pause_run(run_id)
 
     def cancel_run(self, run_id: str) -> None:
         self.application.container.media_run_service.cancel(run_id)
         self._push_notification(
             UiNotification(
                 "Запрошена остановка",
-                f"Запуск {run_id} будет отменен после завершения текущего абзаца",
+                f"Для запуска {run_id} запрошена отмена",
                 "warning",
             )
         )
 
-    def lock_asset(self, run_id: str, paragraph_no: int, asset_id: str) -> RunManifest:
-        manifest = self._require_manifest(run_id)
-        entry = self._require_manifest_entry(manifest, paragraph_no)
-        asset = self._find_asset(entry, asset_id)
-        if asset is None:
-            raise KeyError(asset_id)
-        selection = entry.selection or AssetSelection(paragraph_no=paragraph_no)
-        selection.primary_asset = (
-            asset if asset.kind.value == "video" else selection.primary_asset
-        )
-        if asset.kind.value == "image" and asset not in selection.supporting_assets:
-            selection.supporting_assets = [asset] + [
-                item
-                for item in selection.supporting_assets
-                if item.asset_id != asset.asset_id
-            ]
-        selection.user_locked = True
-        selection.user_decision_status = "locked"
-        selection.reason = selection.reason or "Закреплено пользователем"
-        selection.status = "locked"
-        manifest = self.application.lock_paragraph_selection(
-            run_id, paragraph_no, selection
-        )
-        self.notifications.append(
-            UiNotification(
-                "Ассет закреплен",
-                f"Ассет {asset_id} закреплен за абзацем {paragraph_no}",
-                "success",
-            )
-        )
-        return manifest
-
-    def reject_asset(
-        self,
-        run_id: str,
-        paragraph_no: int,
-        asset_id: str,
-        reason: str = "user_rejected",
-    ) -> RunManifest:
-        manifest = self._require_manifest(run_id)
-        entry = self._require_manifest_entry(manifest, paragraph_no)
-        if entry.selection is None:
-            raise KeyError(paragraph_no)
-        selection = entry.selection
-        if (
-            selection.primary_asset is not None
-            and selection.primary_asset.asset_id == asset_id
-        ):
-            selection.primary_asset = None
-        selection.supporting_assets = [
-            asset for asset in selection.supporting_assets if asset.asset_id != asset_id
-        ]
-        selection.fallback_assets = [
-            asset for asset in selection.fallback_assets if asset.asset_id != asset_id
-        ]
-        selection.rejection_reasons.append(reason)
-        entry.rejection_reasons.append(reason)
-        entry.status = (
-            "needs_review" if selection.primary_asset is None else entry.status
-        )
-        self.application.container.media_pipeline.save_manifest(
-            self.application.container.media_pipeline.update_summary(manifest)
-        )
-        self.notifications.append(
-            UiNotification("Ассет отклонен", f"Ассет {asset_id} отклонен", "warning")
-        )
-        return manifest
-
     def session_panel(self) -> UiSessionPanelViewModel:
-        profile = self.application.container.profile_registry.get_active()
-        state = self.application.container.session_manager.current_state(
-            profile.profile_id if profile is not None else None
-        )
+        profile = self.application.container.profile_registry.get_or_create_singleton()
+        state = self.application.container.session_manager.current_state()
         diagnostic_lines = [
             f"{key}: {value}"
             for key, value in sorted(state.diagnostics.items())
             if str(value).strip()
         ]
         return UiSessionPanelViewModel(
-            profile_id=state.profile_id,
-            profile_name=profile.display_name if profile is not None else "",
             health=state.health.value,
             account=state.storyblocks_account or "",
             browser_ready=state.persistent_context_ready,
@@ -990,31 +799,27 @@ class DesktopGuiController:
             manual_prompt=state.manual_intervention.prompt
             if state.manual_intervention is not None
             else "",
-            last_error=state.last_error
-            or (profile.last_import_error if profile is not None else "")
-            or "",
+            last_error=state.last_error or profile.last_import_error or "",
             indicator_tone=self._session_indicator_tone(state.health),
             imported_source=str(profile.import_source_root)
-            if profile is not None and profile.import_source_root is not None
+            if profile.import_source_root is not None
             else "",
-            imported_profile_name=profile.import_source_profile_name
-            if profile is not None
-            else "",
-            imported_at=_iso(profile.imported_at) if profile is not None else "",
+            imported_profile_name=profile.import_source_profile_name,
+            imported_at=_iso(profile.imported_at),
             manual_ready_override=state.manual_ready_override,
             manual_ready_override_note=state.manual_ready_override_note or "",
             reason_code=state.reason_code,
             diagnostic_lines=diagnostic_lines,
         )
 
-    def discover_storyblocks_sessions(
+    def discover_importable_browser_profiles(
         self, browser_name: str | None = None
-    ) -> list[UiImportableSessionOption]:
+    ) -> list[UiImportableBrowserProfileOption]:
         options = self.application.container.profile_import_service.discover_profiles(
             browser_name
         )
         return [
-            UiImportableSessionOption(
+            UiImportableBrowserProfileOption(
                 browser_name=item.browser_name,
                 browser_label=item.browser_label,
                 profile_name=item.profile_label,
@@ -1026,34 +831,10 @@ class DesktopGuiController:
             for item in options
         ]
 
-    def ensure_active_profile(self, display_name: str = "Основной Storyblocks") -> str:
-        profile = self.application.container.profile_registry.get_active()
-        if profile is None:
-            profile = self.application.container.profile_registry.create_profile(
-                display_name,
-                self.application.container.workspace.paths.browser_profiles_dir,
-            )
-            self.application.container.profile_registry.set_active(profile.profile_id)
-        return profile.profile_id
-
-    def open_storyblocks_browser(self) -> UiSessionPanelViewModel:
-        self._ensure_session_actions_available()
-        profile_id = self.ensure_active_profile()
-        self.application.container.session_manager.open_native_login_browser(profile_id)
-        self.notifications.append(
-            UiNotification(
-                "Браузер Storyblocks",
-                "Открыто управляемое окно Storyblocks. Оставьте его открытым во время автоматизации.",
-                "info",
-            )
-        )
-        return self.session_panel()
-
     def check_storyblocks_session(self) -> UiSessionPanelViewModel:
         self._ensure_session_actions_available()
         state = self.application.container.session_manager.check_authorization(
-            self.ensure_active_profile(),
-            persist_handle=False,
+            persist_handle=False
         )
         if state.health == SessionHealth.READY:
             self.notifications.append(
@@ -1083,8 +864,7 @@ class DesktopGuiController:
 
     def mark_storyblocks_session_ready(self) -> UiSessionPanelViewModel:
         self._ensure_session_actions_available()
-        profile_id = self.ensure_active_profile()
-        self.application.container.session_manager.set_manual_ready_override(profile_id)
+        self.application.container.session_manager.set_manual_ready_override()
         self.notifications.append(
             UiNotification(
                 "Сессия Storyblocks",
@@ -1096,10 +876,7 @@ class DesktopGuiController:
 
     def clear_storyblocks_session_override(self) -> UiSessionPanelViewModel:
         self._ensure_session_actions_available()
-        profile_id = self.ensure_active_profile()
-        self.application.container.session_manager.clear_manual_ready_override(
-            profile_id
-        )
+        self.application.container.session_manager.clear_manual_ready_override()
         self.notifications.append(
             UiNotification(
                 "Сессия Storyblocks",
@@ -1111,8 +888,7 @@ class DesktopGuiController:
 
     def prepare_storyblocks_login(self) -> UiSessionPanelViewModel:
         self._ensure_session_actions_available()
-        profile_id = self.ensure_active_profile()
-        self.application.container.session_manager.open_native_login_browser(profile_id)
+        self.application.container.session_manager.open_native_login_browser()
         self.notifications.append(
             UiNotification(
                 "Вход в браузере",
@@ -1124,22 +900,27 @@ class DesktopGuiController:
 
     def logout_storyblocks(self) -> UiSessionPanelViewModel:
         self._ensure_session_actions_available()
-        profile_id = self.ensure_active_profile()
-        self.application.container.session_manager.close_browser(profile_id)
-        self.application.container.session_manager.close_native_browser(profile_id)
+        profile = self.application.container.profile_registry.get_or_create_singleton()
+        self.application.container.session_manager.close_browser()
+        self.application.container.session_manager.close_native_browser()
         self.application.container.profile_registry.update_storyblocks_account(
-            profile_id, None
+            profile.profile_id, None
         )
         self.application.container.session_manager.set_health(
-            profile_id, SessionHealth.LOGIN_REQUIRED
+            SessionHealth.LOGIN_REQUIRED
+        )
+        self.notifications.append(
+            UiNotification(
+                "Сессия Storyblocks",
+                "Сессия завершена. Чтобы работать дальше, снова войдите в браузере и проверьте сессию.",
+                "info",
+            )
         )
         return self.session_panel()
 
     def reset_storyblocks_session(self) -> UiSessionPanelViewModel:
         self._ensure_session_actions_available()
-        self.application.container.session_manager.reset_session_state(
-            self.ensure_active_profile()
-        )
+        self.application.container.session_manager.reset_session_state()
         self.notifications.append(
             UiNotification(
                 "Сессия Storyblocks",
@@ -1149,40 +930,6 @@ class DesktopGuiController:
         )
         return self.session_panel()
 
-    def switch_storyblocks_account(self) -> UiSessionPanelViewModel:
-        self._ensure_session_actions_available()
-        profile = self.application.container.profile_registry.get_active()
-        display_name = (
-            profile.display_name if profile is not None else "Основной Storyblocks"
-        )
-        if profile is not None:
-            self.application.container.session_manager.close_browser(profile.profile_id)
-            self.application.container.session_manager.close_native_browser(
-                profile.profile_id
-            )
-            self.application.container.profile_registry.delete_profile(
-                profile.profile_id
-            )
-        self.ensure_active_profile(display_name)
-        self.application.container.session_manager.open_native_login_browser(
-            self.ensure_active_profile(display_name)
-        )
-        return self.session_panel()
-
-    def clear_storyblocks_profile(self) -> UiSessionPanelViewModel:
-        self._ensure_session_actions_available()
-        profile = self.application.container.profile_registry.get_active()
-        if profile is not None:
-            self.application.container.session_manager.close_browser(profile.profile_id)
-            self.application.container.session_manager.close_native_browser(
-                profile.profile_id
-            )
-            self.application.container.profile_registry.delete_profile(
-                profile.profile_id
-            )
-        self.ensure_active_profile()
-        return self.session_panel()
-
     def import_storyblocks_session_from_path(
         self,
         source_profile_dir: str | Path,
@@ -1190,38 +937,17 @@ class DesktopGuiController:
         browser_name: str | None = None,
     ) -> UiSessionPanelViewModel:
         self._ensure_session_actions_available()
-        profile_id = self.ensure_active_profile()
-        self.application.container.session_manager.close_browser(profile_id)
-        self.application.container.session_manager.close_native_browser(profile_id)
+        self.application.container.session_manager.close_browser()
+        self.application.container.session_manager.close_native_browser()
         source = self.application.container.profile_import_service.resolve_source(
             source_profile_dir, browser_name=browser_name
         )
-        imported = self.application.container.profile_import_service.import_profile(
-            source, profile_id
-        )
-        self.application.container.session_manager.restore_session(imported.profile_id)
+        self.application.container.profile_import_service.import_profile(source)
+        self.application.container.session_manager.restore_session()
         self.notifications.append(
             UiNotification(
                 "Сессия импортирована",
                 f"Профиль {source.profile_label} из {source.browser_label} импортирован в управляемый профиль Storyblocks.",
-                "success",
-            )
-        )
-        return self.session_panel()
-
-    def reimport_storyblocks_session(self) -> UiSessionPanelViewModel:
-        self._ensure_session_actions_available()
-        profile_id = self.ensure_active_profile()
-        self.application.container.session_manager.close_browser(profile_id)
-        self.application.container.session_manager.close_native_browser(profile_id)
-        imported = self.application.container.profile_import_service.reimport_profile(
-            profile_id
-        )
-        self.application.container.session_manager.restore_session(imported.profile_id)
-        self.notifications.append(
-            UiNotification(
-                "Сессия переимпортирована",
-                "Управляемый профиль Storyblocks обновлен из ранее выбранного профиля браузера.",
                 "success",
             )
         )
@@ -1510,7 +1236,7 @@ class DesktopGuiController:
             dict.fromkeys(self._selected_provider_ids(quick))
         )
         settings.providers.free_images_only = mode.mode_id == "free_images_only"
-        return self.application.container.provider_registry.resolve_concurrency_mode(
+        return resolve_execution_concurrency_mode(
             settings.providers,
             video_enabled=mode.video_enabled,
             storyblocks_images_enabled=mode.storyblocks_images_enabled,
@@ -1572,10 +1298,6 @@ class DesktopGuiController:
             and settings.concurrency.download_workers == launch_profile.download_workers
             and settings.concurrency.download_queue_size
             == launch_profile.download_queue_size
-            and settings.concurrency.relevance_workers
-            == launch_profile.relevance_workers
-            and settings.concurrency.relevance_queue_size
-            == launch_profile.relevance_queue_size
             and settings.concurrency.queue_size == launch_profile.queue_size
             and self._float_equal(
                 settings.concurrency.search_timeout_seconds,
@@ -1585,15 +1307,7 @@ class DesktopGuiController:
                 settings.concurrency.download_timeout_seconds,
                 launch_profile.downloads_timeout_seconds,
             )
-            and self._float_equal(
-                settings.concurrency.relevance_timeout_seconds,
-                launch_profile.relevance_timeout_seconds,
-            )
             and settings.concurrency.retry_budget == launch_profile.retry_budget
-            and self._float_equal(
-                settings.concurrency.early_stop_quality_threshold,
-                launch_profile.early_stop_quality_threshold,
-            )
             and settings.concurrency.fail_fast_storyblocks_errors
             == launch_profile.fail_fast_storyblocks_errors
             and self._float_equal(
@@ -1649,23 +1363,13 @@ class DesktopGuiController:
         settings.concurrency.provider_queue_size = resolved_profile.provider_queue_size
         settings.concurrency.download_workers = resolved_profile.download_workers
         settings.concurrency.download_queue_size = resolved_profile.download_queue_size
-        settings.concurrency.relevance_workers = resolved_profile.relevance_workers
-        settings.concurrency.relevance_queue_size = (
-            resolved_profile.relevance_queue_size
-        )
         settings.concurrency.search_timeout_seconds = (
             resolved_profile.search_timeout_seconds
         )
         settings.concurrency.download_timeout_seconds = (
             resolved_profile.downloads_timeout_seconds
         )
-        settings.concurrency.relevance_timeout_seconds = (
-            resolved_profile.relevance_timeout_seconds
-        )
         settings.concurrency.retry_budget = resolved_profile.retry_budget
-        settings.concurrency.early_stop_quality_threshold = (
-            resolved_profile.early_stop_quality_threshold
-        )
         settings.concurrency.fail_fast_storyblocks_errors = (
             resolved_profile.fail_fast_storyblocks_errors
         )
@@ -1724,13 +1428,10 @@ class DesktopGuiController:
             supporting_image_limit=max(0, int(quick.supporting_image_limit)),
             fallback_image_limit=max(0, int(quick.fallback_image_limit)),
             max_candidates_per_provider=max(1, resolved_profile.provider_workers * 2),
-            top_k_to_relevance=max(1, resolved_profile.top_k_to_relevance),
             provider_workers=max(1, resolved_profile.provider_workers),
             provider_queue_size=max(1, resolved_profile.provider_queue_size),
             bounded_downloads=max(1, resolved_profile.download_queue_size),
             download_workers=max(1, resolved_profile.download_workers),
-            bounded_relevance_queue=max(1, resolved_profile.relevance_queue_size),
-            relevance_workers=max(1, resolved_profile.relevance_workers),
             early_stop_when_satisfied=True,
             no_match_budget_seconds=max(
                 0.0, float(resolved_profile.no_match_budget_seconds)
@@ -1741,13 +1442,7 @@ class DesktopGuiController:
             download_timeout_seconds=max(
                 1.0, float(resolved_profile.downloads_timeout_seconds)
             ),
-            relevance_timeout_seconds=max(
-                0.0, float(resolved_profile.relevance_timeout_seconds)
-            ),
             retry_budget=max(0, int(resolved_profile.retry_budget)),
-            early_stop_quality_threshold=float(
-                resolved_profile.early_stop_quality_threshold
-            ),
             fail_fast_storyblocks_errors=bool(
                 resolved_profile.fail_fast_storyblocks_errors
             ),
@@ -1762,34 +1457,6 @@ class DesktopGuiController:
             quick.mode_id,
             free_image_provider_ids=quick.provider_ids,
         )
-
-    def build_event_journal(
-        self,
-        run_id: str,
-        *,
-        limit: int = 150,
-        events: list[AppEvent] | None = None,
-    ) -> list[UiEventJournalItem]:
-        events = (
-            list(events)
-            if events is not None
-            else self.application.container.event_recorder.by_run(run_id)
-        )
-        items: list[UiEventJournalItem] = []
-        for event in reversed(events[-limit:]):
-            items.append(
-                UiEventJournalItem(
-                    created_at=_iso(event.created_at),
-                    severity=event.level.value,
-                    message=event.message,
-                    stage=event.stage.value if event.stage is not None else "",
-                    paragraph_no=event.paragraph_no,
-                    provider_name=event.provider_name or "",
-                    query=event.query or "",
-                    current_asset_id=str(event.payload.get("current_asset_id", "")),
-                )
-            )
-        return items
 
     def build_run_progress(
         self,
@@ -1824,33 +1491,35 @@ class DesktopGuiController:
         total = 0
         processed = len(run.completed_paragraphs) + len(run.failed_paragraphs)
         failed = len(run.failed_paragraphs)
-        matched = 0
+        completed = max(0, len(run.completed_paragraphs))
         no_match = 0
+        downloads_root = ""
+        videos_dir = ""
+        images_dir = ""
+        downloaded_video_files = 0
+        downloaded_image_files = 0
         if manifest is not None:
+            summary = manifest.summary
             total = int(
-                manifest.summary.get(
-                    "paragraphs_total", len(manifest.paragraph_entries)
-                )
+                summary.get("paragraphs_total", len(manifest.paragraph_entries))
             )
             processed = max(
                 processed,
-                int(manifest.summary.get("paragraphs_processed", processed)),
-                int(manifest.summary.get("paragraphs_completed", processed)),
+                int(summary.get("paragraphs_processed", processed)),
             )
-            failed = max(failed, int(manifest.summary.get("paragraphs_failed", failed)))
-            matched = int(manifest.summary.get("paragraphs_matched", 0))
-            no_match = int(manifest.summary.get("paragraphs_no_match", 0))
+            completed = int(summary.get("paragraphs_completed", completed))
+            failed = max(failed, int(summary.get("paragraphs_failed", failed)))
+            no_match = int(summary.get("paragraphs_no_match", 0))
+            downloads_root = str(summary.get("downloads_root", ""))
+            videos_dir = str(summary.get("videos_dir", ""))
+            images_dir = str(summary.get("images_dir", ""))
+            downloaded_video_files = int(summary.get("downloaded_video_files", 0))
+            downloaded_image_files = int(summary.get("downloaded_image_files", 0))
         else:
             stored_total = int(run.metadata.get("paragraphs_total", 0) or 0)
             total = max(total, stored_total)
             if total <= 0 and run.selected_paragraphs:
                 total = len(set(run.selected_paragraphs))
-            if (
-                total <= 0
-                and run.checkpoint is not None
-                and run.checkpoint.selected_paragraphs
-            ):
-                total = len(set(run.checkpoint.selected_paragraphs))
             if (
                 total <= 0
                 and project is not None
@@ -1892,11 +1561,7 @@ class DesktopGuiController:
             current_stage=stage.value,
             current_paragraph_no=latest_event.paragraph_no
             if latest_event is not None
-            else (
-                run.checkpoint.current_paragraph_no
-                if run.checkpoint is not None
-                else None
-            ),
+            else None,
             current_provider_name=latest_event.provider_name or ""
             if latest_event is not None
             else "",
@@ -1904,25 +1569,23 @@ class DesktopGuiController:
             current_asset_id=str(latest_event.payload.get("current_asset_id", ""))
             if latest_event is not None
             else "",
+            paragraphs_total=total,
+            paragraphs_processed=processed,
+            paragraphs_completed=completed,
             project_progress_total=total,
             project_progress_completed=processed,
-            paragraphs_matched=matched,
             paragraphs_no_match=no_match,
             paragraph_progress_total=7,
             paragraph_progress_completed=paragraph_stage_value,
             paragraphs_failed=failed,
+            downloads_root=downloads_root,
+            videos_dir=videos_dir,
+            images_dir=images_dir,
+            downloaded_video_files=downloaded_video_files,
+            downloaded_image_files=downloaded_image_files,
             percent_complete=percent_complete,
             live_state=self._live_state(run, latest_event, status=effective_status),
-            can_pause=effective_status == RunStatus.RUNNING,
-            can_resume=effective_status == RunStatus.PAUSED,
             can_cancel=effective_status == RunStatus.RUNNING,
-            can_retry_failed=bool(run.failed_paragraphs),
-            can_rerun_selected=project is not None
-            or bool(active_project_id or run.project_id),
-            checkpoint_message=self._checkpoint_message(
-                run,
-                status=effective_status,
-            ),
         )
 
     def format_run_log(self, run_id: str) -> str:
@@ -1942,9 +1605,10 @@ class DesktopGuiController:
             lines.extend(
                 [
                     f"Processed: {progress.project_progress_completed}/{progress.project_progress_total}",
-                    f"Matched: {progress.paragraphs_matched}",
+                    f"Completed: {progress.paragraphs_completed}",
                     f"No match: {progress.paragraphs_no_match}",
                     f"Failed: {progress.paragraphs_failed}",
+                    f"Downloads root: {progress.downloads_root or '-'}",
                     f"ETA: {progress.eta_text or '-'}",
                 ]
             )
@@ -1957,19 +1621,27 @@ class DesktopGuiController:
                 lines.append(f"- {key}: {value}")
         lines.append("")
         lines.append("Events:")
-        for item in self.build_event_journal(
-            run_id, limit=max(1, len(events)), events=events
-        ):
+        for event in events:
             context = []
-            if item.paragraph_no is not None:
-                context.append(f"P{item.paragraph_no}")
-            if item.provider_name:
-                context.append(item.provider_name)
-            if item.query:
-                context.append(item.query)
+            if event.paragraph_no is not None:
+                context.append(f"P{event.paragraph_no}")
+            if event.provider_name:
+                context.append(event.provider_name)
+            if event.query:
+                context.append(event.query)
+            current_asset_id = str(event.payload.get("current_asset_id", "")).strip()
+            if current_asset_id:
+                context.append(current_asset_id)
             suffix = f" [{' | '.join(context)}]" if context else ""
             lines.append(
-                f"{item.created_at} | {item.severity} | {item.stage} | {item.message}{suffix}"
+                " | ".join(
+                    [
+                        _iso(event.created_at),
+                        event.level.value,
+                        event.stage.value if event.stage is not None else "",
+                        f"{event.message}{suffix}",
+                    ]
+                )
             )
         return "\n".join(lines)
 
@@ -2034,8 +1706,6 @@ class DesktopGuiController:
         if latest_event is not None:
             status_by_event = {
                 "run.started": RunStatus.RUNNING,
-                "run.resumed": RunStatus.RUNNING,
-                "run.paused": RunStatus.PAUSED,
                 "run.cancelled": RunStatus.CANCELLED,
                 "run.completed": RunStatus.COMPLETED,
                 "run.failed": RunStatus.FAILED,
@@ -2054,12 +1724,10 @@ class DesktopGuiController:
     ) -> str:
         effective_status = status or run.status
         if latest_event is not None:
-            if latest_event.name == "run.pause_requested":
-                return "запрошена пауза"
             if latest_event.name == "run.cancel_requested":
-                return "запрошена остановка"
-            if latest_event.name == "paragraph.awaiting_manual_decision":
-                return "ожидает ручного решения"
+                return "запрошена отмена"
+            if latest_event.name == "paragraph.processing.started":
+                return "обработка абзаца"
             if latest_event.name == "provider.search.started":
                 return "поиск у провайдера"
             if latest_event.name == "asset.download.started":
@@ -2076,10 +1744,6 @@ class DesktopGuiController:
                 return "нет результатов у провайдера"
             if latest_event.name == "paragraph.search_budget.exhausted":
                 return "истек лимит поиска"
-            if latest_event.name == "run.resumed":
-                return "продолжено с контрольной точки"
-        if effective_status == RunStatus.PAUSED:
-            return "на паузе"
         if effective_status == RunStatus.COMPLETED:
             return "завершено"
         if effective_status == RunStatus.FAILED:
@@ -2090,37 +1754,6 @@ class DesktopGuiController:
             return "выполняется"
         return "ожидание"
 
-    def _checkpoint_message(
-        self,
-        run: Run,
-        *,
-        status: RunStatus | None = None,
-    ) -> str:
-        effective_status = status or run.status
-        current_paragraph = (
-            run.checkpoint.current_paragraph_no if run.checkpoint is not None else None
-        )
-        if effective_status == RunStatus.PAUSED:
-            return (
-                f"Пауза после абзаца {current_paragraph}"
-                if current_paragraph is not None
-                else "Пауза на контрольной точке"
-            )
-        if effective_status == RunStatus.RUNNING:
-            return "Пауза и остановка применяются после завершения текущего абзаца"
-        if effective_status == RunStatus.FAILED:
-            return (
-                f"Абзацы с ошибкой: {', '.join(str(item) for item in run.failed_paragraphs)}"
-                if run.failed_paragraphs
-                else (
-                    translate_error_text(run.last_error or "")
-                    or "Запуск завершился с ошибкой"
-                )
-            )
-        if effective_status == RunStatus.CANCELLED:
-            return "Запуск остановлен до обработки всех абзацев"
-        return ""
-
     def _push_notification(self, notification: UiNotification) -> None:
         self.notifications.append(notification)
         if len(self.notifications) > 30:
@@ -2130,7 +1763,6 @@ class DesktopGuiController:
         self,
         run_id: str,
         project_id: str,
-        mode: str,
         work: Callable[[], tuple[Run, RunManifest]],
     ) -> None:
         with self._background_lock:
@@ -2145,7 +1777,6 @@ class DesktopGuiController:
 
             task = _BackgroundRunTask(
                 run_id=run_id,
-                mode=mode,
                 project_id=project_id,
                 thread=threading.Thread(
                     target=lambda: self._run_background_task(work),
@@ -2388,55 +2019,6 @@ class DesktopGuiController:
             paragraph_no for paragraph_no in available if paragraph_no in selected_set
         ]
 
-    def _selected_assets(
-        self, selection: AssetSelection | None
-    ) -> list[UiAssetPreview]:
-        if selection is None:
-            return []
-        assets: list[UiAssetPreview] = []
-        if selection.primary_asset is not None:
-            assets.append(
-                self._asset_preview(
-                    selection.primary_asset,
-                    role="primary",
-                    locked=selection.user_locked,
-                )
-            )
-        assets.extend(
-            self._asset_preview(asset, role="supporting", locked=selection.user_locked)
-            for asset in selection.supporting_assets
-        )
-        assets.extend(
-            self._asset_preview(asset, role="fallback", locked=selection.user_locked)
-            for asset in selection.fallback_assets
-        )
-        return assets
-
-    def _candidate_assets(self, entry) -> list[UiAssetPreview]:
-        if entry is None or entry.selection is None:
-            return []
-        seen: set[str] = set()
-        previews: list[UiAssetPreview] = []
-        for result in entry.selection.provider_results:
-            for asset in result.candidates:
-                if asset.asset_id in seen:
-                    continue
-                seen.add(asset.asset_id)
-                previews.append(self._asset_preview(asset))
-        return previews
-
-    def _live_asset_previews(
-        self, snapshots: list[LiveAssetSnapshot]
-    ) -> list[UiAssetPreview]:
-        return [
-            self._asset_preview(
-                snapshot.asset,
-                role=snapshot.role,
-                locked=snapshot.locked,
-            )
-            for snapshot in snapshots
-        ]
-
     def _uses_storyblocks_provider(self, provider_ids: list[str]) -> bool:
         return any(
             provider_id in {"storyblocks_video", "storyblocks_image"}
@@ -2450,19 +2032,115 @@ class DesktopGuiController:
     ):
         return self._concurrency_mode_for_quick(quick)
 
-    def _asset_preview(
-        self, asset: AssetCandidate, *, role: str = "candidate", locked: bool = False
-    ) -> UiAssetPreview:
-        return UiAssetPreview(
+    def _downloaded_files(
+        self, selection: AssetSelection | None
+    ) -> list[UiDownloadedFileItem]:
+        if selection is None:
+            return []
+        items: list[UiDownloadedFileItem] = []
+        for role, asset in self._selection_downloaded_assets(selection):
+            items.append(self._downloaded_file_item(asset, role=role))
+        return items
+
+    def _live_downloaded_files(
+        self, snapshots: list[LiveDownloadedFileSnapshot]
+    ) -> list[UiDownloadedFileItem]:
+        return [
+            UiDownloadedFileItem(
+                asset_id=snapshot.asset_id,
+                provider_name=snapshot.provider_name,
+                kind=snapshot.kind.value,
+                role=snapshot.role,
+                title=snapshot.title or snapshot.asset_id,
+                local_path=str(snapshot.local_path or ""),
+                exists=snapshot.exists,
+            )
+            for snapshot in snapshots
+        ]
+
+    def _selection_downloaded_assets(
+        self, selection: AssetSelection
+    ) -> list[tuple[str, AssetCandidate]]:
+        assets: list[tuple[str, AssetCandidate]] = []
+        for role, asset in self._selection_assets_with_roles(selection):
+            if asset.local_path is None:
+                continue
+            assets.append((role, asset))
+        return assets
+
+    def _selection_assets_with_roles(
+        self, selection: AssetSelection
+    ) -> list[tuple[str, AssetCandidate]]:
+        assets: list[tuple[str, AssetCandidate]] = []
+        for role, asset in (
+            ("primary", selection.primary_asset),
+            *[("supporting", asset) for asset in selection.supporting_assets],
+            *[("fallback", asset) for asset in selection.fallback_assets],
+        ):
+            if asset is None:
+                continue
+            assets.append((role, asset))
+        return assets
+
+    def _has_downloaded_files(self, selection: AssetSelection | None) -> bool:
+        if selection is None:
+            return False
+        return any(
+            asset.local_path is not None
+            for _role, asset in self._selection_assets_with_roles(selection)
+        )
+
+    def _downloaded_file_item(
+        self, asset: AssetCandidate, *, role: str
+    ) -> UiDownloadedFileItem:
+        local_path = str(asset.local_path or "")
+        return UiDownloadedFileItem(
             asset_id=asset.asset_id,
             provider_name=asset.provider_name,
             kind=asset.kind.value,
-            title=str(asset.metadata.get("title", asset.asset_id)),
-            license_name=asset.license_name,
-            source_url=asset.source_url,
             role=role,
-            locked=locked,
+            title=str(asset.metadata.get("title", asset.asset_id)),
+            local_path=local_path,
+            exists=self._path_exists(asset.local_path),
         )
+
+    def _path_exists(self, path: Path | None) -> bool:
+        if path is None:
+            return False
+        try:
+            return path.exists()
+        except OSError:
+            return False
+
+    def _normalize_paragraph_status(
+        self,
+        status: str | None,
+        *,
+        has_downloaded_files: bool,
+    ) -> str:
+        value = (status or "pending").strip().casefold()
+        mapping = {
+            "selected": "completed",
+            "locked": "completed",
+            "partial_success": "completed",
+            "pending": "pending",
+            "processing": "processing",
+            "completed": "completed",
+            "no_match": "no_match",
+            "failed": "failed",
+            "skipped": "skipped",
+        }
+        if value == "needs_review":
+            return "completed" if has_downloaded_files else "failed"
+        return mapping.get(value, "pending")
+
+    def _entry_result_note(self, entry) -> str:
+        if entry.selection is not None and entry.selection.reason.strip():
+            return entry.selection.reason.strip()
+        for reason in entry.rejection_reasons:
+            if str(reason).strip():
+                return str(reason).strip()
+        return ""
 
     def _intent_summary(self, intent: ParagraphIntent | None) -> str:
         if intent is None:
@@ -2539,34 +2217,6 @@ class DesktopGuiController:
             if paragraph.paragraph_no == paragraph_no:
                 return paragraph
         raise KeyError(paragraph_no)
-
-    def _require_manifest(self, run_id: str) -> RunManifest:
-        manifest = self.application.container.media_run_service.load_manifest(run_id)
-        if manifest is None:
-            raise KeyError(run_id)
-        return manifest
-
-    def _require_manifest_entry(self, manifest: RunManifest, paragraph_no: int):
-        for entry in manifest.paragraph_entries:
-            if entry.paragraph_no == paragraph_no:
-                return entry
-        raise KeyError(paragraph_no)
-
-    def _find_asset(self, entry, asset_id: str) -> AssetCandidate | None:
-        if entry.selection is not None:
-            assets = [
-                entry.selection.primary_asset,
-                *entry.selection.supporting_assets,
-                *entry.selection.fallback_assets,
-            ]
-            for asset in assets:
-                if asset is not None and asset.asset_id == asset_id:
-                    return asset
-            for result in entry.selection.provider_results:
-                for asset in result.candidates:
-                    if asset.asset_id == asset_id:
-                        return asset
-        return None
 
 
 def handle_ui_error(exc: Exception) -> UiNotification:

@@ -68,7 +68,7 @@ class ApplicationContainer:
     def close(self) -> None:
         self.media_pipeline.close()
         self.image_provider_search_service.close()
-        self.session_manager.close_browsers_owned_by_current_thread()
+        self.session_manager.shutdown()
 
 
 def bootstrap_application(

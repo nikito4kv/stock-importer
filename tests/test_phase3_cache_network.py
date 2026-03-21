@@ -31,11 +31,7 @@ from providers import (
     build_default_provider_registry,
 )
 from providers.base import ProviderDescriptor
-from providers.images.caching import MetadataCache, SearchResultCache
-from providers.images.filtering import (
-    METADATA_CACHE_KEY_VERSION,
-    build_metadata_cache_key,
-)
+from providers.images.caching import SearchResultCache
 from providers.images.service import ImageSearchDiagnostics
 from services.errors import ProviderSearchError
 from services.retry import (
@@ -55,7 +51,14 @@ class FakeProvider:
         self.descriptor = descriptor
         self._candidates = list(candidates)
 
-    def search(self, query: str, limit: int) -> list[SearchCandidate]:
+    def search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[SearchCandidate]:
+        del timeout_seconds
         return [
             SearchCandidate(
                 source=item.source,
@@ -96,7 +99,9 @@ class FakeHttpClient:
 
 
 class FlakyFreeImageSearchService:
-    def __init__(self, provider_id: str, *, retryable: bool, succeed_on_attempt: int | None):
+    def __init__(
+        self, provider_id: str, *, retryable: bool, succeed_on_attempt: int | None
+    ):
         self.provider_id = provider_id
         self.retryable = retryable
         self.succeed_on_attempt = succeed_on_attempt
@@ -113,7 +118,10 @@ class FlakyFreeImageSearchService:
     ):
         del paragraph_text, max_candidates_per_keyword, license_policy
         self.calls += 1
-        if self.succeed_on_attempt is not None and self.calls >= self.succeed_on_attempt:
+        if (
+            self.succeed_on_attempt is not None
+            and self.calls >= self.succeed_on_attempt
+        ):
             return (
                 [
                     SearchCandidate(
@@ -177,7 +185,9 @@ class Phase3CacheNetworkTests(unittest.TestCase):
             script_document=ScriptDocument(
                 source_path=Path(temp_dir) / "story.docx",
                 header_text="HEADER",
-                paragraphs=[self._paragraph(1, "A river boat drifting through the jungle.")],
+                paragraphs=[
+                    self._paragraph(1, "A river boat drifting through the jungle.")
+                ],
             ),
         )
         return container, container.project_repository.save(project)
@@ -198,73 +208,9 @@ class Phase3CacheNetworkTests(unittest.TestCase):
         asset.local_path = local_path
         return asset
 
-    def test_metadata_cache_key_changes_for_keyword_and_version(self) -> None:
-        key_a = build_metadata_cache_key(
-            provider_id="openverse",
-            candidate_url="https://example.com/asset.jpg",
-            keyword="River Boat",
-            query_used="river boat photo",
-        )
-        key_b = build_metadata_cache_key(
-            provider_id="openverse",
-            candidate_url="https://example.com/asset.jpg",
-            keyword="  river   boat  ",
-            query_used="river  boat photo",
-        )
-        key_c = build_metadata_cache_key(
-            provider_id="openverse",
-            candidate_url="https://example.com/asset.jpg",
-            keyword="Company Logo",
-            query_used="company logo",
-        )
-        key_d = build_metadata_cache_key(
-            provider_id="openverse",
-            candidate_url="https://example.com/asset.jpg",
-            keyword="River Boat",
-            query_used="river boat photo",
-            cache_key_version=METADATA_CACHE_KEY_VERSION + 1,
-        )
-
-        self.assertEqual(key_a, key_b)
-        self.assertNotEqual(key_a, key_c)
-        self.assertNotEqual(key_a, key_d)
-
-    def test_metadata_cache_version_bump_cold_misses_legacy_entries(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cache = MetadataCache(Path(temp_dir) / "metadata.sqlite")
-            payload = {"reject": False, "reason": "accepted", "score": 0.8}
-            old_key = build_metadata_cache_key(
-                provider_id="openverse",
-                candidate_url="https://example.com/asset.jpg",
-                keyword="river boat",
-                query_used="river boat photo",
-                cache_key_version=METADATA_CACHE_KEY_VERSION - 1,
-            )
-            new_key = build_metadata_cache_key(
-                provider_id="openverse",
-                candidate_url="https://example.com/asset.jpg",
-                keyword="river boat",
-                query_used="river boat photo",
-            )
-
-            cache.set(old_key, payload)
-            cache.set(new_key, payload)
-
-            self.assertEqual(cache.get(new_key), payload)
-            self.assertIsNone(
-                cache.get(
-                    build_metadata_cache_key(
-                        provider_id="openverse",
-                        candidate_url="https://example.com/asset.jpg",
-                        keyword="river boat",
-                        query_used="river boat photo",
-                        cache_key_version=METADATA_CACHE_KEY_VERSION + 1,
-                    )
-                )
-            )
-            cache.close()
-
-    def test_metadata_cache_regression_same_url_different_keyword(self) -> None:
+    def test_search_service_reuses_same_candidate_without_quality_rejection(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = ImageProviderSearchService(
                 build_default_provider_registry(),
@@ -302,7 +248,7 @@ class Phase3CacheNetworkTests(unittest.TestCase):
                     allow_attribution_licenses=False,
                 ),
             )
-            rejected, rejected_errors, diagnostics = service.search_keyword(
+            repeated, repeated_errors, diagnostics = service.search_keyword(
                 "river boat",
                 "A river boat drifting through mist",
                 [provider],
@@ -315,64 +261,93 @@ class Phase3CacheNetworkTests(unittest.TestCase):
             service.close()
 
             self.assertEqual(errors, [])
-            self.assertEqual(rejected_errors, [])
+            self.assertEqual(repeated_errors, [])
             self.assertEqual(len(accepted), 1)
-            self.assertEqual(rejected, [])
-            self.assertTrue(
-                any(
-                    reason.startswith("openverse:low_quality_prefilter")
-                    for reason in diagnostics.rejected_prefilters
-                )
+            self.assertEqual(len(repeated), 1)
+            self.assertEqual(accepted[0].url, repeated[0].url)
+            self.assertEqual(diagnostics.rejected_prefilters, [])
+            self.assertFalse(
+                (Path(temp_dir) / "provider_cache" / "metadata.sqlite").exists()
             )
 
-    def test_metadata_cache_ttl_and_purge_expired(self) -> None:
+    def test_search_cache_ttl_and_purge_expired(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             clock = {"now": 1_000.0}
-            cache = MetadataCache(
-                Path(temp_dir) / "metadata.sqlite",
+            cache = SearchResultCache(
+                Path(temp_dir) / "search.sqlite",
                 ttl_seconds=10,
                 time_fn=lambda: clock["now"],
                 cleanup_every_operations=100,
             )
-            cache.set("fresh", {"score": 1.0})
-            self.assertEqual(cache.get("fresh"), {"score": 1.0})
+            fresh = SearchCandidate(
+                source="openverse",
+                url="https://example.com/fresh.jpg",
+                referrer_url="https://example.com/item",
+                query_used="river boat",
+                license_name="CC0",
+                license_url=None,
+                author="Author",
+                commercial_allowed=True,
+                attribution_required=False,
+            )
+            keep = SearchCandidate(
+                source="openverse",
+                url="https://example.com/keep.jpg",
+                referrer_url="https://example.com/item",
+                query_used="river keep",
+                license_name="CC0",
+                license_url=None,
+                author="Author",
+                commercial_allowed=True,
+                attribution_required=False,
+            )
+            stale_payload = json.dumps(
+                [
+                    {
+                        "source": "openverse",
+                        "url": "https://example.com/stale.jpg",
+                        "referrer_url": "https://example.com/item",
+                        "query_used": "stale",
+                        "license_name": "CC0",
+                        "license_url": None,
+                        "author": "Author",
+                        "commercial_allowed": True,
+                        "attribution_required": False,
+                        "rank_hint": 0.0,
+                    }
+                ],
+                ensure_ascii=False,
+            )
+            cache.set("openverse", "river boat", 8, [fresh])
+            self.assertIsNotNone(cache.get("openverse", "river boat", 8))
 
             clock["now"] += 11.0
-            self.assertIsNone(cache.get("fresh"))
+            self.assertIsNone(cache.get("openverse", "river boat", 8))
 
-            cache.set("keep", {"score": 2.0})
+            cache.set("openverse", "river keep", 8, [keep])
             with cache._lock:
                 cache._conn.execute(
-                    "INSERT OR REPLACE INTO metadata_cache(cache_key, payload, created_at) VALUES (?, ?, ?)",
-                    ("stale", json.dumps({"score": 3.0}), 0.0),
+                    """
+                    INSERT OR REPLACE INTO search_cache(
+                        provider_id,
+                        query,
+                        limit_value,
+                        payload,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    ("openverse", "stale", 8, stale_payload, 0.0),
                 )
                 cache._conn.commit()
 
             purged = cache.purge_expired()
             self.assertEqual(purged, 1)
-            self.assertEqual(cache.get("keep"), {"score": 2.0})
+            self.assertIsNotNone(cache.get("openverse", "river keep", 8))
             cache.close()
 
-    def test_metadata_cache_migrates_legacy_rows_without_created_at_as_expired(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "metadata.sqlite"
-            connection = sqlite3.connect(path)
-            connection.execute(
-                "CREATE TABLE metadata_cache (cache_key TEXT PRIMARY KEY, payload TEXT NOT NULL)"
-            )
-            connection.execute(
-                "INSERT INTO metadata_cache(cache_key, payload) VALUES (?, ?)",
-                ("legacy", json.dumps({"score": 0.5})),
-            )
-            connection.commit()
-            connection.close()
-
-            cache = MetadataCache(path, ttl_seconds=60, time_fn=lambda: 1_000.0)
-            self.assertIsNone(cache.get("legacy"))
-            self.assertEqual(cache.purge_expired(), 0)
-            cache.close()
-
-    def test_search_cache_uses_persistent_connection_and_close_is_idempotent(self) -> None:
+    def test_search_cache_uses_persistent_connection_and_close_is_idempotent(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             original_connect = sqlite3.connect
             connect_calls = {"count": 0}
@@ -381,7 +356,9 @@ class Phase3CacheNetworkTests(unittest.TestCase):
                 connect_calls["count"] += 1
                 return original_connect(*args, **kwargs)
 
-            with patch("providers.images.caching.sqlite3.connect", side_effect=counting_connect):
+            with patch(
+                "providers.images.caching.sqlite3.connect", side_effect=counting_connect
+            ):
                 cache = SearchResultCache(Path(temp_dir) / "search.sqlite")
                 candidate = SearchCandidate(
                     source="openverse",
@@ -403,27 +380,44 @@ class Phase3CacheNetworkTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     cache.get("openverse", "river boat", 8)
 
-    def test_metadata_cache_enables_wal_and_survives_concurrent_access(self) -> None:
+    def test_search_cache_enables_wal_and_survives_concurrent_access(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "metadata.sqlite"
-            cache_a = MetadataCache(path, ttl_seconds=300)
-            cache_b = MetadataCache(path, ttl_seconds=300)
+            path = Path(temp_dir) / "search.sqlite"
+            cache_a = SearchResultCache(path, ttl_seconds=300)
+            cache_b = SearchResultCache(path, ttl_seconds=300)
             errors: list[Exception] = []
             barrier = threading.Barrier(4)
 
-            def writer(prefix: str, cache: MetadataCache) -> None:
+            def writer(prefix: str, cache: SearchResultCache) -> None:
                 try:
                     barrier.wait(timeout=2.0)
                     for index in range(50):
-                        cache.set(f"{prefix}-{index}", {"value": index})
+                        cache.set(
+                            "openverse",
+                            f"{prefix}-{index}",
+                            8,
+                            [
+                                SearchCandidate(
+                                    source="openverse",
+                                    url=f"https://example.com/{prefix}-{index}.jpg",
+                                    referrer_url="https://example.com/item",
+                                    query_used=f"{prefix}-{index}",
+                                    license_name="CC0",
+                                    license_url=None,
+                                    author="Author",
+                                    commercial_allowed=True,
+                                    attribution_required=False,
+                                )
+                            ],
+                        )
                 except Exception as exc:  # pragma: no cover - asserted via list
                     errors.append(exc)
 
-            def reader(prefix: str, cache: MetadataCache) -> None:
+            def reader(prefix: str, cache: SearchResultCache) -> None:
                 try:
                     barrier.wait(timeout=2.0)
                     for index in range(50):
-                        cache.get(f"{prefix}-{index}")
+                        cache.get("openverse", f"{prefix}-{index}", 8)
                 except Exception as exc:  # pragma: no cover - asserted via list
                     errors.append(exc)
 
@@ -440,12 +434,20 @@ class Phase3CacheNetworkTests(unittest.TestCase):
 
             self.assertEqual(cache_a.pragma_state.get("journal_mode"), "wal")
             self.assertEqual(errors, [])
-            self.assertEqual(cache_a.get("a-49"), {"value": 49})
-            self.assertEqual(cache_b.get("b-49"), {"value": 49})
+            cached_a = cache_a.get("openverse", "a-49", 8)
+            cached_b = cache_b.get("openverse", "b-49", 8)
+            self.assertIsNotNone(cached_a)
+            self.assertIsNotNone(cached_b)
+            assert cached_a is not None
+            assert cached_b is not None
+            self.assertEqual(cached_a[0].url, "https://example.com/a-49.jpg")
+            self.assertEqual(cached_b[0].url, "https://example.com/b-49.jpg")
             cache_a.close()
             cache_b.close()
 
-    def test_legacy_free_image_providers_propagate_retryable_search_errors(self) -> None:
+    def test_legacy_free_image_providers_propagate_retryable_search_errors(
+        self,
+    ) -> None:
         provider_factories = [
             lambda client: PexelsProvider("key", 5.0, "UA", http_client=client),
             lambda client: PixabayProvider("key", 5.0, "UA", http_client=client),
@@ -466,12 +468,16 @@ class Phase3CacheNetworkTests(unittest.TestCase):
                 provider.search("river boat", 5)
             self.assertTrue(ctx.exception.retryable)
 
-    def test_free_image_backend_retryable_failure_retries_at_pipeline_level(self) -> None:
+    def test_free_image_backend_retryable_failure_retries_at_pipeline_level(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container, project = self._create_project(temp_dir)
             descriptor = container.provider_registry.get("openverse")
             assert descriptor is not None
-            container.media_pipeline._provider_settings.enabled_providers = ["openverse"]
+            container.media_pipeline._provider_settings.enabled_providers = [
+                "openverse"
+            ]
             flaky_service = FlakyFreeImageSearchService(
                 "openverse",
                 retryable=True,
@@ -523,15 +529,21 @@ class Phase3CacheNetworkTests(unittest.TestCase):
             self.assertEqual(retry_events[0].payload["final_status"], "retrying")
             entry = manifest.paragraph_entries[0]
             assert entry.selection is not None
-            self.assertEqual(entry.selection.fallback_assets[0].provider_name, "openverse")
+            self.assertEqual(
+                entry.selection.fallback_assets[0].provider_name, "openverse"
+            )
             container.close()
 
-    def test_free_image_backend_non_retryable_failure_stays_single_attempt(self) -> None:
+    def test_free_image_backend_non_retryable_failure_stays_single_attempt(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             container, project = self._create_project(temp_dir)
             descriptor = container.provider_registry.get("openverse")
             assert descriptor is not None
-            container.media_pipeline._provider_settings.enabled_providers = ["openverse"]
+            container.media_pipeline._provider_settings.enabled_providers = [
+                "openverse"
+            ]
             flaky_service = FlakyFreeImageSearchService(
                 "openverse",
                 retryable=False,
@@ -585,7 +597,9 @@ class Phase3CacheNetworkTests(unittest.TestCase):
             self.assertEqual(retry_events, [])
             self.assertTrue(warning_events)
             self.assertEqual(warning_events[-1].payload["attempt_count"], 1)
-            self.assertEqual(warning_events[-1].payload["error_code"], "provider_http_401")
+            self.assertEqual(
+                warning_events[-1].payload["error_code"], "provider_http_401"
+            )
             self.assertEqual(manifest.paragraph_entries[0].status, "no_match")
             container.close()
 
@@ -594,13 +608,16 @@ class Phase3CacheNetworkTests(unittest.TestCase):
             container = bootstrap_application(temp_dir)
             backend = container.media_pipeline._image_backends.get("openverse")
             _ = container.image_provider_search_service._search_cache
-            _ = container.image_provider_search_service._metadata_cache
 
             container.close()
             container.close()
 
-            self.assertTrue(container.image_provider_search_service._search_cache.closed)
-            self.assertTrue(container.image_provider_search_service._metadata_cache.closed)
+            self.assertTrue(
+                container.image_provider_search_service._search_cache.closed
+            )
+            self.assertFalse(
+                (Path(temp_dir) / "provider_cache" / "metadata.sqlite").exists()
+            )
             self.assertIsInstance(backend, FreeImageCandidateSearchBackend)
             assert isinstance(backend, FreeImageCandidateSearchBackend)
             self.assertTrue(backend.http_client.closed)
@@ -615,9 +632,10 @@ class Phase3CacheNetworkTests(unittest.TestCase):
         with patch("services.retry.random.uniform", return_value=0.02):
             self.assertAlmostEqual(compute_retry_delay_seconds(profile, 1), 0.12)
             self.assertAlmostEqual(compute_retry_delay_seconds(profile, 2), 0.22)
-        with patch("services.retry.random.uniform", return_value=0.02), patch(
-            "services.retry.time.sleep"
-        ) as sleep_mock:
+        with (
+            patch("services.retry.random.uniform", return_value=0.02),
+            patch("services.retry.time.sleep") as sleep_mock,
+        ):
             delay = sleep_for_retry_attempt(profile, 1)
         self.assertAlmostEqual(delay, 0.12)
         sleep_mock.assert_called_once_with(0.12)

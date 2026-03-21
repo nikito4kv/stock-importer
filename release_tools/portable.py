@@ -8,11 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
-INCLUDED_DIRS = (
+INCLUDED_RUNTIME_DIRS = (
     "app",
     "browser",
     "config",
-    "docs",
     "domain",
     "legacy_core",
     "pipeline",
@@ -22,11 +21,24 @@ INCLUDED_DIRS = (
     "ui",
 )
 
-INCLUDED_FILES = (
-    "requirements.txt",
-    ".env.example",
-    "implementation_plan.md",
+INCLUDED_ROOT_FILES = ("requirements.txt",)
+
+INCLUDED_DOCUMENT_FILES = (Path("docs") / "phase-10" / "onboarding.md",)
+
+GENERATED_ROOT_FILES = (
+    "launch_gui.bat",
+    "launch_smoke.bat",
+    "setup_portable.bat",
+    "setup_portable.ps1",
+    "PORTABLE-README.txt",
+    "portable_manifest.json",
 )
+
+WORKSPACE_DIR = "workspace"
+
+# Backward-compatible aliases for older tests/tools.
+INCLUDED_DIRS = INCLUDED_RUNTIME_DIRS
+INCLUDED_FILES = INCLUDED_ROOT_FILES
 
 SKIP_DIR_NAMES = {
     ".git",
@@ -72,18 +84,16 @@ def build_portable_bundle(
         shutil.rmtree(bundle_dir)
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
-    for directory_name in INCLUDED_DIRS:
-        source = root / directory_name
-        if not source.exists():
-            continue
-        shutil.copytree(source, bundle_dir / directory_name, ignore=_ignore_names)
+    for directory_name in INCLUDED_RUNTIME_DIRS:
+        _copy_required_directory(root, bundle_dir, directory_name)
 
-    for file_name in INCLUDED_FILES:
-        source = root / file_name
-        if source.exists():
-            shutil.copy2(source, bundle_dir / file_name)
+    for file_name in INCLUDED_ROOT_FILES:
+        _copy_required_file(root, bundle_dir, Path(file_name))
 
-    (bundle_dir / "workspace").mkdir(parents=True, exist_ok=True)
+    for relative_path in INCLUDED_DOCUMENT_FILES:
+        _copy_required_file(root, bundle_dir, relative_path)
+
+    (bundle_dir / WORKSPACE_DIR).mkdir(parents=True, exist_ok=True)
     _write_launchers(bundle_dir)
     manifest_path = _write_manifest(bundle_dir, build_version)
 
@@ -117,6 +127,26 @@ def _ignore_names(directory: str, names: list[str]) -> set[str]:
     return ignored
 
 
+def _copy_required_directory(root: Path, bundle_dir: Path, directory_name: str) -> None:
+    source = root / directory_name
+    if not source.is_dir():
+        raise FileNotFoundError(
+            f"Required portable directory is missing: {directory_name}"
+        )
+    shutil.copytree(source, bundle_dir / directory_name, ignore=_ignore_names)
+
+
+def _copy_required_file(root: Path, bundle_dir: Path, relative_path: Path) -> None:
+    source = root / relative_path
+    if not source.is_file():
+        raise FileNotFoundError(
+            f"Required portable file is missing: {relative_path.as_posix()}"
+        )
+    destination = bundle_dir / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+
+
 def _write_launchers(bundle_dir: Path) -> None:
     launch_gui = r"""@echo off
 setlocal
@@ -141,7 +171,7 @@ if not exist "%ROOT%.venv\Scripts\python.exe" (
 "%ROOT%.venv\Scripts\python.exe" -m pip install --upgrade pip
 "%ROOT%.venv\Scripts\python.exe" -m pip install -r "%ROOT%requirements.txt"
 echo Portable environment is ready.
-echo Run launch_gui.bat to start the desktop app.
+echo Run launch_smoke.bat to verify the bundle, then launch_gui.bat.
 """
     setup_ps1 = r"""$ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -152,20 +182,27 @@ if (-not (Test-Path $venvPython)) {
 & $venvPython -m pip install --upgrade pip
 & $venvPython -m pip install -r (Join-Path $root 'requirements.txt')
 Write-Host 'Portable environment is ready.'
-Write-Host 'Run launch_gui.bat to start the desktop app.'
+Write-Host 'Run launch_smoke.bat to verify the bundle, then launch_gui.bat.'
 """
     readme = """Vid Img Downloader Portable Bundle
 
 1. Run setup_portable.ps1 or setup_portable.bat.
-2. Make sure Chrome or Edge is installed on the machine.
-3. Run launch_gui.bat.
-4. The app stores runtime data in the local workspace folder next to this file.
+2. Make sure Python and Chrome or Edge are installed on the machine.
+3. Run launch_smoke.bat to verify the portable install on this machine.
+4. Run launch_gui.bat to start the app.
+5. The app stores runtime data in the local workspace folder next to this file.
 
-Full user docs live in docs/phase-10/.
+See docs/phase-10/onboarding.md for the full portable setup flow.
 """
-    (bundle_dir / "launch_gui.bat").write_text(launch_gui, encoding="utf-8", newline="\r\n")
-    (bundle_dir / "launch_smoke.bat").write_text(launch_smoke, encoding="utf-8", newline="\r\n")
-    (bundle_dir / "setup_portable.bat").write_text(setup_bat, encoding="utf-8", newline="\r\n")
+    (bundle_dir / "launch_gui.bat").write_text(
+        launch_gui, encoding="utf-8", newline="\r\n"
+    )
+    (bundle_dir / "launch_smoke.bat").write_text(
+        launch_smoke, encoding="utf-8", newline="\r\n"
+    )
+    (bundle_dir / "setup_portable.bat").write_text(
+        setup_bat, encoding="utf-8", newline="\r\n"
+    )
     (bundle_dir / "setup_portable.ps1").write_text(setup_ps1, encoding="utf-8")
     (bundle_dir / "PORTABLE-README.txt").write_text(readme, encoding="utf-8")
 
@@ -181,12 +218,17 @@ def _write_manifest(bundle_dir: Path, version: str) -> Path:
             "setup_bat": "setup_portable.bat",
             "setup_ps1": "setup_portable.ps1",
         },
-        "included_directories": list(INCLUDED_DIRS),
-        "included_files": list(INCLUDED_FILES),
-        "workspace_dir": "workspace",
+        "included_runtime_directories": list(INCLUDED_RUNTIME_DIRS),
+        "included_root_files": list(INCLUDED_ROOT_FILES + GENERATED_ROOT_FILES),
+        "included_document_files": [
+            path.as_posix() for path in INCLUDED_DOCUMENT_FILES
+        ],
+        "workspace_dir": WORKSPACE_DIR,
     }
     manifest_path = bundle_dir / "portable_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     return manifest_path
 
 
@@ -196,11 +238,13 @@ def _zip_bundle(bundle_dir: Path, archive_path: Path) -> None:
         for path in sorted(bundle_dir.rglob("*")):
             if path.is_dir():
                 continue
-            archive.write(path, arcname=f"{bundle_dir.name}/{path.relative_to(bundle_dir)}")
+            archive.write(
+                path, arcname=f"{bundle_dir.name}/{path.relative_to(bundle_dir)}"
+            )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a portable release bundle")
+    parser = argparse.ArgumentParser(description="Build a portable bundle")
     parser.add_argument("--project-root", default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output-dir", default=Path("dist") / "portable")
     parser.add_argument("--version", default=None)

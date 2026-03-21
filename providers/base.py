@@ -15,8 +15,6 @@ class ProviderDescriptor:
     provider_id: str
     display_name: str
     capability: ProviderCapability
-    provider_group: str = "general"
-    priority: int = 100
     requires_auth: bool = False
     enabled_by_default: bool = True
     opt_in: bool = False

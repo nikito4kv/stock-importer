@@ -16,10 +16,7 @@ class ProviderCapability(str, Enum):
 
 
 class RunStatus(str, Enum):
-    DRAFT = "draft"
-    READY = "ready"
     RUNNING = "running"
-    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"

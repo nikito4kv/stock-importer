@@ -87,7 +87,6 @@ class JsonLineEventLogger:
         "run.completed",
         "run.failed",
         "run.cancelled",
-        "run.paused",
     }
 
     def __init__(
@@ -107,8 +106,8 @@ class JsonLineEventLogger:
 
     def write(self, event: AppEvent) -> None:
         line = json.dumps(event.to_dict(), ensure_ascii=False)
-        force_flush = (
-            event.name in self._TERMINAL_EVENTS or event.name.endswith(".perf")
+        force_flush = event.name in self._TERMINAL_EVENTS or event.name.endswith(
+            ".perf"
         )
         self._writer.append_line(line, force_flush=force_flush)
 
@@ -124,7 +123,6 @@ class JsonLinePerfLogger:
         "run.completed",
         "run.failed",
         "run.cancelled",
-        "run.paused",
     }
 
     def __init__(
@@ -145,8 +143,8 @@ class JsonLinePerfLogger:
     def write(self, event: AppEvent) -> None:
         metrics = self._extract_metrics(event.payload)
         should_write = bool(metrics) or event.name.endswith(".perf")
-        force_flush = (
-            event.name in self._TERMINAL_EVENTS or event.name.endswith(".perf")
+        force_flush = event.name in self._TERMINAL_EVENTS or event.name.endswith(
+            ".perf"
         )
         if not should_write:
             if force_flush:

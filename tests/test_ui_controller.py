@@ -56,12 +56,18 @@ def _candidate(
 
 
 def _mark_storyblocks_ready(controller: DesktopGuiController) -> None:
-    profile_id = controller.ensure_active_profile()
+    profile = (
+        controller.application.container.profile_registry.get_or_create_singleton()
+    )
     state = controller.application.container.session_manager.set_health(
-        profile_id, SessionHealth.READY
+        SessionHealth.READY
     )
     state.persistent_context_ready = True
     state.storyblocks_account = "editor@example.com"
+    controller.application.container.profile_registry.update_storyblocks_account(
+        profile.profile_id,
+        "editor@example.com",
+    )
 
 
 class _FakeSessionPage:
@@ -225,7 +231,7 @@ class UiControllerTests(unittest.TestCase):
             controller.delete_gemini_key()
             self.assertIsNone(controller.get_gemini_key())
 
-    def test_controller_updates_workbench_runs_and_lock_reject_actions(self) -> None:
+    def test_controller_projects_downloaded_files_and_run_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             script_path = _write_docx(
                 temp_dir,
@@ -241,7 +247,9 @@ class UiControllerTests(unittest.TestCase):
                 video_queries=["river boat dawn"],
                 image_queries=["river boat photo"],
             )
+            assert updated.script_document is not None
             paragraph = updated.script_document.paragraphs[0]
+            assert paragraph.query_bundle is not None
             self.assertEqual(paragraph.query_bundle.video_queries, ["river boat dawn"])
             self.assertEqual(paragraph.query_bundle.image_queries, ["river boat photo"])
 
@@ -251,8 +259,32 @@ class UiControllerTests(unittest.TestCase):
             assert video_descriptor is not None
             assert image_descriptor is not None
 
+            class DownloadingVideoBackend(CallbackCandidateSearchBackend):
+                def download_asset(
+                    self, asset: AssetCandidate, *, destination_dir: Path, filename: str
+                ) -> AssetCandidate:
+                    destination_dir.mkdir(parents=True, exist_ok=True)
+                    local_path = destination_dir / filename
+                    local_path.write_bytes(b"video")
+                    downloaded = AssetCandidate.from_dict(asset.to_dict())
+                    downloaded.local_path = local_path
+                    downloaded.metadata["download_status"] = "completed"
+                    return downloaded
+
+            class DownloadingImageBackend(CallbackCandidateSearchBackend):
+                def download_asset(
+                    self, asset: AssetCandidate, *, destination_dir: Path, filename: str
+                ) -> AssetCandidate:
+                    destination_dir.mkdir(parents=True, exist_ok=True)
+                    local_path = destination_dir / filename
+                    local_path.write_bytes(b"image")
+                    downloaded = AssetCandidate.from_dict(asset.to_dict())
+                    downloaded.local_path = local_path
+                    downloaded.metadata["download_status"] = "completed"
+                    return downloaded
+
             container.media_pipeline.register_backend(
-                CallbackCandidateSearchBackend(
+                DownloadingVideoBackend(
                     provider_id="storyblocks_video",
                     capability=ProviderCapability.VIDEO,
                     descriptor=video_descriptor,
@@ -267,7 +299,7 @@ class UiControllerTests(unittest.TestCase):
                 )
             )
             container.media_pipeline.register_backend(
-                CallbackCandidateSearchBackend(
+                DownloadingImageBackend(
                     provider_id="storyblocks_image",
                     capability=ProviderCapability.IMAGE,
                     descriptor=image_descriptor,
@@ -293,37 +325,39 @@ class UiControllerTests(unittest.TestCase):
             workbench = controller.build_paragraph_workbench(
                 project.project_id, run.run_id
             )
+            progress = controller.build_run_progress(
+                run.run_id, active_project_id=project.project_id
+            )
 
             self.assertEqual(len(history), 1)
-            self.assertEqual(workbench[0].selected_assets[0].asset_id, "video-1")
+            self.assertEqual(workbench[0].status, "completed")
+            self.assertTrue(workbench[0].downloaded_files)
+            self.assertTrue(
+                any(
+                    asset.asset_id == "video-1"
+                    for asset in workbench[0].downloaded_files
+                )
+            )
             self.assertTrue(
                 any(
                     asset.asset_id == "image-1"
-                    for asset in workbench[0].candidate_assets
+                    for asset in workbench[0].downloaded_files
                 )
             )
+            self.assertIsNotNone(progress)
+            assert progress is not None
+            self.assertTrue(progress.downloads_root)
+            self.assertTrue(progress.videos_dir.endswith("videos"))
+            self.assertTrue(progress.images_dir.endswith("images"))
+            for action_name in ("lock" + "_asset", "reject" + "_asset"):
+                self.assertNotIn(action_name, dir(controller))
 
-            locked_manifest = controller.lock_asset(run.run_id, 1, "image-1")
-            locked_entry = next(
-                entry
-                for entry in locked_manifest.paragraph_entries
-                if entry.paragraph_no == 1
-            )
-            self.assertEqual(locked_entry.user_decision_status, "locked")
-
-            rejected_manifest = controller.reject_asset(run.run_id, 1, "image-1")
-            rejected_entry = next(
-                entry
-                for entry in rejected_manifest.paragraph_entries
-                if entry.paragraph_no == 1
-            )
-            self.assertIn("user_rejected", rejected_entry.rejection_reasons)
-
-            rerun_run, rerun_manifest = controller.rerun_current_paragraph(
-                project.project_id, 1, quick, advanced
+            rerun_run, rerun_manifest = controller.rerun_full_run(
+                project.project_id, quick, advanced
             )
             self.assertEqual(
-                [entry.paragraph_no for entry in rerun_manifest.paragraph_entries], [1]
+                [entry.paragraph_no for entry in rerun_manifest.paragraph_entries],
+                [1, 2, 3],
             )
             self.assertEqual(rerun_run.project_id, project.project_id)
 
@@ -423,19 +457,17 @@ class UiControllerTests(unittest.TestCase):
     def test_controller_manages_storyblocks_session_panel_without_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             controller = DesktopGuiController.create(temp_dir)
-            profile_id_value = controller.ensure_active_profile()
+            profile = controller.application.container.profile_registry.get_or_create_singleton()
             container = controller.application.container
 
-            def fake_open_browser(profile_id=None):
-                pid = profile_id or profile_id_value
-                state = container.session_manager.set_health(pid, SessionHealth.UNKNOWN)
+            def fake_open_browser():
+                state = container.session_manager.set_health(SessionHealth.UNKNOWN)
                 state.persistent_context_ready = True
                 return cast(object, None)
 
-            def fake_native_login(profile_id=None, **_kwargs):
-                pid = profile_id or profile_id_value
+            def fake_native_login(**_kwargs):
                 state = container.session_manager.set_health(
-                    pid, SessionHealth.LOGIN_REQUIRED
+                    SessionHealth.LOGIN_REQUIRED
                 )
                 state.manual_intervention = ManualInterventionRequest(
                     reason="native_login",
@@ -444,28 +476,26 @@ class UiControllerTests(unittest.TestCase):
                 )
                 return state
 
-            def fake_check_authorization(profile_id=None, **_kwargs):
-                pid = profile_id or profile_id_value
-                state = container.session_manager.set_health(pid, SessionHealth.READY)
+            def fake_check_authorization(**_kwargs):
+                state = container.session_manager.set_health(SessionHealth.READY)
                 state.storyblocks_account = "editor@example.com"
+                container.profile_registry.update_storyblocks_account(
+                    profile.profile_id,
+                    "editor@example.com",
+                )
                 return state
 
-            container.session_manager.open_browser = fake_open_browser
             container.session_manager.open_native_login_browser = fake_native_login
             container.session_manager.check_authorization = fake_check_authorization
 
             initial = controller.session_panel()
             login = controller.prepare_storyblocks_login()
             ready = controller.check_storyblocks_session()
-            switched = controller.switch_storyblocks_account()
-            cleared = controller.clear_storyblocks_profile()
 
-            self.assertEqual(initial.profile_id, profile_id_value)
+            self.assertEqual(initial.health, SessionHealth.UNKNOWN.value)
             self.assertEqual(login.health, SessionHealth.LOGIN_REQUIRED.value)
             self.assertEqual(ready.health, SessionHealth.READY.value)
             self.assertEqual(ready.account, "editor@example.com")
-            self.assertEqual(switched.health, SessionHealth.LOGIN_REQUIRED.value)
-            self.assertNotEqual(cleared.profile_id, profile_id_value)
 
     def test_controller_can_reset_storyblocks_session_with_reason_code(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -483,9 +513,8 @@ class UiControllerTests(unittest.TestCase):
             script_path = _write_docx(temp_dir, ["HEADER", "1. River boat scene"])
             controller = DesktopGuiController.create(temp_dir)
             project = controller.open_script(script_path, project_name="Override Run")
-            profile_id = controller.ensure_active_profile()
             controller.application.container.session_manager.set_health(
-                profile_id, SessionHealth.UNKNOWN
+                SessionHealth.UNKNOWN
             )
             panel = controller.mark_storyblocks_session_ready()
 
@@ -539,7 +568,6 @@ class UiControllerTests(unittest.TestCase):
 
             controller = DesktopGuiController.create(temp_dir)
             container = controller.application.container
-            profile_id = controller.ensure_active_profile()
             container.profile_import_service = ChromiumProfileImportService(
                 container.profile_registry,
                 explicit_user_data_roots={"chrome": [external_root]},
@@ -560,12 +588,11 @@ class UiControllerTests(unittest.TestCase):
                 session_probe=StoryblocksSessionProbe(),
             )
 
-            options = controller.discover_storyblocks_sessions("chrome")
+            options = controller.discover_importable_browser_profiles("chrome")
             panel = controller.import_storyblocks_session_from_path(
                 options[0].profile_dir, browser_name="chrome"
             )
 
-            self.assertEqual(panel.profile_id, profile_id)
             self.assertEqual(panel.health, SessionHealth.READY.value)
             self.assertIn(str(external_root), panel.imported_source)
             self.assertEqual(panel.imported_profile_name, "Storyblocks Personal")
@@ -734,6 +761,7 @@ class UiControllerTests(unittest.TestCase):
             self.assertEqual(settings.concurrency.queue_size, 1)
             self.assertEqual(settings.browser.action_delay_ms, 1500)
             self.assertTrue(settings.browser.slow_mode)
+            self.assertFalse(hasattr(settings.concurrency, "relevance_timeout_seconds"))
 
     def test_custom_preset_round_trip_preserves_launch_profile_and_timing(
         self,
@@ -862,18 +890,19 @@ class UiControllerTests(unittest.TestCase):
             run, manifest = container.media_run_service.create_run(project.project_id)
             run.status = RunStatus.RUNNING
             run.stage = RunStage.PROVIDER_SEARCH
-            assert run.checkpoint is not None
-            run.checkpoint.stage = RunStage.PROVIDER_SEARCH
-            run.checkpoint.current_paragraph_no = 1
             container.run_repository.save(run)
 
             detail_candidate = _candidate(
                 "video-1", "storyblocks_video", AssetKind.VIDEO, 10.0
             )
+            detail_candidate.local_path = Path(temp_dir) / "downloads" / "video-1.mp4"
+            detail_candidate.local_path.parent.mkdir(parents=True, exist_ok=True)
+            detail_candidate.local_path.write_bytes(b"video")
             detail_entry = manifest.paragraph_entries[0]
             detail_entry.selection = AssetSelection(
                 paragraph_no=1,
                 primary_asset=detail_candidate,
+                reason="Saved video is ready",
                 provider_results=[
                     ProviderResult(
                         provider_name="storyblocks_video",
@@ -882,13 +911,9 @@ class UiControllerTests(unittest.TestCase):
                         candidates=[detail_candidate],
                     )
                 ],
-                user_locked=True,
-                user_decision_status="locked",
-                status="locked",
+                status="completed",
             )
-            detail_entry.status = "locked"
-            detail_entry.user_decision_status = "locked"
-            detail_entry.rejection_reasons = ["manual override"]
+            detail_entry.status = "completed"
             container.media_pipeline.register_live_manifest(manifest)
             container.event_recorder(
                 AppEvent(
@@ -949,9 +974,15 @@ class UiControllerTests(unittest.TestCase):
             }
             self.assertTrue(item_by_no[1].text)
             self.assertEqual(item_by_no[2].text, "")
-            self.assertEqual(len(item_by_no[1].selected_assets), 1)
-            self.assertEqual(len(item_by_no[1].candidate_assets), 1)
-            self.assertEqual(item_by_no[1].rejection_reasons, ["manual override"])
+            self.assertEqual(item_by_no[1].status, "completed")
+            self.assertEqual(item_by_no[1].result_note, "Saved video is ready")
+            self.assertEqual(len(item_by_no[1].downloaded_files), 1)
+            self.assertEqual(
+                item_by_no[1].downloaded_files[0].local_path,
+                str(detail_candidate.local_path),
+            )
+            for field_name in ("selected" + "_assets", "candidate" + "_assets"):
+                self.assertNotIn(field_name, type(item_by_no[1]).__slots__)
 
     def test_build_live_run_state_does_not_fallback_to_manifest_after_live_release(
         self,
@@ -1006,6 +1037,7 @@ class UiControllerTests(unittest.TestCase):
                 run.run_id, detailed_paragraph_no=None
             )
             self.assertIsNotNone(live_state.run_progress)
+            assert live_state.run_progress is not None
             self.assertEqual(live_state.run_progress.status, "completed")
             self.assertEqual(live_state.paragraph_items, [])
 
@@ -1066,7 +1098,7 @@ class UiControllerTests(unittest.TestCase):
                     break
                 time.sleep(0.05)
 
-    def test_controller_tracks_live_progress_journal_and_pause_resume(self) -> None:
+    def test_controller_tracks_live_progress_without_event_journal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             script_path = _write_docx(
                 temp_dir, ["HEADER", "1. River boat scene", "2. Camp scene"]
@@ -1126,29 +1158,40 @@ class UiControllerTests(unittest.TestCase):
             quick.mode_id = "sb_video_plus_sb_images"
 
             run_id = controller.start_run_async(project.project_id, quick, advanced)
-            time.sleep(0.02)
-            controller.pause_run(run_id)
 
-            paused_state = None
+            live_snapshot = None
             deadline = time.time() + 10.0
             while time.time() < deadline:
-                paused_state = controller.build_state(
+                live_snapshot = controller.build_live_snapshot(
                     active_project_id=project.project_id, active_run_id=run_id
                 )
                 if (
-                    paused_state.run_progress is not None
-                    and paused_state.run_progress.status == "paused"
+                    live_snapshot.run_progress is not None
+                    and live_snapshot.run_progress.status == "running"
                 ):
                     break
                 time.sleep(0.05)
 
-            assert paused_state is not None
-            assert paused_state.run_progress is not None
-            self.assertEqual(paused_state.run_progress.status, "paused")
-            self.assertTrue(paused_state.run_progress.can_resume)
-            self.assertGreater(len(paused_state.event_journal), 0)
+            assert live_snapshot is not None
+            assert live_snapshot.run_progress is not None
+            self.assertEqual(live_snapshot.run_progress.status, "running")
+            self.assertTrue(live_snapshot.run_progress.can_cancel)
+            self.assertFalse(hasattr(live_snapshot, "event_journal"))
 
-            controller.resume_run_async(run_id, advanced)
+            live_state = controller.build_live_run_state(
+                active_project_id=project.project_id,
+                active_run_id=run_id,
+                live_snapshot=live_snapshot,
+            )
+            self.assertFalse(hasattr(live_state, "event_journal"))
+
+            running_state = controller.build_state(
+                active_project_id=project.project_id,
+                active_run_id=run_id,
+            )
+            self.assertFalse(hasattr(running_state, "event_journal"))
+
+            controller.cancel_run(run_id)
 
             completed_state = None
             deadline = time.time() + 20.0
@@ -1158,22 +1201,97 @@ class UiControllerTests(unittest.TestCase):
                 )
                 if (
                     completed_state.run_progress is not None
-                    and completed_state.run_progress.status == "completed"
+                    and completed_state.run_progress.status == "cancelled"
                 ):
                     break
                 time.sleep(0.05)
 
             assert completed_state is not None
             assert completed_state.run_progress is not None
-            self.assertEqual(completed_state.run_progress.status, "completed")
+            self.assertEqual(completed_state.run_progress.status, "cancelled")
             history = controller.list_run_history(project.project_id)
-            self.assertEqual(history[0].status, "completed")
-            self.assertTrue(
-                any(
-                    item.message.endswith("Run completed")
-                    or item.message.startswith("Run ")
-                    for item in completed_state.event_journal
+            self.assertEqual(history[0].status, "cancelled")
+
+    def test_controller_rerun_full_run_async_ignores_current_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = _write_docx(
+                temp_dir,
+                ["HEADER", "1. River boat scene", "2. Camp scene", "3. City scene"],
+            )
+            controller = DesktopGuiController.create(temp_dir)
+            project = controller.open_script(script_path, project_name="Full Rerun")
+            _mark_storyblocks_ready(controller)
+            container = controller.application.container
+            video_descriptor = container.provider_registry.get("storyblocks_video")
+            assert video_descriptor is not None
+
+            container.media_pipeline.register_backend(
+                CallbackCandidateSearchBackend(
+                    provider_id="storyblocks_video",
+                    capability=ProviderCapability.VIDEO,
+                    descriptor=video_descriptor,
+                    search_fn=lambda paragraph, query, limit: [
+                        _candidate(
+                            f"video-{paragraph.paragraph_no}",
+                            "storyblocks_video",
+                            AssetKind.VIDEO,
+                            9.0,
+                        )
+                    ],
                 )
+            )
+
+            quick = controller.build_quick_launch_settings()
+            advanced = controller.build_advanced_settings()
+            quick.project_name = "Full Rerun"
+            quick.script_path = str(script_path)
+            quick.mode_id = "sb_video_only"
+            quick.paragraph_selection_text = "2..end"
+
+            subset_run, subset_manifest = controller.execute_run(
+                project.project_id,
+                quick,
+                advanced,
+            )
+            self.assertEqual(subset_run.selected_paragraphs, [2, 3])
+            self.assertEqual(
+                [entry.paragraph_no for entry in subset_manifest.paragraph_entries],
+                [2, 3],
+            )
+
+            quick.paragraph_selection_text = "1"
+            rerun_id = controller.rerun_full_run_async(
+                project.project_id,
+                quick,
+                advanced,
+            )
+
+            rerun_state = None
+            deadline = time.time() + 20.0
+            while time.time() < deadline:
+                rerun_state = controller.build_state(
+                    active_project_id=project.project_id,
+                    active_run_id=rerun_id,
+                )
+                if (
+                    rerun_state.run_progress is not None
+                    and rerun_state.run_progress.status == "completed"
+                ):
+                    break
+                time.sleep(0.05)
+
+            rerun_run = controller.application.container.run_repository.load(rerun_id)
+            rerun_manifest = controller.application.container.manifest_repository.load(
+                rerun_id
+            )
+            self.assertIsNotNone(rerun_run)
+            self.assertIsNotNone(rerun_manifest)
+            assert rerun_run is not None
+            assert rerun_manifest is not None
+            self.assertEqual(rerun_run.selected_paragraphs, [])
+            self.assertEqual(
+                [entry.paragraph_no for entry in rerun_manifest.paragraph_entries],
+                [1, 2, 3],
             )
 
 

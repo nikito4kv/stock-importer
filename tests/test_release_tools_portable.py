@@ -19,9 +19,16 @@ class PortableReleaseTests(unittest.TestCase):
             )
 
             for relative_path in (
+                Path("app") / "bootstrap.py",
+                Path("browser") / "session.py",
+                Path("legacy_core") / "image_providers.py",
                 Path("pipeline") / "intents.py",
                 Path("pipeline") / "media.py",
                 Path("providers") / "images" / "clients.py",
+                Path("providers") / "images" / "filtering.py",
+                Path("providers") / "images" / "querying.py",
+                Path("services") / "settings_manager.py",
+                Path("services") / "secrets.py",
             ):
                 source = (project_root / relative_path).read_text(encoding="utf-8")
                 bundled = (result.bundle_dir / relative_path).read_text(

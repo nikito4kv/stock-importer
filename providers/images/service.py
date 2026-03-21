@@ -8,7 +8,7 @@ from services.errors import ProviderSearchError
 from services.retry import is_timeout_exception
 
 from ..registry import ProviderRegistry
-from .caching import MetadataCache, SearchResultCache
+from .caching import SearchResultCache
 from .clients import (
     ImageProviderBuildContext,
     ImageSearchProvider,
@@ -91,7 +91,6 @@ class ImageProviderSearchService:
         self._cache_dir = cache_dir
         self._query_planner = ImageQueryPlanner()
         self._search_cache_instance: SearchResultCache | None = None
-        self._metadata_cache_instance: MetadataCache | None = None
         self._closed = False
 
     @property
@@ -103,17 +102,6 @@ class ImageProviderSearchService:
             raise RuntimeError("ImageProviderSearchService is closed")
         cache = SearchResultCache(self._cache_dir / "search_results.sqlite")
         self._search_cache_instance = cache
-        return cache
-
-    @property
-    def _metadata_cache(self) -> MetadataCache:
-        cache = self._metadata_cache_instance
-        if cache is not None:
-            return cache
-        if self._closed:
-            raise RuntimeError("ImageProviderSearchService is closed")
-        cache = MetadataCache(self._cache_dir / "metadata.sqlite")
-        self._metadata_cache_instance = cache
         return cache
 
     def _require_open(self) -> None:
@@ -178,7 +166,11 @@ class ImageProviderSearchService:
         seen_urls: set[str] = set()
 
         if not providers:
-            return [], ["No image providers are configured"], ImageSearchDiagnostics({}, [], 0)
+            return (
+                [],
+                ["No image providers are configured"],
+                ImageSearchDiagnostics({}, [], 0),
+            )
 
         for provider in providers:
             try:
@@ -208,7 +200,6 @@ class ImageProviderSearchService:
             provider_cache_hits.update(provider_diagnostics.provider_cache_hits)
             provider_rejected.update(provider_diagnostics.provider_rejected_prefilters)
 
-            provider_candidates.sort(key=lambda item: item.rank_hint, reverse=True)
             unique_candidates: list[SearchCandidate] = []
             for candidate in provider_candidates:
                 if candidate.url in seen_urls:
@@ -216,8 +207,9 @@ class ImageProviderSearchService:
                 seen_urls.add(candidate.url)
                 unique_candidates.append(candidate)
             all_candidates.extend(unique_candidates)
+            if len(all_candidates) >= max_candidates_per_keyword:
+                break
 
-        all_candidates.sort(key=lambda item: item.rank_hint, reverse=True)
         return (
             all_candidates[:max_candidates_per_keyword],
             errors,
@@ -242,8 +234,10 @@ class ImageProviderSearchService:
     ) -> tuple[list[SearchCandidate], list[str], ImageSearchDiagnostics]:
         self._require_open()
         descriptor = provider.descriptor
-        provider_limit = max(8, min(80, max_candidates_per_keyword or 8))
-        query_plan = self._query_planner.rewrite_for_provider(descriptor, keyword, paragraph_text)
+        provider_limit = max(1, int(max_candidates_per_keyword or 8))
+        query_plan = self._query_planner.rewrite_for_provider(
+            descriptor, keyword, paragraph_text
+        )
         provider_candidates: list[SearchCandidate] = []
         errors: list[str] = []
         rejected_prefilters: list[str] = []
@@ -269,21 +263,21 @@ class ImageProviderSearchService:
                         provider_queries=list(query_plan.queries),
                         failed_query=query,
                     ) from exc
-                self._search_cache.set(provider.provider_id, query, provider_limit, found)
+                self._search_cache.set(
+                    provider.provider_id, query, provider_limit, found
+                )
 
             filtered, rejected = filter_and_rank_candidates(
                 descriptor,
                 keyword,
                 list(found),
                 license_policy=license_policy,
-                metadata_cache=self._metadata_cache,
             )
             rejected_prefilters.extend(rejected)
             provider_candidates.extend(filtered)
             if len(provider_candidates) >= provider_limit:
                 break
 
-        provider_candidates.sort(key=lambda item: item.rank_hint, reverse=True)
         provider_candidates = provider_candidates[:provider_limit]
         return (
             provider_candidates,
@@ -293,7 +287,9 @@ class ImageProviderSearchService:
                 rejected_prefilters=rejected_prefilters,
                 cache_hits=cache_hits,
                 provider_cache_hits={provider.provider_id: cache_hits},
-                provider_rejected_prefilters={provider.provider_id: list(rejected_prefilters)},
+                provider_rejected_prefilters={
+                    provider.provider_id: list(rejected_prefilters)
+                },
             ),
         )
 
@@ -303,8 +299,6 @@ class ImageProviderSearchService:
         self._closed = True
         if self._search_cache_instance is not None:
             self._search_cache_instance.close()
-        if self._metadata_cache_instance is not None:
-            self._metadata_cache_instance.close()
 
 
 __all__ = ["ImageProviderSearchService", "ImageSearchDiagnostics"]

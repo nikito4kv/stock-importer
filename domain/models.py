@@ -178,9 +178,7 @@ class AssetSelection(SerializableModel):
     provider_results: list[ProviderResult] = field(default_factory=list)
     rejection_reasons: list[str] = field(default_factory=list)
     diagnostics: dict[str, Any] = field(default_factory=dict)
-    user_decision_status: str = "auto_selected"
     reason: str = ""
-    user_locked: bool = False
     status: str = "pending"
 
 
@@ -191,7 +189,6 @@ class MediaSlot(SerializableModel):
     role: str
     required: bool = False
     selected_asset_id: str | None = None
-    user_locked: bool = False
 
 
 @dataclass(slots=True)
@@ -200,7 +197,7 @@ class ParagraphDiagnostics(SerializableModel):
     provider_queries: dict[str, list[str]] = field(default_factory=dict)
     provider_results: list[ProviderResult] = field(default_factory=list)
     rejected_reasons: list[str] = field(default_factory=list)
-    fanout_limits: dict[str, int] = field(default_factory=dict)
+    fanout_limits: dict[str, Any] = field(default_factory=dict)
     dedupe_rejections: dict[str, int] = field(default_factory=dict)
     early_stop_triggered: bool = False
     selected_from_provider: str | None = None
@@ -216,9 +213,7 @@ class ParagraphManifestEntry(SerializableModel):
     slots: list[MediaSlot] = field(default_factory=list)
     selection: AssetSelection | None = None
     diagnostics: ParagraphDiagnostics | None = None
-    fallback_options: list[AssetCandidate] = field(default_factory=list)
     rejection_reasons: list[str] = field(default_factory=list)
-    user_decision_status: str = "auto_selected"
     status: str = "pending"
 
 
@@ -236,26 +231,30 @@ class RunManifest(SerializableModel):
 
 
 @dataclass(slots=True)
-class LiveAssetSnapshot:
-    asset: AssetCandidate
-    role: str = "candidate"
-    locked: bool = False
+class LiveDownloadedFileSnapshot:
+    asset_id: str
+    provider_name: str
+    kind: AssetKind
+    role: str = ""
+    title: str = ""
+    local_path: Path | None = None
+    exists: bool = False
 
 
 @dataclass(slots=True)
 class LiveParagraphStateSnapshot:
     paragraph_no: int
     status: str = "pending"
-    user_decision_status: str = "auto_selected"
-    selected_assets: list[LiveAssetSnapshot] = field(default_factory=list)
-    candidate_assets: list[LiveAssetSnapshot] = field(default_factory=list)
-    rejection_reasons: list[str] = field(default_factory=list)
+    result_note: str = ""
+    downloaded_files: list[LiveDownloadedFileSnapshot] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class LiveRunStateSnapshot:
     run_id: str
-    paragraph_states: dict[int, LiveParagraphStateSnapshot] = field(default_factory=dict)
+    paragraph_states: dict[int, LiveParagraphStateSnapshot] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(slots=True)
@@ -275,18 +274,6 @@ class BrowserProfile(SerializableModel):
     session_health: SessionHealth = SessionHealth.UNKNOWN
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
-    is_active: bool = False
-
-
-@dataclass(slots=True)
-class RunCheckpoint(SerializableModel):
-    run_id: str
-    stage: RunStage
-    current_paragraph_no: int | None = None
-    selected_paragraphs: list[int] = field(default_factory=list)
-    completed_paragraphs: list[int] = field(default_factory=list)
-    failed_paragraphs: list[int] = field(default_factory=list)
-    updated_at: datetime = field(default_factory=utc_now)
 
 
 @dataclass(slots=True)
@@ -294,17 +281,29 @@ class Run(SerializableModel):
     run_id: str
     project_id: str
     schema_version: int = 1
-    status: RunStatus = RunStatus.DRAFT
+    status: RunStatus = RunStatus.RUNNING
     stage: RunStage = RunStage.IDLE
     selected_paragraphs: list[int] = field(default_factory=list)
     completed_paragraphs: list[int] = field(default_factory=list)
     failed_paragraphs: list[int] = field(default_factory=list)
-    checkpoint: RunCheckpoint | None = None
     last_error: str | None = None
     created_at: datetime = field(default_factory=utc_now)
     started_at: datetime | None = None
     finished_at: datetime | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]):
+        payload = dict(data)
+        metadata = dict(payload.get("metadata") or {})
+        raw_status = str(payload.get("status") or "").strip().casefold()
+        legacy_statuses = {"draft", "ready", "paused"}
+        if raw_status in legacy_statuses:
+            metadata.setdefault("legacy_status", raw_status)
+            payload["status"] = RunStatus.CANCELLED.value
+        payload.pop("checkpoint", None)
+        payload["metadata"] = metadata
+        return SerializableModel.from_dict.__func__(cls, payload)
 
 
 @dataclass(slots=True)
@@ -323,7 +322,6 @@ class Project(SerializableModel):
     schema_version: int = 1
     script_document: ScriptDocument | None = None
     active_run_id: str | None = None
-    active_browser_profile_id: str | None = None
     preset_names: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)

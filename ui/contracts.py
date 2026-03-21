@@ -13,18 +13,6 @@ class UiNotification:
 
 
 @dataclass(slots=True)
-class UiEventJournalItem:
-    created_at: str
-    severity: str
-    message: str
-    stage: str = ""
-    paragraph_no: int | None = None
-    provider_name: str = ""
-    query: str = ""
-    current_asset_id: str = ""
-
-
-@dataclass(slots=True)
 class UiErrorPayload:
     code: str
     message: str
@@ -38,7 +26,7 @@ class UiPresetViewModel:
 
 
 @dataclass(slots=True)
-class UiImportableSessionOption:
+class UiImportableBrowserProfileOption:
     browser_name: str
     browser_label: str
     profile_name: str
@@ -73,16 +61,14 @@ class UiRunHistoryItem:
 
 
 @dataclass(slots=True)
-class UiAssetPreview:
+class UiDownloadedFileItem:
     asset_id: str
     provider_name: str
     kind: str
+    role: str
     title: str
-    license_name: str
-    source_url: str | None = None
-    role: str = "candidate"
-    locked: bool = False
-    rejected: bool = False
+    local_path: str
+    exists: bool = False
 
 
 @dataclass(slots=True)
@@ -93,22 +79,18 @@ class UiParagraphWorkbenchItem:
     numbering_valid: bool
     validation_issues: list[str]
     status: str
-    user_decision_status: str
+    result_note: str
     intent_summary: str
     current_stage: str = ""
     current_provider_name: str = ""
     current_query: str = ""
     video_queries: list[str] = field(default_factory=list)
     image_queries: list[str] = field(default_factory=list)
-    selected_assets: list[UiAssetPreview] = field(default_factory=list)
-    candidate_assets: list[UiAssetPreview] = field(default_factory=list)
-    rejection_reasons: list[str] = field(default_factory=list)
+    downloaded_files: list[UiDownloadedFileItem] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class UiSessionPanelViewModel:
-    profile_id: str | None = None
-    profile_name: str = ""
     health: str = "unknown"
     account: str = ""
     browser_ready: bool = False
@@ -151,28 +133,29 @@ class UiRunProgressViewModel:
     current_provider_name: str = ""
     current_query: str = ""
     current_asset_id: str = ""
+    paragraphs_total: int = 0
+    paragraphs_processed: int = 0
+    paragraphs_completed: int = 0
     project_progress_total: int = 0
     project_progress_completed: int = 0
-    paragraphs_matched: int = 0
     paragraphs_no_match: int = 0
     paragraph_progress_total: int = 0
     paragraph_progress_completed: int = 0
     paragraphs_failed: int = 0
+    downloads_root: str = ""
+    videos_dir: str = ""
+    images_dir: str = ""
+    downloaded_video_files: int = 0
+    downloaded_image_files: int = 0
     percent_complete: float = 0.0
     live_state: str = "idle"
-    can_pause: bool = False
-    can_resume: bool = False
     can_cancel: bool = False
-    can_retry_failed: bool = False
-    can_rerun_selected: bool = False
-    checkpoint_message: str = ""
 
 
 @dataclass(slots=True)
 class UiLiveRunStateViewModel:
     active_run_id: str | None = None
     status_text: str = "готово"
-    event_journal: list[UiEventJournalItem] = field(default_factory=list)
     paragraph_items: list[UiParagraphWorkbenchItem] = field(default_factory=list)
     run_progress: UiRunProgressViewModel | None = None
 
@@ -181,7 +164,6 @@ class UiLiveRunStateViewModel:
 class UiLiveSnapshotViewModel:
     active_run_id: str | None = None
     status_text: str = "готово"
-    event_journal: list[UiEventJournalItem] = field(default_factory=list)
     run_progress: UiRunProgressViewModel | None = None
 
 
@@ -223,7 +205,6 @@ class UiStateViewModel:
     run_history: list[UiRunHistoryItem] = field(default_factory=list)
     presets: list[UiPresetViewModel] = field(default_factory=list)
     paragraph_items: list[UiParagraphWorkbenchItem] = field(default_factory=list)
-    event_journal: list[UiEventJournalItem] = field(default_factory=list)
     session: UiSessionPanelViewModel = field(default_factory=UiSessionPanelViewModel)
     quick_launch: UiQuickLaunchSettingsViewModel = field(
         default_factory=UiQuickLaunchSettingsViewModel

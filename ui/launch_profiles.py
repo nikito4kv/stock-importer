@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from providers.registry import ExecutionConcurrencyMode
+from providers import ExecutionConcurrencyMode
 
 LaunchProfileId = Literal["normal", "fast", "custom"]
 
@@ -20,13 +20,8 @@ class LaunchProfileDefinition:
     provider_queue_size: int
     download_workers: int
     download_queue_size: int
-    relevance_workers: int
-    relevance_queue_size: int
     search_timeout_seconds: float
-    relevance_timeout_seconds: float
     retry_budget: int
-    top_k_to_relevance: int
-    early_stop_quality_threshold: float
     fail_fast_storyblocks_errors: bool
     no_match_budget_seconds: float
 
@@ -58,13 +53,8 @@ class ResolvedLaunchProfile:
     provider_queue_size: int
     download_workers: int
     download_queue_size: int
-    relevance_workers: int
-    relevance_queue_size: int
     search_timeout_seconds: float
-    relevance_timeout_seconds: float
     retry_budget: int
-    top_k_to_relevance: int
-    early_stop_quality_threshold: float
     fail_fast_storyblocks_errors: bool
     no_match_budget_seconds: float
 
@@ -87,13 +77,8 @@ _PROFILE_DEFINITIONS: dict[str, LaunchProfileDefinition] = {
         provider_queue_size=8,
         download_workers=4,
         download_queue_size=8,
-        relevance_workers=2,
-        relevance_queue_size=8,
         search_timeout_seconds=20.0,
-        relevance_timeout_seconds=10.0,
         retry_budget=2,
-        top_k_to_relevance=24,
-        early_stop_quality_threshold=8.0,
         fail_fast_storyblocks_errors=True,
         no_match_budget_seconds=20.0,
     ),
@@ -108,13 +93,8 @@ _PROFILE_DEFINITIONS: dict[str, LaunchProfileDefinition] = {
         provider_queue_size=8,
         download_workers=4,
         download_queue_size=8,
-        relevance_workers=2,
-        relevance_queue_size=8,
         search_timeout_seconds=12.0,
-        relevance_timeout_seconds=6.0,
         retry_budget=1,
-        top_k_to_relevance=24,
-        early_stop_quality_threshold=8.0,
         fail_fast_storyblocks_errors=True,
         no_match_budget_seconds=10.0,
     ),
@@ -182,9 +162,7 @@ def resolve_launch_profile(
         action_delay_ms = max(0, int(overrides.action_delay_ms))
         launch_timeout_ms = max(1000, int(overrides.launch_timeout_ms))
         navigation_timeout_ms = max(1000, int(overrides.navigation_timeout_ms))
-        downloads_timeout_seconds = max(
-            1.0, float(overrides.downloads_timeout_seconds)
-        )
+        downloads_timeout_seconds = max(1.0, float(overrides.downloads_timeout_seconds))
     return ResolvedLaunchProfile(
         launch_profile_id=normalized_id,
         label=get_launch_profile_label(normalized_id),
@@ -199,13 +177,8 @@ def resolve_launch_profile(
         provider_queue_size=definition.provider_queue_size,
         download_workers=definition.download_workers,
         download_queue_size=definition.download_queue_size,
-        relevance_workers=definition.relevance_workers,
-        relevance_queue_size=definition.relevance_queue_size,
         search_timeout_seconds=definition.search_timeout_seconds,
-        relevance_timeout_seconds=definition.relevance_timeout_seconds,
         retry_budget=definition.retry_budget,
-        top_k_to_relevance=definition.top_k_to_relevance,
-        early_stop_quality_threshold=definition.early_stop_quality_threshold,
         fail_fast_storyblocks_errors=definition.fail_fast_storyblocks_errors,
         no_match_budget_seconds=definition.no_match_budget_seconds,
     )
@@ -234,15 +207,11 @@ def describe_custom_timing_overrides(
     if custom_timing.navigation_timeout_ms != base.navigation_timeout_ms:
         lines.append(f"таймаут навигации {custom_timing.navigation_timeout_ms} мс")
     if (
-        abs(
-            custom_timing.downloads_timeout_seconds
-            - base.downloads_timeout_seconds
-        )
+        abs(custom_timing.downloads_timeout_seconds - base.downloads_timeout_seconds)
         > 1e-9
     ):
         lines.append(
-            "таймаут скачивания "
-            f"{custom_timing.downloads_timeout_seconds:.1f} с"
+            f"таймаут скачивания {custom_timing.downloads_timeout_seconds:.1f} с"
         )
     return lines
 

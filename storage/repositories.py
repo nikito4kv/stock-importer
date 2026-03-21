@@ -128,18 +128,30 @@ class SettingsRepository:
             )
         project_mode = providers.get("project_mode")
         if not project_mode:
-            project_mode = infer_project_mode(
-                video_enabled=bool(
-                    normalized_default_video_providers
-                    or ("storyblocks_video" in normalized_enabled_providers)
-                ),
-                storyblocks_images_enabled=(
-                    "storyblocks_image" in normalized_enabled_providers
-                    and not bool(providers.get("free_images_only", False))
-                ),
-                free_images_enabled=bool(normalized_free_providers),
-                mixed_image_fallback=bool(providers.get("mixed_image_fallback", True)),
+            legacy_mixed_image_fallback = bool(
+                providers.get("mixed_image_fallback", True)
             )
+            storyblocks_images_enabled = (
+                "storyblocks_image" in normalized_enabled_providers
+                and not bool(providers.get("free_images_only", False))
+            )
+            free_images_enabled = bool(normalized_free_providers)
+            video_enabled = bool(
+                normalized_default_video_providers
+                or ("storyblocks_video" in normalized_enabled_providers)
+            )
+            if video_enabled and storyblocks_images_enabled and free_images_enabled:
+                project_mode = (
+                    "sb_video_plus_free_images"
+                    if legacy_mixed_image_fallback
+                    else "sb_video_plus_sb_images"
+                )
+            else:
+                project_mode = infer_project_mode(
+                    video_enabled=video_enabled,
+                    storyblocks_images_enabled=storyblocks_images_enabled,
+                    free_images_enabled=free_images_enabled,
+                )
         resolved_project_mode = normalize_project_mode(project_mode)
         resolved_enabled_providers = provider_ids_for_mode(
             resolved_project_mode,
@@ -223,21 +235,13 @@ class SettingsRepository:
                 provider_queue_size=int(concurrency.get("provider_queue_size", 8)),
                 download_workers=int(concurrency.get("download_workers", 4)),
                 download_queue_size=int(concurrency.get("download_queue_size", 8)),
-                relevance_workers=int(concurrency.get("relevance_workers", 2)),
-                relevance_queue_size=int(concurrency.get("relevance_queue_size", 8)),
                 search_timeout_seconds=max(
                     0.0, float(concurrency.get("search_timeout_seconds", 20.0))
                 ),
                 download_timeout_seconds=max(
                     1.0, float(concurrency.get("download_timeout_seconds", 120.0))
                 ),
-                relevance_timeout_seconds=max(
-                    0.0, float(concurrency.get("relevance_timeout_seconds", 10.0))
-                ),
                 retry_budget=max(0, int(concurrency.get("retry_budget", 2))),
-                early_stop_quality_threshold=float(
-                    concurrency.get("early_stop_quality_threshold", 8.0)
-                ),
                 fail_fast_storyblocks_errors=bool(
                     concurrency.get("fail_fast_storyblocks_errors", True)
                 ),
@@ -318,13 +322,9 @@ class SettingsRepository:
                 "provider_queue_size": settings.concurrency.provider_queue_size,
                 "download_workers": settings.concurrency.download_workers,
                 "download_queue_size": settings.concurrency.download_queue_size,
-                "relevance_workers": settings.concurrency.relevance_workers,
-                "relevance_queue_size": settings.concurrency.relevance_queue_size,
                 "search_timeout_seconds": settings.concurrency.search_timeout_seconds,
                 "download_timeout_seconds": settings.concurrency.download_timeout_seconds,
-                "relevance_timeout_seconds": settings.concurrency.relevance_timeout_seconds,
                 "retry_budget": settings.concurrency.retry_budget,
-                "early_stop_quality_threshold": settings.concurrency.early_stop_quality_threshold,
                 "fail_fast_storyblocks_errors": settings.concurrency.fail_fast_storyblocks_errors,
                 "queue_size": settings.concurrency.queue_size,
             },

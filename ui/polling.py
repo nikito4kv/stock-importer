@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled", "paused"})
+TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
 @dataclass(slots=True, frozen=True)

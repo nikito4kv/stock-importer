@@ -1,4 +1,9 @@
 from .base import ProviderDescriptor
+from .concurrency import (
+    ConcurrencyModeResolution,
+    ExecutionConcurrencyMode,
+    resolve_execution_concurrency_mode,
+)
 from .images import (
     ImageLicensePolicy,
     ImageProviderBuildContext,
@@ -7,12 +12,7 @@ from .images import (
     SearchCandidate,
     build_image_provider_clients,
 )
-from .registry import (
-    ConcurrencyModeResolution,
-    ExecutionConcurrencyMode,
-    ProviderRegistry,
-    build_default_provider_registry,
-)
+from .registry import ProviderRegistry, build_default_provider_registry
 
 __all__ = [
     "ImageLicensePolicy",
@@ -26,4 +26,5 @@ __all__ = [
     "SearchCandidate",
     "build_default_provider_registry",
     "build_image_provider_clients",
+    "resolve_execution_concurrency_mode",
 ]

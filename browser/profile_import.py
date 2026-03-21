@@ -22,7 +22,7 @@ def _now() -> datetime:
 
 
 @dataclass(frozen=True, slots=True)
-class ImportableBrowserSession:
+class ImportableBrowserProfile:
     browser_name: str
     browser_label: str
     user_data_root: Path
@@ -67,9 +67,13 @@ class ChromiumProfileImportService:
         self._env = dict(env or os.environ)
         self._explicit_user_data_roots = explicit_user_data_roots or {}
 
-    def discover_profiles(self, browser_name: str | None = None) -> list[ImportableBrowserSession]:
-        browser_names = [browser_name] if browser_name else list(self.SUPPORTED_BROWSERS)
-        sessions: list[ImportableBrowserSession] = []
+    def discover_profiles(
+        self, browser_name: str | None = None
+    ) -> list[ImportableBrowserProfile]:
+        browser_names = (
+            [browser_name] if browser_name else list(self.SUPPORTED_BROWSERS)
+        )
+        sessions: list[ImportableBrowserProfile] = []
         for current_browser in browser_names:
             for root in self._candidate_user_data_roots(current_browser):
                 if not root.exists() or not root.is_dir():
@@ -77,7 +81,7 @@ class ChromiumProfileImportService:
                 locked = self._is_external_root_locked(root)
                 for profile_dir in self._profile_dirs(root):
                     sessions.append(
-                        ImportableBrowserSession(
+                        ImportableBrowserProfile(
                             browser_name=current_browser,
                             browser_label=self._browser_label(current_browser),
                             user_data_root=root,
@@ -87,9 +91,18 @@ class ChromiumProfileImportService:
                             locked=locked,
                         )
                     )
-        return sorted(sessions, key=lambda item: (item.browser_label, item.profile_label.casefold(), item.profile_dir_name.casefold()))
+        return sorted(
+            sessions,
+            key=lambda item: (
+                item.browser_label,
+                item.profile_label.casefold(),
+                item.profile_dir_name.casefold(),
+            ),
+        )
 
-    def resolve_source(self, source_path: str | Path, *, browser_name: str | None = None) -> ImportableBrowserSession:
+    def resolve_source(
+        self, source_path: str | Path, *, browser_name: str | None = None
+    ) -> ImportableBrowserProfile:
         path = Path(source_path).expanduser().resolve()
         if not path.exists() or not path.is_dir():
             raise SessionError(
@@ -115,7 +128,7 @@ class ChromiumProfileImportService:
                     details={"source_path": str(path)},
                 )
         detected_browser = browser_name or self._infer_browser_name(user_data_root)
-        return ImportableBrowserSession(
+        return ImportableBrowserProfile(
             browser_name=detected_browser,
             browser_label=self._browser_label(detected_browser),
             user_data_root=user_data_root,
@@ -125,8 +138,8 @@ class ChromiumProfileImportService:
             locked=self._is_external_root_locked(user_data_root),
         )
 
-    def import_profile(self, source: ImportableBrowserSession, target_profile_id: str | None = None) -> BrowserProfile:
-        target_profile = self._resolve_target_profile(target_profile_id)
+    def import_profile(self, source: ImportableBrowserProfile) -> BrowserProfile:
+        target_profile = self._profile_registry.get_or_create_singleton()
         target_paths = self._profile_registry.paths_for(target_profile)
         if self._lock_probe.is_profile_in_use(target_paths):
             raise SessionError(
@@ -147,14 +160,20 @@ class ChromiumProfileImportService:
                 details={"source_path": str(source.profile_dir)},
             )
 
-        staged_root = Path(tempfile.mkdtemp(prefix="profile-import-", dir=str(target_paths.root)))
+        staged_root = Path(
+            tempfile.mkdtemp(prefix="profile-import-", dir=str(target_paths.root))
+        )
         staged_user_data = staged_root / "user_data"
         staged_user_data.mkdir(parents=True, exist_ok=True)
         try:
             self._copy_source_profile(source, staged_user_data)
-            self._patch_local_state(staged_user_data / "Local State", source.profile_dir_name)
+            self._patch_local_state(
+                staged_user_data / "Local State", source.profile_dir_name
+            )
             self._swap_user_data_dir(target_paths.user_data_dir, staged_user_data)
-            target_profile.launch_profile_dir_name = source.profile_dir_name or "Default"
+            target_profile.launch_profile_dir_name = (
+                source.profile_dir_name or "Default"
+            )
             target_profile.import_source_browser = source.browser_name
             target_profile.import_source_root = source.user_data_root
             target_profile.import_source_profile_dir = source.profile_dir
@@ -174,37 +193,19 @@ class ChromiumProfileImportService:
                 raise
             raise PersistenceError(
                 code="browser_profile_import_failed",
-                message="Failed to import the external browser profile into the app-managed Storyblocks profile.",
-                details={"source_path": str(source.profile_dir), "target_profile_id": target_profile.profile_id},
+                message="Failed to import the external browser profile into the managed Storyblocks profile.",
+                details={
+                    "source_path": str(source.profile_dir),
+                    "target_profile_id": target_profile.profile_id,
+                },
             ) from exc
         finally:
             if staged_root.exists():
                 shutil.rmtree(staged_root, ignore_errors=True)
 
-    def reimport_profile(self, target_profile_id: str | None = None) -> BrowserProfile:
-        target_profile = self._resolve_target_profile(target_profile_id)
-        if target_profile.import_source_profile_dir is None:
-            raise SessionError(
-                code="no_import_source",
-                message="This managed profile has no imported browser source yet.",
-                details={"profile_id": target_profile.profile_id},
-            )
-        source = self.resolve_source(
-            target_profile.import_source_profile_dir,
-            browser_name=target_profile.import_source_browser or None,
-        )
-        return self.import_profile(source, target_profile.profile_id)
-
-    def _resolve_target_profile(self, target_profile_id: str | None) -> BrowserProfile:
-        profile = self._profile_registry.get_profile(target_profile_id) if target_profile_id else self._profile_registry.get_active()
-        if profile is None:
-            raise SessionError(
-                code="managed_profile_missing",
-                message="Create or select an app-managed Storyblocks profile before importing a session.",
-            )
-        return profile
-
-    def _copy_source_profile(self, source: ImportableBrowserSession, target_user_data_root: Path) -> None:
+    def _copy_source_profile(
+        self, source: ImportableBrowserProfile, target_user_data_root: Path
+    ) -> None:
         for name in self.COPY_ROOT_FILES:
             source_path = source.user_data_root / name
             if not source_path.exists():
@@ -214,7 +215,11 @@ class ChromiumProfileImportService:
                 shutil.copy2(source_path, destination)
             elif source_path.is_dir():
                 shutil.copytree(source_path, destination, ignore=self._ignore_copy)
-        shutil.copytree(source.profile_dir, target_user_data_root / source.profile_dir_name, ignore=self._ignore_copy)
+        shutil.copytree(
+            source.profile_dir,
+            target_user_data_root / source.profile_dir_name,
+            ignore=self._ignore_copy,
+        )
 
     def _patch_local_state(self, local_state_path: Path, profile_dir_name: str) -> None:
         if not local_state_path.exists():
@@ -255,12 +260,18 @@ class ChromiumProfileImportService:
                 "profile_id": profile.profile_id,
                 "display_name": profile.display_name,
                 "import_source_browser": profile.import_source_browser,
-                "import_source_root": str(profile.import_source_root) if profile.import_source_root is not None else "",
-                "import_source_profile_dir": str(profile.import_source_profile_dir) if profile.import_source_profile_dir is not None else "",
+                "import_source_root": str(profile.import_source_root)
+                if profile.import_source_root is not None
+                else "",
+                "import_source_profile_dir": str(profile.import_source_profile_dir)
+                if profile.import_source_profile_dir is not None
+                else "",
                 "import_source_profile_dir_name": profile.import_source_profile_dir_name,
                 "import_source_profile_name": profile.import_source_profile_name,
                 "launch_profile_dir_name": profile.launch_profile_dir_name,
-                "imported_at": profile.imported_at.isoformat() if profile.imported_at is not None else "",
+                "imported_at": profile.imported_at.isoformat()
+                if profile.imported_at is not None
+                else "",
             },
         )
 
@@ -279,23 +290,31 @@ class ChromiumProfileImportService:
         default_dir = user_data_root / "Default"
         if self._looks_like_profile_dir(default_dir):
             profile_dirs.append(default_dir)
-        for child in sorted(user_data_root.iterdir() if user_data_root.exists() else []):
+        for child in sorted(
+            user_data_root.iterdir() if user_data_root.exists() else []
+        ):
             if not child.is_dir():
                 continue
-            if not any(child.name.startswith(prefix) for prefix in self.PROFILE_DIR_PREFIXES):
+            if not any(
+                child.name.startswith(prefix) for prefix in self.PROFILE_DIR_PREFIXES
+            ):
                 continue
             if self._looks_like_profile_dir(child):
                 profile_dirs.append(child)
         return profile_dirs
 
     def _looks_like_profile_dir(self, path: Path) -> bool:
-        return path.exists() and path.is_dir() and any(
-            candidate.exists()
-            for candidate in (
-                path / "Preferences",
-                path / "Cookies",
-                path / "Network" / "Cookies",
-                path / "Local Storage",
+        return (
+            path.exists()
+            and path.is_dir()
+            and any(
+                candidate.exists()
+                for candidate in (
+                    path / "Preferences",
+                    path / "Cookies",
+                    path / "Network" / "Cookies",
+                    path / "Local Storage",
+                )
             )
         )
 
