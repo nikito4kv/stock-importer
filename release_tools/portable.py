@@ -76,7 +76,7 @@ def build_portable_bundle(
     root = Path(project_root).resolve()
     out_root = Path(output_dir).resolve()
     build_version = version or _utc_stamp()
-    bundle_name = f"vid-img-downloader-portable-{build_version}"
+    bundle_name = f"stock-importer-portable-{build_version}"
     bundle_dir = out_root / bundle_name
     archive_path = out_root / f"{bundle_name}.zip"
 
@@ -184,7 +184,7 @@ if (-not (Test-Path $venvPython)) {
 Write-Host 'Portable environment is ready.'
 Write-Host 'Run launch_smoke.bat to verify the bundle, then launch_gui.bat.'
 """
-    readme = """Vid Img Downloader Portable Bundle
+    readme = """Stock Importer Portable Bundle
 
 1. Run setup_portable.ps1 or setup_portable.bat.
 2. Make sure Python and Chrome or Edge are installed on the machine.

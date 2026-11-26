@@ -173,7 +173,7 @@ class SettingsRepository:
         return ApplicationSettings(
             desktop_stack=SUPPORTED_DESKTOP_STACK,
             ui_theme=str(data.get("ui_theme", "dark")),
-            workspace_name=str(data.get("workspace_name", "vid-img-downloader")),
+            workspace_name=str(data.get("workspace_name", "stock-importer")),
             storage=StorageSettings(
                 workspace_root=Path(storage.get("workspace_root", "workspace")),
                 cache_root=Path(storage.get("cache_root", "workspace/cache")),

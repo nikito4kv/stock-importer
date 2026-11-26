@@ -91,7 +91,7 @@ class SecuritySettings:
 class ApplicationSettings:
     desktop_stack: str = SUPPORTED_DESKTOP_STACK
     ui_theme: str = "dark"
-    workspace_name: str = "vid-img-downloader"
+    workspace_name: str = "stock-importer"
     storage: StorageSettings = field(default_factory=StorageSettings)
     browser: BrowserSettings = field(default_factory=BrowserSettings)
     providers: ProviderSettings = field(default_factory=ProviderSettings)

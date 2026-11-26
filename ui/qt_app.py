@@ -71,7 +71,7 @@ class DesktopQtApp(QtWidgets.QMainWindow):
         self._current_videos_dir = ""
         self._current_images_dir = ""
 
-        self.setWindowTitle("Vid Img Downloader")
+        self.setWindowTitle("Stock Importer")
         self.resize(1480, 920)
         self._build_ui()
         self._apply_theme(self._theme_id)
